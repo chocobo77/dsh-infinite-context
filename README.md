@@ -16,7 +16,7 @@
 - **结构化记忆** — 四分类（user/feedback/project/reference）+ 索引 + 审计 + 忘得可见
 - **模型上下文感知** — 自动采纳 DSH 解析的真实模型 CTX，本地小模型提前压缩
 - **高价值过滤** — 只入库高价值工具结果，低价值工具自动过滤
-- **手动工具** — search / status / index / maintain / forget / consolidate / reset / model_probe
+- **手动工具** — 10 个：search / status / index / maintain / model_probe / forget / consolidate / reset / force_compress / ingest
 
 ### 核心特性
 
@@ -26,7 +26,7 @@
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；Ollama 可选主动探测 |
-| 高价值过滤 | denylist 过滤 21 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.7） |
+| 高价值过滤 | denylist 过滤 23 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
 
 ### 架构
 
@@ -49,7 +49,7 @@ src/
 ├── strings.ts            共享字符串工具
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
-└── tools.ts              9 个手动工具
+└── tools.ts              10 个手动工具
 tests/                    62 个单元测试
 ```
 
@@ -66,6 +66,7 @@ tests/                    62 个单元测试
 | `memory_consolidate` | 强制金字塔合并 |
 | `memory_reset` | 清空所有记忆 |
 | `memory_force_compress(sessionId?)` | 强制压缩指定会话 |
+| `memory_ingest(text, source)` | 手动入库一条文本（自动触发见 `tools/result` 回调） |
 
 ### 配置参考
 
@@ -131,7 +132,7 @@ feel via **multi-tier memory management**:
 - **Structured memory** — four classifications (user/feedback/project/reference) + index + audit + visible forgetting
 - **Model-context awareness** — auto-adopts DSH-resolved real model CTX, small local models compress early
 - **High-value filtering** — only high-value tool results ingested, low-value tools filtered
-- **Manual tools** — search / status / index / maintain / forget / consolidate / reset / model_probe
+- **Manual tools** — 10: search / status / index / maintain / model_probe / forget / consolidate / reset / force_compress / ingest
 
 ### Key Features
 
@@ -141,7 +142,7 @@ feel via **multi-tier memory management**:
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; optional active probe for Ollama |
-| High-value filtering | denylist filters 21 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.7) |
+| High-value filtering | denylist filters 23 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
 
 ### Manual Tools
 
@@ -156,6 +157,7 @@ feel via **multi-tier memory management**:
 | `memory_consolidate` | Force pyramid consolidation |
 | `memory_reset` | Erase all memories |
 | `memory_force_compress(sessionId?)` | Force compress a session |
+| `memory_ingest(text, source)` | Manually ingest a text (auto-triggered via the `tools/result` callback) |
 
 ### Deployment
 

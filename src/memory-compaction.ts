@@ -11,7 +11,9 @@
  *      latest user message and spliced into the request as background.
  *   4. History compression: every N rounds, old messages are summarized into
  *      a compact background context (recursion-locked to prevent re-entrancy).
- *   5. Output sanitization: tool results are cleaned before entering context.
+ *   5. Output sanitization: tool results are cleaned before entering the
+ *      vector memory (the live tool result still reaches the current turn's
+ *      context as-is — tools/result is a post-hoc event and cannot rewrite it).
  *   6. Fallback truncation: if still over budget, oldest messages are dropped.
  *
  * @module dsh-infinite-context/memory-compaction
@@ -81,6 +83,38 @@ function messageText(message: { role: string; content: unknown }): string {
       .join('\n')
   }
   return ''
+}
+
+/**
+ * Fixed token cost charged per image block by the heuristic meter. The real
+ * cost varies with resolution; this conservative constant keeps image-heavy
+ * sessions from being systematically under-measured (which used to delay
+ * compression until compaction-basic's overflow recovery had to step in).
+ */
+const IMAGE_BLOCK_TOKEN_COST = 1500
+
+/**
+ * Heuristic token estimate across a message content (string or block array).
+ * text blocks are metered normally, image blocks get a fixed cost, and every
+ * other block type (reasoning / tool-call / tool-result) contributes either
+ * its textual payload when it carries one or a small constant — never its raw
+ * JSON, which may embed base64 data that would poison the estimate.
+ */
+function estimateContentTokens(content: unknown): number {
+  if (typeof content === 'string') return estimateTokens(content)
+  if (!Array.isArray(content)) return 0
+  let total = 0
+  for (const block of content as ContentBlock[]) {
+    if (block.type === 'text') {
+      total += estimateTokens(block.text)
+    } else if (block.type === 'image') {
+      total += IMAGE_BLOCK_TOKEN_COST
+    } else {
+      const maybeText = (block as { text?: unknown }).text
+      total += typeof maybeText === 'string' ? estimateTokens(maybeText) : 32
+    }
+  }
+  return total
 }
 
 /** Map a terminal summarization finish to a fail-closed error. */
@@ -367,7 +401,7 @@ export class HistoryCompressor {
       let cutTokens = 0
       for (let i = 0; i < compressible.length; i++) {
         cutIndex = i + 1
-        cutTokens += estimateTokens(messageText(compressible[i]))
+        cutTokens += estimateContentTokens(compressible[i].content)
         if (cutTokens >= toFree) break
       }
       const oldMessages = compressible.slice(0, cutIndex)
@@ -444,6 +478,23 @@ export class HistoryCompressor {
         `[ContextGovernor] Compressed history: ${oldMessages.length} messages → 1 summary. `
         + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens`,
       )
+
+      // Persist the compression summary as a mid memory. The live summary
+      // message can still be dropped by fallback truncation later, so the
+      // compressed span must remain retrievable from the memory system.
+      // Best-effort: persistence failure must not fail the compression itself.
+      try {
+        await this.ctx.memoryContext.storeMemory(summaryText, 'mid', {
+          sourceSessionId: sessionId,
+          importance: 0.6,
+          kind: 'project',
+        })
+      } catch (persistErr) {
+        this.ctx.logger.warn(
+          `[ContextGovernor] Compression summary persistence failed: `
+          + `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+        )
+      }
 
       return { messages: newMessages, tokensSaved: saved }
     } catch (err) {
@@ -532,9 +583,7 @@ export class HistoryCompressor {
   private estimateMessageTokens(messages: readonly { role: string; content: unknown }[]): number {
     let total = 0
     for (const msg of messages) {
-      total += estimateTokens(msg.role)
-      const text = messageText(msg)
-      total += estimateTokens(text)
+      total += estimateContentTokens(msg.content)
     }
     return total
   }
@@ -887,7 +936,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       void this.onToolResult(exec.name, text)
     })
 
-    if (this.retrieval.enabled) this.registerRetrieval(ctx)
+    // Always register the governance hook: it also drives history compression
+    // (Strategy 1) and model-context adoption (G8) — both must keep working
+    // when RAG retrieval is disabled. The RAG section gates itself inside.
+    this.registerRetrieval(ctx)
   }
 
   /**
@@ -954,7 +1006,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
   }
 
-  /** Register the per-turn retrieval + compression injection (the governance hook). */
+  /** Register the per-turn governance hook: CTX adoption + compression + RAG injection. */
   private registerRetrieval(ctx: Context): void {
     ctx.on('agent/pre-step', async (
       payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
@@ -999,43 +1051,46 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           currentMessages = [...compressResult.messages]
         }
 
-        // --- Strategy 4: RAG retrieval injection ---
-        const userText = this.latestUserText(currentMessages)
-        let memoryMessage: UserMessage | undefined
-        if (userText !== undefined) {
-          const excludeIds = this.lastInjectedIds.get(session)
-          const retrieval = await this.retriever.retrieve(userText, excludeIds)
-          if (retrieval !== null) {
-            memoryMessage = retrieval.message
-            this.lastInjectedIds.set(session, new Set(retrieval.ids))
-            ctx.logger.info(
-              `[ContextGovernor] RAG injected: ${retrieval.hitCount} memories for query "${userText.slice(0, 60)}…"`,
-            )
-          } else if (excludeIds !== undefined) {
-            // Nothing fresh to inject — drop the exclusion set so the next
-            // turn re-attempts the full Top-K instead of permanently
-            // excluding the same memories forever.
-            this.lastInjectedIds.delete(session)
-          }
-        }
-
-        // Insert the memory background BEFORE the latest user message so the
-        // model reads it as context, not as a new user input appended after
-        // the question (which would break instruction ordering).
-        if (memoryMessage !== undefined) {
-          let insertAt = currentMessages.length
-          for (let i = currentMessages.length - 1; i >= 0; i--) {
-            const text = messageText(currentMessages[i]).trim()
-            if (currentMessages[i].role === 'user' && text.length > 0) {
-              insertAt = i
-              break
+        // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
+        // compression and CTX adoption above stay active regardless) ---
+        if (this.retrieval.enabled) {
+          const userText = this.latestUserText(currentMessages)
+          let memoryMessage: UserMessage | undefined
+          if (userText !== undefined) {
+            const excludeIds = this.lastInjectedIds.get(session)
+            const retrieval = await this.retriever.retrieve(userText, excludeIds)
+            if (retrieval !== null) {
+              memoryMessage = retrieval.message
+              this.lastInjectedIds.set(session, new Set(retrieval.ids))
+              ctx.logger.info(
+                `[ContextGovernor] RAG injected: ${retrieval.hitCount} memories for query "${userText.slice(0, 60)}…"`,
+              )
+            } else if (excludeIds !== undefined) {
+              // Nothing fresh to inject — drop the exclusion set so the next
+              // turn re-attempts the full Top-K instead of permanently
+              // excluding the same memories forever.
+              this.lastInjectedIds.delete(session)
             }
           }
-          currentMessages = [
-            ...currentMessages.slice(0, insertAt),
-            memoryMessage,
-            ...currentMessages.slice(insertAt),
-          ]
+
+          // Insert the memory background BEFORE the latest user message so the
+          // model reads it as context, not as a new user input appended after
+          // the question (which would break instruction ordering).
+          if (memoryMessage !== undefined) {
+            let insertAt = currentMessages.length
+            for (let i = currentMessages.length - 1; i >= 0; i--) {
+              const text = messageText(currentMessages[i]).trim()
+              if (currentMessages[i].role === 'user' && text.length > 0) {
+                insertAt = i
+                break
+              }
+            }
+            currentMessages = [
+              ...currentMessages.slice(0, insertAt),
+              memoryMessage,
+              ...currentMessages.slice(insertAt),
+            ]
+          }
         }
 
         // --- Fallback truncation (Strategy 2 — deterministic last resort) ---

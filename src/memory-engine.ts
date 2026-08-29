@@ -74,6 +74,8 @@ export interface MemoryEngineDeps {
   readonly summarize?: SummarizeFn
   /** Clock for deterministic tests; defaults to `Date.now`. */
   readonly now?: () => number
+  /** Optional warning sink (e.g. the cordis logger) for best-effort failures. */
+  readonly onWarn?: (message: string) => void
 }
 
 /** Options for storing a new memory. */
@@ -95,6 +97,7 @@ export class MemoryEngine {
   private readonly config: MemoryConfig
   private summarize: SummarizeFn | undefined
   private readonly now: () => number
+  private readonly onWarn: ((message: string) => void) | undefined
 
   /**
    * @param deps - the injected dependencies.
@@ -108,6 +111,7 @@ export class MemoryEngine {
     this.config = deps.config
     this.summarize = deps.summarize
     this.now = deps.now ?? (() => Date.now())
+    this.onWarn = deps.onWarn
   }
 
   /**
@@ -289,8 +293,14 @@ export class MemoryEngine {
     let pyramid: PyramidResult | null = null
     try {
       pyramid = await this.consolidate()
-    } catch {
-      pyramid = null // consolidation is best-effort; forgetting already applied
+    } catch (err) {
+      // Consolidation is best-effort; forgetting already applied. But the
+      // failure must stay visible (e.g. a misconfigured summarizer would
+      // otherwise silently disable pyramid merging forever).
+      pyramid = null
+      this.onWarn?.(
+        `pyramid consolidation failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
+      )
     }
     return { forgetting, pyramid }
   }

@@ -1,8 +1,14 @@
 /**
- * Sanitize tool execution results before they enter the context window.
+ * Sanitize tool execution results before they are ingested into the vector
+ * memory.
  *
- * Purpose: reduce token consumption from verbose tool outputs while preserving
- * the semantic content the LLM needs. Three strategies by source type:
+ * Scope note: this cleans the COPY that goes into persistent memory. The raw
+ * tool result still reaches the current turn's context window as-is (the
+ * tools/result event is post-hoc and cannot rewrite it) — do not rely on this
+ * module as a token guard for the live context.
+ *
+ * Purpose: reduce memory noise from verbose tool outputs while preserving
+ * the semantic content worth retrieving later. Three strategies by source type:
  *   - web_search: extract title + snippet, strip HTML
  *   - code_exec: keep tail 200 lines of stdout + errors
  *   - generic JSON: recursive string truncation at configurable max chars
