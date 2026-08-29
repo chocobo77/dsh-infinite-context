@@ -1,0 +1,51 @@
+# === Dependencies ===
+node_modules/
+
+# === Build output ===
+dist/
+*.tsbuildinfo
+
+# === Database (contains runtime memories) ===
+*.db
+*.db-shm
+*.db-wal
+
+# === OS generated files ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Environment / Credentials ===
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.token
+*.credential
+*.password
+credentials.*
+secrets.*
+
+# === Logs ===
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# === Misc ===
+*.tgz
+*.tar.gz
+.cache/
+tmp/
+temp/
