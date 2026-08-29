@@ -5,9 +5,10 @@ setlocal EnableDelayedExpansion
 title DSH 插件一键安装
 
 rem ==============================================================
-rem  DSH 插件一键安装菜单 v1.2（封装 install-dsh-plugin.ps1）
+rem  DSH 插件一键安装菜单 v1.3（封装 install-dsh-plugin.ps1）
 rem  与 install-dsh-plugin.ps1 放同一目录，或自动回退到插件仓库。
 rem  默认设置持久化在同级 install-dsh-plugin.cfg。
+rem  profile 自动检测：已保存的 > web > 手动选择（3 秒倒计时确认）。
 rem ==============================================================
 
 set "PS1=%~dp0install-dsh-plugin.ps1"
@@ -35,7 +36,7 @@ echo.
 echo  ============================================================
 echo    DSH 插件一键安装
 echo  ============================================================
-echo    默认 Profile : %PROFILE%      （[7] 可修改，自动保存）
+echo    默认 Profile : %PROFILE%      （自动检测，[7] 可改默认）
 echo    默认插件目录 : %DEFAULT_DIR%
 echo  ------------------------------------------------------------
 echo    选择安装来源：
@@ -192,12 +193,55 @@ rem ==================== 来源 9：退出 ====================
 :OPT9
 exit /b 0
 
-rem ==================== 公共：确认 Profile ====================
+rem ==================== 公共：profile 自动检测 ====================
 :ASK_PROFILE
 echo.
-echo  第 2 步 / 目标 profile（回车 = %PROFILE%）
-set /p "PROFILE_IN=  profile: "
-if not "%PROFILE_IN%"=="" set "PROFILE=%PROFILE_IN%"
+echo  第 2 步 / 目标 profile（自动检测）
+call :DETECT_PROFILE
+if defined AUTOPICK (
+    echo  检测到 profile: %AUTOPICK%
+    choice /c XM /n /t 3 /d X /m "  [X] 3 秒后自动使用 [M] 手动选择: "
+    if errorlevel 2 goto MANUAL_PROFILE
+    set "PROFILE=%AUTOPICK%"
+    echo  [OK] 使用 profile: %PROFILE%
+    goto PROFILE_DONE
+)
+echo  未检测到可用的默认 profile，请手动选择：
+:MANUAL_PROFILE
+set /a N=0
+if exist "%PROFILES_DIR%\" (
+    for /f "delims=" %%d in ('dir /b /ad "%PROFILES_DIR%" 2^>nul') do (
+        set /a N+=1
+        set "PNAME_!N!=%%d"
+        echo    [!N!] %%d
+    )
+)
+echo    （输入序号或名称；名称不存在将自动新建）
+set "PIN="
+set /p "PIN=  选择 (回车 = %PROFILE%): "
+if "%PIN%"=="" goto PROFILE_DONE
+set "MATCHED="
+call set "MATCHED=%%PNAME_%PIN%%%"
+if not "%MATCHED%"=="" (set "PROFILE=%MATCHED%") else (set "PROFILE=%PIN%")
+echo  [OK] 使用 profile: %PROFILE%
+
+:PROFILE_DONE
+goto AFTER_PROFILE
+
+rem ---- 子过程：探测可自动确认的 profile（供独立测试复用） ----
+:DETECT_PROFILE
+set "AUTOPICK="
+if "%DSH_HOME%"=="" set "DSH_HOME=%USERPROFILE%\.dsh"
+set "PROFILES_DIR=%DSH_HOME%\profiles"
+if not exist "%PROFILES_DIR%\" goto :eof
+if exist "%PROFILES_DIR%\%PROFILE%\" (
+    set "AUTOPICK=%PROFILE%"
+    goto :eof
+)
+if exist "%PROFILES_DIR%\web\" set "AUTOPICK=web"
+goto :eof
+
+:AFTER_PROFILE
 
 rem ==================== 公共：确认重启 ====================
 echo.
