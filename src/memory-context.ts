@@ -79,6 +79,12 @@ export class MemoryContext extends Service {
     )
     budget.validate()
     this.store = store
+    // Close the SQLite handle when this service fiber unloads (hot reload /
+    // plugin update). Without this, the db/WAL files stay locked on Windows
+    // and block replacing the plugin directory. This cordis version has no
+    // `Service.disconnect` symbol — `ctx.effect` is the lifecycle-sanctioned
+    // way to register a disposer that runs during UNLOADING.
+    this.context.effect(() => () => store.close(), 'close memory store')
     const index = new VectorIndex()
     this.engine = new MemoryEngine({
       store,
@@ -87,6 +93,7 @@ export class MemoryContext extends Service {
       budget,
       forgetting: new ForgettingPolicy(this.resolved.memory.forgetting),
       config: this.resolved.memory,
+      onWarn: (message) => this.context.logger.warn(`[memoryContext] ${message}`),
     })
     // Hydrate the in-memory index from previously persisted memories so that
     // retrieval works across restarts (not only for memories stored in this
