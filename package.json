@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "private": true,
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/chocobo77/dsh-infinite-context.git"
@@ -19,17 +19,18 @@
     "rag"
   ],
   "files": [
-    "src",
+    "dist",
     "bundle.patch.yml",
     "cordis.yml",
     "README.md",
     "ARCHITECTURE.md"
   ],
   "exports": {
-    ".": "./src/index.ts",
-    "./memory-context": "./src/memory-context.ts",
-    "./memory-compaction": "./src/memory-compaction.ts",
-    "./core": "./src/core.ts",
+    ".": "./dist/index.js",
+    "./memory-context": "./dist/memory-context.js",
+    "./memory-compaction": "./dist/memory-compaction.js",
+    "./tools": "./dist/tools.js",
+    "./core": "./dist/core.js",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -38,20 +39,23 @@
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",
-    "@deepseek-ai/schemastery": "^3.18.0",
     "@deepseek-ai/dsh-agent": ">=0.1.1-0 <0.2.0-0",
     "@deepseek-ai/dsh-compaction": ">=0.1.1-0 <0.2.0-0",
     "@deepseek-ai/dsh-compaction-basic": ">=0.1.1-0 <0.2.0-0",
     "@deepseek-ai/dsh-llm": ">=0.1.1-0 <0.2.0-0",
     "@deepseek-ai/dsh-session": ">=0.1.1-0 <0.2.0-0",
     "@deepseek-ai/dsh-token-meter": ">=0.1.1-0 <0.2.0-0",
-    "@deepseek-ai/dsh-tools": ">=0.1.1-0 <0.2.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.1.1-0 <0.2.0-0",
+    "@deepseek-ai/schemastery": "^3.18.0"
   },
   "peerDependenciesMeta": {
     "@huggingface/transformers": {
@@ -60,10 +64,15 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "^5.6.0",
+    "typescript": "^6.0.3",
     "vitest": "^3.0.0"
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

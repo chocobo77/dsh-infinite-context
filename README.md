@@ -97,14 +97,19 @@ tests/                    62 个单元测试
 
 ### 部署
 
+> **发布就绪说明**：npm/GitHub/tarball 安装走 `dist/` 编译产物（`prepare`/`prepack` 自动构建）。
+> Node 24 不允许 node_modules 下的 `.ts` 类型剥离（`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`），
+> 因此 bundle 必须发布编译后 JS；bundle 补丁里的入口用**裸子路径说明符**
+> （如 `dsh-infinite-context/memory-context`）——相对路径会按 profile 目录解析而失效。
+
 ```sh
-# 方式一：通过 --patch 临时加载
+# 方式一：通过 --patch 临时加载（.ts 源码直载，适合本机开发）
 dsh web --patch ./cordis.yml
 
-# 方式二：安装到 profile
-dsh plugin --profile web add .
+# 方式二：安装到 profile（tarball，已端到端验证）
+npm pack && dsh plugin --profile <name> add ./dsh-infinite-context-0.1.0.tgz
 
-# 方式三：手动复制到 DSH plugins 目录 + 编辑 cordis.patch.yml
+# 方式三：手动复制到 DSH plugins 目录 + 编辑 cordis.patch.yml（.ts 直载）
 ```
 
 ### 测试
@@ -161,14 +166,21 @@ feel via **multi-tier memory management**:
 
 ### Deployment
 
+> **Publish-readiness note**: npm/GitHub/tarball installs consume the compiled `dist/`
+> (`prepare`/`prepack` build automatically). Node 24 refuses TypeScript stripping under
+> node_modules (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), so bundles must ship
+> compiled JS, and bundle-patch entries must use **bare subpath specifiers**
+> (e.g. `dsh-infinite-context/memory-context`) — relative paths resolve against the
+> profile directory and break.
+
 ```sh
-# Option 1: Temporary load via --patch
+# Option 1: Temporary load via --patch (direct .ts loading, for local dev)
 dsh web --patch ./cordis.yml
 
-# Option 2: Install into profile
-dsh plugin --profile web add .
+# Option 2: Install into a profile (tarball, verified end-to-end)
+npm pack && dsh plugin --profile <name> add ./dsh-infinite-context-0.1.0.tgz
 
-# Option 3: Manual copy to DSH plugins dir + edit cordis.patch.yml
+# Option 3: Manual copy to DSH plugins dir + edit cordis.patch.yml (direct .ts)
 ```
 
 ### Testing
