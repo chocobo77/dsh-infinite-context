@@ -8,8 +8,11 @@
 # Insert the three plugin entries.
 - insert:
     # 1) Persistent multi-tier memory store + embedder + index + budget.
+    # Bare subpath specifiers resolve through node_modules against the
+    # installed package's exports map. RELATIVE paths resolve against the
+    # PROFILE directory and break bundle installs (verified 2026-08-30).
     - id: memory-context
-      name: ./src/memory-context.ts
+      name: dsh-infinite-context/memory-context
       config:
         storePath: dsh-infinite-context.db
         contextWindow: 94000
@@ -37,7 +40,7 @@
 
     # 2) Compaction engine with progressive compression + RAG injection.
     - id: memory-compaction
-      name: ./src/memory-compaction.ts
+      name: dsh-infinite-context/memory-compaction
       config:
         auto: true
         thresholdRatio: 0.8
@@ -90,4 +93,4 @@
 
     # 3) Manual tools (memory_search, memory_status, etc.).
     - id: memory-tools
-      name: ./src/tools.ts
+      name: dsh-infinite-context/tools
