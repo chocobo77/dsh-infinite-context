@@ -22,15 +22,17 @@ import { estimateTokens } from './token-budget.ts'
 export interface VectorRetrieverConfig {
   /** Maximum number of similar memories to retrieve (default 3). */
   topK: number
-  /** Minimum cosine similarity threshold (default 0.3 for lightweight embedder). */
+  /** Minimum cosine similarity threshold (wired from resolved rag_min_score / retrieval.minScore). */
   minScore: number
   /** Maximum token budget for the injected retrieval context (default 3000). */
   tokenBudget: number
   /** Semantic chunk size in characters for ingestion (default 500). */
   chunkSize: number
   /**
-   * Ingest dedup: skip a chunk when an identical memory already exists
-   * (exact-text match). Default true.
+   * Ingest dedup (exact layer): skip a chunk when an identical memory already
+   * exists (exact-text match). Default true. Only controls the exact layer —
+   * the fuzzy-normalized layer always runs, and the semantic layer is
+   * governed by `dedupeMinScore`.
    */
   dedupeExact?: boolean
   /**
@@ -53,6 +55,12 @@ export interface VectorRetrieverConfig {
 
 const TAG = '[VectorRetriever]'
 const MEMORY_STORE_TIMEOUT_MS = 5_000
+/**
+ * Total character cap per ingested tool result (≈ 2× the per-field sanitize
+ * cap). A large JSON with many fields can otherwise explode into an unbounded
+ * number of chunks and keep the embedder/SQLite loop running for a long time.
+ */
+const MAX_INGEST_CHARS = 24_000
 
 /** Human-readable relative age for a memory timestamp. */
 function relativeAge(createdAt: number, now: number = Date.now()): string {
@@ -101,7 +109,10 @@ export class VectorRetriever {
    *
    * Ingestion guards:
    *   - source filtering: low-value tools (denylist / non-allowlist) are skipped;
+   *   - total-size bound: results are capped at MAX_INGEST_CHARS before chunking;
    *   - exact dedup: a chunk whose full text already exists is skipped;
+   *   - fuzzy dedup: a chunk identical up to timestamps/counters/case is skipped
+   *     (always on — a cosine threshold cannot catch time-only diffs);
    *   - semantic dedup: a chunk whose nearest memory scores >= dedupeMinScore
    *     is skipped (near-duplicate content);
    *   - importance: ingested tool results get a low importance (default 0.3)
@@ -114,56 +125,90 @@ export class VectorRetriever {
       this.ctx.logger.debug(`${TAG} skip ingestion: source=${source} is not high-value`)
       return
     }
+    // Bound the total work: a tool result with many fields can otherwise
+    // explode into an unbounded chunk count (per-field sanitize caps do not
+    // constrain the aggregate).
+    const bounded = trimmed.length > MAX_INGEST_CHARS
+      ? trimmed.slice(0, MAX_INGEST_CHARS)
+      : trimmed
+    if (bounded.length < trimmed.length) {
+      this.ctx.logger.info(
+        `${TAG} ingest text truncated for source=${source}: ${trimmed.length} → ${MAX_INGEST_CHARS} chars`,
+      )
+    }
     const provenance = `[source: ${source}]\n`
     const importance = this.config.ingestImportance ?? 0.3
     const dedupeExact = this.config.dedupeExact ?? true
     const dedupeMinScore = this.config.dedupeMinScore ?? 0.92
+    // Set when the race timeout wins; the ingestion loop checks it and stops
+    // instead of continuing to burn embedder/SQLite work in the background.
+    let timedOut = false
+    const work = (async () => {
+      const chunks = chunkText(bounded, this.config.chunkSize)
+      let stored = 0
+      let skipped = 0
+      for (const chunk of chunks) {
+        if (timedOut) {
+          this.ctx.logger.warn(
+            `${TAG} ingestion aborted after timeout for source=${source} `
+            + `(${stored + skipped}/${chunks.length} chunks processed)`,
+          )
+          return
+        }
+        const full = provenance + chunk
+        // Exact dedup: identical memory already present?
+        if (dedupeExact && this.ctx.memoryContext.hasText(full)) {
+          skipped++
+          continue
+        }
+        // Fuzzy dedup: memory identical up to timestamps/counters/case?
+        // The lightweight embedder scores such near-identical texts low
+        // (time-only diffs land ~0.6), so a cosine threshold cannot catch
+        // them — normalize and compare instead. Runs independently of
+        // `dedupeExact`, which governs the exact layer only.
+        if (this.ctx.memoryContext.hasTextNormalized(full)) {
+          skipped++
+          continue
+        }
+        // Semantic dedup: near-duplicate memory already present?
+        if (dedupeMinScore > 0) {
+          const near = await this.ctx.memoryContext.retrieve(chunk, 1, dedupeMinScore)
+          if (near.length > 0 && near[0].score >= dedupeMinScore) {
+            skipped++
+            continue
+          }
+        }
+        await this.ctx.memoryContext.storeMemory(full, 'short', { importance, kind: 'reference' })
+        stored++
+      }
+      if (stored > 0 || skipped > 0) {
+        this.ctx.logger.info(
+          `${TAG} ingested source=${source}: stored=${stored} chunks, skipped=${skipped} (dedup/filter)`,
+        )
+      }
+    })()
     try {
-      await Promise.race([
-        (async () => {
-          const chunks = chunkText(trimmed, this.config.chunkSize)
-          let stored = 0
-          let skipped = 0
-          for (const chunk of chunks) {
-            const full = provenance + chunk
-            // Exact dedup: identical memory already present?
-            if (dedupeExact && this.ctx.memoryContext.hasText(full)) {
-              skipped++
-              continue
-            }
-            // Fuzzy dedup: memory identical up to timestamps/counters/case?
-            // The lightweight embedder scores such near-identical texts low
-            // (time-only diffs land ~0.6), so a cosine threshold cannot catch
-            // them — normalize and compare instead.
-            if (dedupeExact && this.ctx.memoryContext.hasTextNormalized(full)) {
-              skipped++
-              continue
-            }
-            // Semantic dedup: near-duplicate memory already present?
-            if (dedupeMinScore > 0) {
-              const near = await this.ctx.memoryContext.retrieve(chunk, 1, dedupeMinScore)
-              if (near.length > 0 && near[0].score >= dedupeMinScore) {
-                skipped++
-                continue
-              }
-            }
-            await this.ctx.memoryContext.storeMemory(full, 'short', { importance, kind: 'reference' })
-            stored++
-          }
-          if (stored > 0 || skipped > 0) {
-            this.ctx.logger.info(
-              `${TAG} ingested source=${source}: stored=${stored} chunks, skipped=${skipped} (dedup/filter)`,
-            )
-          }
-        })(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('memory store timeout')), MEMORY_STORE_TIMEOUT_MS),
-        ),
-      ])
+      const timeout = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          timedOut = true
+          reject(new Error('memory store timeout'))
+        }, MEMORY_STORE_TIMEOUT_MS)
+        timer.unref()
+      })
+      await Promise.race([work, timeout])
     } catch (err) {
       this.ctx.logger.warn(
         `${TAG} memory store failed for source=${source}: ${err instanceof Error ? err.message : String(err)}`,
       )
+    }
+    if (timedOut) {
+      // The losing `work` promise keeps running; without this handler a late
+      // rejection would vanish silently inside the settled race.
+      work.catch((err: unknown) => {
+        this.ctx.logger.warn(
+          `${TAG} late ingestion failure for source=${source}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      })
     }
   }
 

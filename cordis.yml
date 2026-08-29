@@ -86,7 +86,8 @@
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
     # rag_ingest_denylist: []
 
-# 3) Manual tools (memory_search, memory_status, memory_forget,
-#    memory_consolidate, memory_reset).
+# 3) Manual tools (memory_search, memory_status, memory_index, memory_maintain,
+#    memory_model_probe, memory_forget, memory_consolidate, memory_reset,
+#    memory_force_compress, memory_ingest).
 - id: memory-tools
   name: ./src/tools.ts
