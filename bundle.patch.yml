@@ -1,0 +1,93 @@
+# dsh-infinite-context bundle patch layer
+# Applied when installed via: dsh plugin --profile web add .
+
+# Disable the built-in compaction-basic (replaced by memory-compaction).
+- id: compaction-basic
+  disabled: true
+
+# Insert the three plugin entries.
+- insert:
+    # 1) Persistent multi-tier memory store + embedder + index + budget.
+    - id: memory-context
+      name: ./src/memory-context.ts
+      config:
+        storePath: dsh-infinite-context.db
+        contextWindow: 94000
+        headroomRatio: 0.25
+        embedder:
+          kind: lightweight
+          dimension: 256
+        budget:
+          short: 10000
+          mid: 20000
+          long: 5000
+          retrieved: 15000
+        forgetting:
+          halfLifeDays: 30
+          importanceWeight: 0.6
+          recencyWeight: 0.4
+          minScore: 0.25
+          maxMemories: 500
+        pyramid:
+          mergeThreshold: 4
+          mergeBatch: 3
+          maxLong: 20
+        retrievalMinScore: 0.2
+        retrievalTopK: 5
+
+    # 2) Compaction engine with progressive compression + RAG injection.
+    - id: memory-compaction
+      name: ./src/memory-compaction.ts
+      config:
+        auto: true
+        thresholdRatio: 0.8
+        retainRatio: 0.4
+        summarizationProvider: deepseek-official
+        summarizationModel: deepseek-v4-flash
+        maxTokens: 8192
+        compactionRetries: 1
+        maxOverflowRetries: 1
+        retrieval:
+          enabled: true
+          topK: 3
+          minScore: 0.2
+        compress_round_interval: 7
+        compress_trigger_ratio: 0.85
+        compress_target_ratio: 0.6
+        retain_recent_messages: 4
+        sanitize_max_chars: 2000
+        rag_top_k: 3
+        rag_min_score: 0.3
+        rag_token_budget: 3000
+        rag_chunk_size: 500
+        rag_dedupe_exact: true
+        rag_dedupe_min_score: 0.92
+        rag_ingest_importance: 0.3
+        rag_ingest_denylist:
+          - memory_search
+          - memory_status
+          - memory_index
+          - memory_maintain
+          - memory_model_probe
+          - memory_forget
+          - memory_consolidate
+          - memory_reset
+          - memory_ingest
+          - memory_force_compress
+          - todo_write
+          - ask_user_question
+          - interrupt_agent
+          - job_list
+          - job_output
+          - job_kill
+          - list_agents
+          - send_message
+          - subagent
+          - subagent_fork
+          - workflow
+          - ralph
+          - skill
+
+    # 3) Manual tools (memory_search, memory_status, etc.).
+    - id: memory-tools
+      name: ./src/tools.ts
