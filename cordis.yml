@@ -1,0 +1,92 @@
+# dsh-infinite-context — example composition
+#
+# Load these three entries into a DeepSeek Harness composition. They assume the
+# base harness services are present (llm, tokenMeter, sessions, tools), which a
+# normal `dsh` profile already provides.
+#
+# Use relative paths here because this file sits next to the plugin source; in
+# your own deployment, point `name` at the plugin location (or an installed
+# package name).
+#
+# `memory-context` must load before `memory-compaction` (the compaction engine
+# injects it). Ordering in the file does not matter — Cordis orders by the
+# `inject` dependency.
+
+# 1) The persistent multi-tier memory store + embedder + index + budget.
+- id: memory-context
+  name: ./src/memory-context.ts
+  config:
+    # SQLite file for persisted memories. Use ':memory:' to disable persistence.
+    storePath: ./dsh-infinite-context.db
+    # The model's total context window (local 94k deployment).
+    contextWindow: 94000
+    # Fraction reserved for system prompt + tools + current input + output.
+    headroomRatio: 0.25
+    # Embedder: 'lightweight' (built-in, no deps) or 'transformers'
+    # (all-MiniLM-L6-v2 via @huggingface/transformers).
+    embedder:
+      kind: lightweight
+      dimension: 256
+    # Per-tier token budgets (short + mid + long + retrieved must fit the window).
+    budget:
+      short: 10000
+      mid: 20000
+      long: 5000
+      retrieved: 15000
+    # Forgetting policy.
+    forgetting:
+      halfLifeDays: 30
+      importanceWeight: 0.6
+      recencyWeight: 0.4
+      minScore: 0.25
+      maxMemories: 500
+    # Pyramid consolidation (merge N mid memories into one long memory).
+    pyramid:
+      mergeThreshold: 4
+      mergeBatch: 3
+      maxLong: 20
+    retrievalMinScore: 0.2
+    retrievalTopK: 5
+
+# 2) The compaction engine that persists summaries, rebalances the pyramid,
+#    and injects retrieved memories into the context.
+- id: memory-compaction
+  name: ./src/memory-compaction.ts
+  config:
+    # --- basic compaction policy (delegated to compaction-basic) ---
+    auto: true
+    thresholdRatio: 0.8          # trigger compaction at 80% of the window
+    retainRatio: 0.4            # keep the recent ~40% verbatim (short-term)
+    # Required for LLM summarization (mid-term + pyramid consolidation).
+    summarizationProvider: deepseek
+    summarizationModel: deepseek-chat
+    maxTokens: 8192
+    # --- retrieval injection ---
+    retrieval:
+      enabled: true              # splice top-K memories in on each new turn
+      topK: 3
+      minScore: 0.2
+    # --- history compression (Strategy 1) ---
+    compress_round_interval: 7   # compress old history every N rounds
+    compress_trigger_ratio: 0.85 # compress only when context > 85% of budget (delays compression)
+    compress_target_ratio: 0.6   # progressive: only the oldest overflow is summarized
+    retain_recent_messages: 4    # keep the most recent N messages uncompressed
+    # --- output sanitization (Strategy 3) ---
+    sanitize_max_chars: 2000     # max chars for generic JSON string fields
+    # --- vector retrieval / RAG (Strategy 4) ---
+    rag_top_k: 3                 # Top-K similar memories to inject
+    rag_min_score: 0.3           # minimum cosine similarity (lightweight embedder typical range: 0.25-0.35)
+    rag_token_budget: 3000       # max tokens for injected RAG context
+    rag_chunk_size: 500          # semantic chunk size in characters
+    # --- RAG ingestion guards (dedup + high-value filtering) ---
+    rag_dedupe_exact: true       # skip chunks whose exact text already exists
+    rag_dedupe_min_score: 0.92   # skip chunks near-duplicate to an existing memory (0 disables)
+    rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
+    # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
+    # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
+    # rag_ingest_denylist: []
+
+# 3) Manual tools (memory_search, memory_status, memory_forget,
+#    memory_consolidate, memory_reset).
+- id: memory-tools
+  name: ./src/tools.ts
