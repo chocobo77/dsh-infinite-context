@@ -29,6 +29,8 @@ export interface ModelContextAdoption {
 export class ModelContextTracker {
   private modelContext: ModelContextInfo | null = null
   private probedForModel: string | null = null
+  private readonly fallbackWindow: number
+  private readonly probeEnabled: boolean
 
   /**
    * @param fallbackWindow - the configured context window used until the real
@@ -36,9 +38,11 @@ export class ModelContextTracker {
    * @param probeEnabled - whether live probing is allowed (config `modelProbe.enabled`).
    */
   constructor(
-    private readonly fallbackWindow: number,
-    private readonly probeEnabled: boolean,
+    fallbackWindow: number,
+    probeEnabled: boolean,
   ) {
+    this.fallbackWindow = fallbackWindow
+    this.probeEnabled = probeEnabled
     if (!Number.isSafeInteger(fallbackWindow) || fallbackWindow <= 0) {
       throw new RangeError('fallbackWindow must be a positive integer')
     }

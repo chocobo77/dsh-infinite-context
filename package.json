@@ -1,7 +1,7 @@
 {
   "name": "dsh-infinite-context",
   "version": "0.1.0",
-  "description": "DeepSeek Harness plugin: multi-tier memory management (short/mid/long), semantic retrieval, token budgeting, and forgetting for 'infinite context'.",
+  "description": "DeepSeek Harness plugin: multi-tier memory management, semantic retrieval, structured memory, and model-context awareness for infinite context.",
   "type": "module",
   "license": "MIT",
   "private": true,
@@ -12,6 +12,11 @@
     "./memory-compaction": "./src/memory-compaction.ts",
     "./core": "./src/core.ts",
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle.patch.yml"
+    }
   },
   "scripts": {
     "test": "vitest run",
