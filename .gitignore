@@ -43,14 +43,14 @@ npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
 
-# === Misc ===
+# === Packages / misc ===
 *.tgz
 *.tar.gz
 .cache/
 tmp/
 temp/
 
-# === ±¾µØ¹ı³Ì¼ÇÂ¼£¨²»Èë¿â£© ===
+# === local process notes (not tracked) ===
 REVIEW*.md
-DSH²å¼ş¿ª·¢¾­Ñé.md
-DSH²å¼ş°²×°×¢ÒâÊÂÏî.md
+DSHæ’ä»¶å¼€å‘ç»éªŒ.md
+DSHæ’ä»¶å®‰è£…æ³¨æ„äº‹é¡¹.md
