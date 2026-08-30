@@ -112,6 +112,17 @@ npm pack && dsh plugin --profile <name> add ./dsh-infinite-context-0.1.0.tgz
 # 方式三：手动复制到 DSH plugins 目录 + 编辑 cordis.patch.yml（.ts 直载）
 ```
 
+**一键安装脚本**（`scripts/`，通用工具，可用于任何 DSH 插件）：
+
+```powershell
+# 交互式菜单（校验 dsh.bundle 清单 → 自动编译 → tarball 安装 →
+# 自动清理 profile 补丁层同 id 旧条目 → 可选联动重启）
+scripts\install-dsh-plugin.bat
+
+# 或直接调用 PowerShell 版
+scripts\install-dsh-plugin.ps1 <目录|tgz|npm:包名|github:owner/repo> -Profile <name>
+```
+
 ### 测试
 
 ```sh
@@ -183,6 +194,17 @@ npm pack && dsh plugin --profile <name> add ./dsh-infinite-context-0.1.0.tgz
 # Option 3: Manual copy to DSH plugins dir + edit cordis.patch.yml (direct .ts)
 ```
 
+**One-click installer** (`scripts/`, generic tool for any DSH plugin):
+
+```powershell
+# Interactive menu (validates the dsh.bundle manifest → auto-builds →
+# tarball install → auto-cleans legacy same-id patch entries → optional restart)
+scripts\install-dsh-plugin.bat
+
+# Or call the PowerShell version directly
+scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <name>
+```
+
 ### Testing
 
 ```sh
@@ -196,5 +218,3 @@ tsc -p tsconfig.typecheck.json --noEmit
 ---
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
-See [`DSH插件开发经验.md`](DSH插件开发经验.md) for development lessons learned.
-See [`REVIEW.md`](REVIEW.md) for the code review report.

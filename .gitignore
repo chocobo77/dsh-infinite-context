@@ -49,3 +49,8 @@ pnpm-debug.log*
 .cache/
 tmp/
 temp/
+
+# === 本地过程记录（不入库） ===
+REVIEW*.md
+DSH插件开发经验.md
+DSH插件安装注意事项.md
