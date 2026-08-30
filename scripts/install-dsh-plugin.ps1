@@ -49,7 +49,10 @@ param(
 
   [switch]$Restart,
 
-  [string]$HarnessRoot
+  [string]$HarnessRoot,
+
+  # 保留 profile cordis.patch.yml 中的旧手动条目（默认自动清理同 id 条目）
+  [switch]$KeepPatch
 )
 
 $ErrorActionPreference = 'Continue'
@@ -172,6 +175,18 @@ else {
 }
 
 # ---------------------------------------------------------------- 执行安装
+# 记录安装前 profile 已有的依赖（用于安装后定位新装的包 → 读取其 bundle ids）
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$profileDir = Join-Path $dshHome "profiles\$Profile"
+$profilePkgPath = Join-Path $profileDir 'package.json'
+$beforeDeps = @()
+if (Test-Path $profilePkgPath) {
+  try {
+    $pj = Get-Content $profilePkgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($pj.dependencies) { $beforeDeps = @($pj.dependencies.PSObject.Properties.Name) }
+  } catch { }
+}
+
 Write-Step "安装到 profile '$Profile'：dsh plugin --profile $Profile add $installArg"
 Push-Location $harness
 try {
@@ -198,6 +213,77 @@ if ($exit -ne 0) {
   if ($exit -ne 0) { Write-Fail "安装失败（exit $exit）。"; exit $exit }
 }
 Write-Ok "安装流程结束。"
+
+# ------------------------------ 幂等清理：移除旧手动方式残留的同 id 条目 ------------------------------
+# 场景（2026-08-30 事故）：插件先以手动 file:/// 方式写入 profile cordis.patch.yml，
+# 之后又以 bundle 机制安装 → 同 id entry 出现两次 → loader 报 duplicate loader entry id。
+# 本步骤在安装成功后，自动识别 profile 补丁层里与本插件 bundle.patch.yml 同 id 的旧条目
+# 并移除（先备份）。混排了其它插件条目的块保守跳过，避免误删。-KeepPatch 可跳过清理。
+if (-not $KeepPatch) {
+  # 收集 profile 内所有已安装 bundle 声明的 entry id：
+  # bundle 层与补丁层出现同 id 即为重复（与具体插件无关），均可安全清理。
+  $ids = @()
+  $nmDir = Join-Path $profileDir 'node_modules'
+  if (Test-Path $nmDir) {
+    foreach ($dep in (Get-ChildItem $nmDir -Directory -ErrorAction SilentlyContinue)) {
+      $bpPath = Join-Path $dep.FullName 'bundle.patch.yml'
+      if (Test-Path $bpPath) {
+        $bp = [IO.File]::ReadAllText($bpPath)
+        $ids += [regex]::Matches($bp, '(?m)^\s*-\s*id:\s*([A-Za-z0-9_\-.]+)') | ForEach-Object { $_.Groups[1].Value }
+      }
+    }
+    $ids = @($ids | Select-Object -Unique)
+  }
+  $patchPath = Join-Path $profileDir 'cordis.patch.yml'
+  if ($ids.Count -gt 0 -and (Test-Path $patchPath)) {
+    $bytes = [IO.File]::ReadAllBytes($patchPath)
+    $hadBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $raw = [IO.File]::ReadAllText($patchPath)
+    $idPattern = ($ids | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    if ($raw -notmatch "id:\s*($idPattern)\b") {
+      Write-Ok "profile 补丁层无本插件旧条目，无需清理。"
+    } else {
+      $lines = $raw -split "`r?`n"
+      $preface = @()
+      $blocks = @()
+      $cur = $null
+      foreach ($ln in $lines) {
+        if ($ln -match '^-') {
+          if ($cur) { $blocks += ,$cur }
+          $cur = @($ln)
+        } elseif ($cur) { $cur += $ln }
+        else { $preface += $ln }
+      }
+      if ($cur) { $blocks += ,$cur }
+      $removedIds = @()
+      $mixed = $false
+      $kept = @()
+      foreach ($b in $blocks) {
+        $bIds = [regex]::Matches(($b -join "`n"), '(?m)^\s*-?\s*id:\s*([A-Za-z0-9_\-.]+)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+        $hasMatch = @($bIds | Where-Object { $ids -contains $_ }).Count -gt 0
+        $hasForeign = @($bIds | Where-Object { $ids -notcontains $_ }).Count -gt 0
+        if ($hasMatch -and $hasForeign) { $mixed = $true; $kept += ,$b; continue }
+        if ($hasMatch) { $removedIds += @($bIds); continue }
+        $kept += ,$b
+      }
+      if ($mixed) {
+        Write-Warn2 "profile 补丁层存在与本插件混排的块（同块含其它插件 id），为避免误删未自动清理。请手动核对：$patchPath"
+      } elseif ($removedIds.Count -gt 0) {
+        $bak = "$patchPath.bak_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
+        Copy-Item $patchPath $bak -Force
+        $newLines = @()
+        $newLines += $preface
+        foreach ($b in $kept) { $newLines += ''; $newLines += $b }
+        $body = ($newLines -join "`r`n").TrimEnd()
+        if (-not ($body -match '(?m)^\s*-')) {
+          $body = "# $($removedIds -join ' / ') 现由 bundle 机制管理，旧手动条目已移除（幂等清理）。`r`n# 备份: $bak`r`n[]"
+        }
+        [IO.File]::WriteAllText($patchPath, $body + "`r`n", (New-Object System.Text.UTF8Encoding($hadBom)))
+        Write-Ok "幂等清理：已移除 profile 补丁层旧条目 [$($removedIds -join ', ')]（备份: $bak）"
+      }
+    }
+  }
+}
 
 # ---------------------------------------------------------------- 重启
 if ($Restart) {
