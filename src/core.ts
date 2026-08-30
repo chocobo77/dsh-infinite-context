@@ -28,6 +28,7 @@ export { oneLine } from './strings.ts'
 export { probeModelContext, probeLlama, probeOllama, probeOpenAI } from './model-probe.ts'
 export {
   ModelContextTracker,
+  PROBE_RETRY_MS,
   type ModelContextAdoption,
   type ModelRouteObservation,
 } from './model-context.ts'

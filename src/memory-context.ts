@@ -161,13 +161,21 @@ export class MemoryContext extends Service {
     try {
       const window = await probeModelContext(this.resolved.modelProbe, model)
       if (window !== undefined) {
-        this.modelTracker.adopt({ model, contextWindow: window, source: 'probe' })
+        // A live probe reflects the server's REAL runtime context, which can
+        // be far smaller than the declared catalog window. Cap the adoption at
+        // the current (declared) window so a probe can only LOWER it, never
+        // inflate it.
+        const ceiling = this.modelTracker.info?.contextWindow ?? this.resolved.contextWindow
+        const adopted = Math.min(window, ceiling)
+        this.modelTracker.adopt({ model, contextWindow: adopted, source: 'probe' })
+        this.modelTracker.markResolved(model)
         this.context.logger.info(
-          `[memoryContext] Model probe adopted context window ${window} (model=${model}, source=probe)`,
+          `[memoryContext] Model probe adopted context window ${adopted} `
+          + `(model=${model}, probed=${window}, ceiling=${ceiling}, source=probe)`,
         )
       } else {
         this.context.logger.info(
-          `[memoryContext] Model probe for "${model}" reported no context window`,
+          `[memoryContext] Model probe for "${model}" reported no context window (will retry)`,
         )
       }
     } catch (error) {
