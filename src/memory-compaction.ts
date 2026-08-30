@@ -274,6 +274,13 @@ export class HistoryCompressor {
   readonly triggerRatio: number
   /** Target water level (fraction of budget) after compression. */
   readonly targetRatio: number
+  /**
+   * Reserved tokens for the plugin's own per-turn context footprint (the RAG
+   * injection spliced in AFTER the compression check). Subtracted from the
+   * trigger/target water levels so compression fires before the REAL request
+   * — conversation + plugin overhead — overflows the model window.
+   */
+  readonly injectionBudget: number
 
   constructor(
     ctx: Context,
@@ -282,6 +289,7 @@ export class HistoryCompressor {
     retainRecent: number,
     triggerRatio = 0.85,
     targetRatio = 0.6,
+    injectionBudget = 0,
   ) {
     this.ctx = ctx
     this.config = config
@@ -289,6 +297,7 @@ export class HistoryCompressor {
     this.retainRecent = retainRecent
     this.triggerRatio = triggerRatio
     this.targetRatio = targetRatio
+    this.injectionBudget = injectionBudget
   }
 
   /** The effective token budget: context window minus headroom. */
@@ -367,14 +376,17 @@ export class HistoryCompressor {
     // Token-pressure trigger: compress only when the round interval has
     // elapsed AND the context is actually over the trigger water level.
     // This delays compression while the context is still roomy, preserving
-    // more verbatim history for as long as possible.
+    // more verbatim history for as long as possible. The plugin's own per-turn
+    // RAG injection (spliced in after this check) is reserved up front so the
+    // trigger reflects the REAL request size, not just the message array.
     if (!force) {
       if (currentTurn % this.compressInterval !== 0) return null
       const budget = this.tokenBudget()
-      if (beforeTokens <= budget * this.triggerRatio) {
+      const triggerTokens = Math.max(0, Math.floor(budget * this.triggerRatio) - this.injectionBudget)
+      if (beforeTokens <= triggerTokens) {
         this.ctx.logger.debug(
           `[ContextGovernor] Compression deferred: ${beforeTokens} tokens <= `
-          + `${Math.floor(budget * this.triggerRatio)} trigger (interval reached)`,
+          + `${triggerTokens} trigger (interval reached, injection budget ${this.injectionBudget})`,
         )
         return null
       }
@@ -389,9 +401,11 @@ export class HistoryCompressor {
     try {
       // Progressive compression: only the OLDEST messages needed to bring the
       // context back down to the target water level are summarized; everything
-      // newer stays verbatim so recent context remains fully coherent.
+      // newer stays verbatim so recent context remains fully coherent. The
+      // injection budget is reserved here too, so after the RAG splice the
+      // request still lands at (not above) the target.
       const budget = this.tokenBudget()
-      const targetTokens = Math.floor(budget * this.targetRatio)
+      const targetTokens = Math.max(0, Math.floor(budget * this.targetRatio) - this.injectionBudget)
       const toFree = beforeTokens - targetTokens
 
       // Walk from the oldest message forward, accumulating the oldest block
@@ -845,6 +859,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly sanitizerConfig: SanitizerConfig
   /** Recent messages kept verbatim by compression/truncation. */
   private readonly retainRecent: number
+  /** Reserved tokens for the plugin's own per-turn RAG injection. */
+  private readonly injectionBudget: number
 
   /**
    * @param ctx - the plugin context.
@@ -885,7 +901,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // makes compression progressive (only the oldest overflow is summarized).
     const compressInterval = compress_round_interval ?? 7
     const retainRecent = retain_recent_messages ?? 4
+    const injectionBudget = rag_token_budget ?? 3000
     this.retainRecent = retainRecent
+    this.injectionBudget = injectionBudget
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -893,6 +911,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       retainRecent,
       compress_trigger_ratio ?? 0.85,
       compress_target_ratio ?? 0.6,
+      injectionBudget,
     )
 
     // Initialize the sanitizer config (Strategy 3)

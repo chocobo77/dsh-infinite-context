@@ -64,6 +64,30 @@ describe('model probe', () => {
     await expect(probeOpenAI('http://127.0.0.1:8000/v1', 'vllm-model')).resolves.toBe(32_768)
   })
 
+  it('falls back to LM Studio /api/v0/models max_total_tokens', async () => {
+    mockFetchOnce(url => {
+      if (url === 'http://127.0.0.1:1234/v1/models') {
+        // LM Studio's OpenAI-compatible listing advertises no context length.
+        return jsonResponse({ data: [{ id: 'qwen3.8-27b' }] })
+      }
+      if (url === 'http://127.0.0.1:1234/api/v0/models') {
+        return jsonResponse({ data: [
+          { id: 'qwen3.8-27b', max_total_tokens: 8192, max_completion_tokens: 4096 },
+        ] })
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBe(8192)
+  })
+
+  it('ignores the LM Studio fallback when the model id does not match', async () => {
+    mockFetchOnce(url => {
+      if (url.endsWith('/v1/models')) return jsonResponse({ data: [{ id: 'other' }] })
+      return jsonResponse({ data: [{ id: 'other', max_total_tokens: 4096 }] })
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBeUndefined()
+  })
+
   it('returns undefined on a non-2xx reply', async () => {
     mockFetchOnce(() => jsonResponse({ error: 'nope' }, false))
     await expect(probeLlama('http://127.0.0.1:8080')).resolves.toBeUndefined()

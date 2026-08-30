@@ -98,9 +98,23 @@ export async function probeOllama(baseURL: string, model?: string): Promise<numb
   return positiveInt(info?.['llama.context_length']) ?? positiveInt(params?.num_ctx)
 }
 
-/** `GET /models` (OpenAI-compatible): context window of one listed model. */
-export async function probeOpenAI(baseURL: string, model?: string): Promise<number | undefined> {
-  const response = await boundedFetch(joinPath(baseURL, '/models'))
+/** Context-length fields advertised by standard OpenAI-compatible `/models` listings. */
+const CONTEXT_FIELDS = ['context_length', 'context_window', 'max_model_len'] as const
+
+/**
+ * Context-length fields reported by local servers' NATIVE listings that never
+ * advertise one on their OpenAI-compatible surface — LM Studio's
+ * `/api/v0/models` reports the loaded model's runtime context here.
+ */
+const NATIVE_CONTEXT_FIELDS = ['max_total_tokens', 'max_completion_tokens', 'n_ctx'] as const
+
+/** Read a context length from a `{ data: [...] }` listing, filtered by model id. */
+async function probeListing(
+  url: string,
+  model: string | undefined,
+  fields: readonly string[],
+): Promise<number | undefined> {
+  const response = await boundedFetch(url)
   if (response === null) return undefined
   const body = await readJson(response)
   if (body === null) return undefined
@@ -112,12 +126,23 @@ export async function probeOpenAI(baseURL: string, model?: string): Promise<numb
     : data.filter(entry => (entry as { id?: unknown })?.id === name)
   for (const raw of entries) {
     const entry = raw as Record<string, unknown>
-    const found = positiveInt(entry.context_length)
-      ?? positiveInt(entry.context_window)
-      ?? positiveInt(entry.max_model_len)
-    if (found !== undefined) return found
+    for (const field of fields) {
+      const found = positiveInt(entry[field])
+      if (found !== undefined) return found
+    }
   }
   return undefined
+}
+
+/** `GET /models` (OpenAI-compatible), with an LM Studio native fallback. */
+export async function probeOpenAI(baseURL: string, model?: string): Promise<number | undefined> {
+  // Standard OpenAI-compatible listing first (vLLM / llama-server / LiteLLM).
+  const fromModels = await probeListing(joinPath(baseURL, '/models'), model, CONTEXT_FIELDS)
+  if (fromModels !== undefined) return fromModels
+  // LM Studio's /v1/models never advertises a context length, but its native
+  // /api/v0/models reports the loaded model's runtime context (max_total_tokens).
+  const nativeBase = baseURL.replace(/\/v1$/, '')
+  return probeListing(joinPath(nativeBase, '/api/v0/models'), model, NATIVE_CONTEXT_FIELDS)
 }
 
 /** Probe the configured local server for a model's context window. */

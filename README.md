@@ -75,13 +75,21 @@ tests/                    62 个单元测试
 | 键 | 默认值 | 说明 |
 |----|--------|------|
 | `storePath` | `dsh-infinite-context.db` | SQLite 路径；`:memory:` 禁用持久化 |
-| `contextWindow` | `94000` | 模型上下文窗口（**回退值**；插件自动采纳 DSH 解析的真实窗口） |
+| `contextWindow` | `94000` | 模型上下文窗口（**回退值**；插件自动采纳 DSH 解析的真实窗口，并会以实时探测结果为上限） |
 | `headroomRatio` | `0.25` | 系统/工具/输入/输出预留比例 |
-| `modelProbe.enabled/kind/baseURL` | `false` | 可选主动探测（`llama`/`ollama`/`openai`） |
+| `modelProbe.enabled/kind/baseURL` | `false` | 主动探测本地服务器的**真实**上下文窗口（`llama`/`ollama`/`openai`） |
 | `embedder.kind` | `lightweight` | `lightweight`（无依赖）或 `transformers` |
 | `budget.short/mid/long/retrieved` | `10000/20000/5000/15000` | 分层 token 预算 |
 | `forgetting.minScore` | `0.25` | 低于此分数的记忆被遗忘 |
 | `forgetting.maxMemories` | `500` | 记忆总数上限 |
+
+> **本地模型（LM Studio / llama-server / Ollama）**：`settings.yaml` 里声明的
+> `contextWindow` 可能远大于服务器实际运行的上下文（例如声明 100000、实际只有 8k）。
+> 开启 `modelProbe`（`kind: openai` 同时兼容 LM Studio 的 `/api/v0/models`，或
+> `llama`/`ollama`）后，插件会在首次观测到该模型时读取服务器的真实运行上下文，
+> 并取 `min(声明值, 探测值)` 作为生效窗口——压缩因此会在真实上限之前触发，而不是
+> 等到溢出。插件自身的每轮 RAG 注入（`rag_token_budget`）也会从压缩触发水位中预留，
+> 避免「插件自己吃掉的上下文」被漏算。
 
 #### `memory-compaction` 配置
 

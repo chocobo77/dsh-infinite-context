@@ -25,10 +25,19 @@ export interface ModelContextAdoption {
   source: Exclude<ModelContextSource, 'config'>
 }
 
+/**
+ * Cooldown before a failed model probe is retried. A local server that was
+ * down (or started after DSH) is re-probed after this delay on later turns.
+ */
+export const PROBE_RETRY_MS = 60_000
+
 /** Tracks the effective model context window and probe-once-per-model state. */
 export class ModelContextTracker {
   private modelContext: ModelContextInfo | null = null
-  private probedForModel: string | null = null
+  /** Models whose window was confirmed by a successful live probe. */
+  private readonly resolvedModels = new Set<string>()
+  /** Last probe attempt per model (for the retry cooldown). */
+  private readonly lastProbeAttempt = new Map<string, number>()
   private readonly fallbackWindow: number
   private readonly probeEnabled: boolean
 
@@ -59,12 +68,14 @@ export class ModelContextTracker {
   }
 
   /**
-   * Observe one request's resolved route metadata. When it carries a context
-   * window, adopt it immediately. Otherwise — when live probing is enabled and
-   * this model has not been probed yet — return the model id to probe; the
-   * caller runs the async probe and passes its result to {@link adopt}.
+   * Observe one request's resolved route metadata. A declared window (DSH
+   * catalog / `/models` listing) is adopted immediately as an upper bound —
+   * but for local servers that value can far exceed the real runtime context,
+   * so a live probe is still requested (once per model, respecting the retry
+   * cooldown). The probe result (capped at the declared window by the caller)
+   * then narrows the effective window to the server's true limit.
    * @param route - the observed route metadata.
-   * @returns a model id to probe (once per model), or undefined.
+   * @returns a model id to probe (once per model, after cooldown), or undefined.
    */
   observe(route: ModelRouteObservation): string | undefined {
     if (route.contextWindow !== undefined) {
@@ -74,14 +85,25 @@ export class ModelContextTracker {
         contextWindow: route.contextWindow,
         source: 'request-context',
       })
-      if (route.model !== undefined) this.probedForModel = route.model
-      return undefined
     }
     const model = route.model
     if (model === undefined || !this.probeEnabled) return undefined
-    if (this.probedForModel === model) return undefined
-    this.probedForModel = model
+    if (this.resolvedModels.has(model)) return undefined
+    const lastAttempt = this.lastProbeAttempt.get(model) ?? 0
+    if (Date.now() - lastAttempt < PROBE_RETRY_MS) return undefined
+    this.lastProbeAttempt.set(model, Date.now())
     return model
+  }
+
+  /**
+   * Mark a model as resolved by a successful live probe, so it is not probed
+   * again. A probe only ever narrows the window; the runtime context is stable
+   * until the model is reloaded (a process restart re-probes).
+   * @param model - the model id whose window was confirmed by a probe.
+   */
+  markResolved(model: string): void {
+    this.resolvedModels.add(model)
+    this.lastProbeAttempt.delete(model)
   }
 
   /**
