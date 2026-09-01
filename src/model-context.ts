@@ -34,6 +34,13 @@ export const PROBE_RETRY_MS = 60_000
 /** Tracks the effective model context window and probe-once-per-model state. */
 export class ModelContextTracker {
   private modelContext: ModelContextInfo | null = null
+  /**
+   * Per-model window registry. A single global slot cannot serve a runtime
+   * where concurrent sessions route to different models (a 1M remote chat and
+   * an 8K local model): the last observation would poison the other session's
+   * budget. Every adoption and per-model override lands here keyed by model id.
+   */
+  private readonly windowsByModel = new Map<string, ModelContextInfo>()
   /** Models whose window was confirmed by a successful live probe. */
   private readonly resolvedModels = new Set<string>()
   /** Last probe attempt per model (for the retry cooldown). */
@@ -65,6 +72,45 @@ export class ModelContextTracker {
   /** The currently adopted model context info, or null. */
   get info(): ModelContextInfo | null {
     return this.modelContext
+  }
+
+  /**
+   * The narrowed window recorded for one specific model, or undefined when
+   * nothing (declaration, probe, or override) has been observed for it.
+   */
+  windowFor(model: string | undefined): number | undefined {
+    if (model === undefined) return undefined
+    return this.windowsByModel.get(model)?.contextWindow
+  }
+
+  /** All per-model windows currently known, in insertion order. */
+  perModel(): readonly ModelContextInfo[] {
+    return [...this.windowsByModel.values()]
+  }
+
+  /**
+   * Record an explicit per-model window (config override or probe result)
+   * WITHOUT moving the global "last observed" slot. Probes only ever narrow:
+   * a later wider observation for the same model cannot raise a recorded
+   * narrower value.
+   */
+  setModelWindow(info: {
+    provider?: string
+    model?: string
+    contextWindow: number
+    source: ModelContextSource
+  }): void {
+    if (info.model === undefined) return
+    if (!Number.isSafeInteger(info.contextWindow) || info.contextWindow <= 0) return
+    const existing = this.windowsByModel.get(info.model)
+    if (existing !== undefined && info.contextWindow >= existing.contextWindow) return
+    this.windowsByModel.set(info.model, {
+      ...(info.provider === undefined ? {} : { provider: info.provider }),
+      model: info.model,
+      contextWindow: info.contextWindow,
+      source: info.source,
+      detectedAt: Date.now(),
+    })
   }
 
   /**
@@ -112,6 +158,9 @@ export class ModelContextTracker {
    */
   adopt(info: ModelContextAdoption): void {
     if (!Number.isSafeInteger(info.contextWindow) || info.contextWindow <= 0) return
+    // Mirror into the per-model registry: a probe narrowing must win over the
+    // declared value, and each model keeps its own slot.
+    if (info.model !== undefined) this.setModelWindow({ ...info, source: info.source })
     const current = this.modelContext
     if (current !== null
       && current.contextWindow === info.contextWindow

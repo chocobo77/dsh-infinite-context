@@ -57,6 +57,13 @@ export class MemoryContext extends Service {
       this.resolved.contextWindow,
       this.resolved.modelProbe.enabled,
     )
+    // Apply explicit per-model window overrides (config-declared truth, e.g. a
+    // local model the catalog misdeclares, or a remote model whose real window
+    // differs from the declaration). These feed the per-model registry that
+    // compaction triggering and per-session budgets read.
+    for (const { model, contextWindow } of this.resolved.modelWindows) {
+      this.modelTracker.setModelWindow({ model, contextWindow, source: 'config' })
+    }
   }
 
   /**
@@ -126,6 +133,20 @@ export class MemoryContext extends Service {
   /** The currently adopted model context info, or null. */
   get modelInfo(): ModelContextInfo | null {
     return this.modelTracker.info
+  }
+
+  /**
+   * The narrowed window recorded for one specific model (probe / per-model
+   * override), or undefined when nothing has been observed for it. Callers
+   * fall back to the global effective window when undefined.
+   */
+  windowForModel(model: string | undefined): number | undefined {
+    return this.modelTracker.windowFor(model)
+  }
+
+  /** All per-model windows currently known (for observability). */
+  perModelWindows(): readonly ModelContextInfo[] {
+    return this.modelTracker.perModel()
   }
 
   /**
@@ -278,7 +299,12 @@ export class MemoryContext extends Service {
    */
   compactionEngine: {
     compressor: {
-      compress: (sid: string, msgs: readonly any[]) => Promise<{ messages: readonly any[]; tokensSaved: number } | null>
+      compress: (
+        sid: string,
+        msgs: readonly any[],
+        force?: boolean,
+        options?: { window?: number },
+      ) => Promise<{ messages: readonly any[]; tokensSaved: number } | null>
       compressForce: (sid: string, msgs: readonly any[]) => Promise<{ messages: readonly any[]; tokensSaved: number }>
     }
   } | null = null

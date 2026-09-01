@@ -26,6 +26,19 @@
           enabled: true
           kind: openai
           baseURL: http://127.0.0.1:1234/v1
+        # Explicit per-model context windows (authoritative per-model truth).
+        # These feed the per-model registry that the dynamic compaction
+        # threshold and per-session budgets read; a successful live probe can
+        # still narrow them further. Adjust/remove to match the models you
+        # actually run:
+        #   - glm-5.3-flash: declared in settings.yaml as 1000000.
+        #   - Qwen3.8-27B-UD-Q4_K_XL: local model; set this to the value LM
+        #     Studio reports (max_total_tokens) if probing stays unavailable.
+        modelWindows:
+          - model: glm-5.3-flash
+            contextWindow: 1000000
+          - model: Qwen3.8-27B-UD-Q4_K_XL
+            contextWindow: 32768
         embedder:
           kind: lightweight
           dimension: 256
@@ -66,6 +79,13 @@
         compress_round_interval: 7
         compress_trigger_ratio: 0.85
         compress_target_ratio: 0.6
+        # Track the routed model's REAL context window (probe / modelWindows):
+        # when it is smaller than the declared window, force durable-history
+        # compaction at a threshold derived from the REAL window instead of
+        # waiting for a declared-window threshold the model can never reach.
+        # This is what makes short-context local models "refill" (续杯) in time,
+        # including after one very long thinking turn.
+        compaction_dynamic_threshold: true
         retain_recent_messages: 4
         sanitize_max_chars: 2000
         rag_top_k: 3

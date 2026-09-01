@@ -32,3 +32,15 @@ export {
   type ModelContextAdoption,
   type ModelRouteObservation,
 } from './model-context.ts'
+export {
+  COMPRESS_FAILURE_COOLDOWN,
+  SURGE_RATIO,
+  decidePressureCompaction,
+  shouldCompressHistory,
+  type HistoryTriggerInput,
+  type HistoryTriggerReason,
+  type HistoryTriggerResult,
+  type PressureDecision,
+  type PressureDecisionInput,
+  type PressureDecisionMode,
+} from './compaction-policy.ts'

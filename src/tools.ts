@@ -60,6 +60,7 @@ export function apply(ctx: Context) {
         ...status,
         modelContext: ctx.memoryContext.modelInfo
           ?? { contextWindow: ctx.memoryContext.contextWindow, source: 'config' },
+        perModelWindows: ctx.memoryContext.perModelWindows(),
       }, null, 2)
     },
     presentCall: () => ({ card: 'generic', title: 'Memory status', kind: 'other' }),
@@ -80,13 +81,18 @@ export function apply(ctx: Context) {
       const info = args.forceProbe === true
         ? await ctx.memoryContext.probeModel(args.model)
         : ctx.memoryContext.modelInfo
+      const perModel = ctx.memoryContext.perModelWindows()
+        .map(entry => `${entry.model ?? '?'}=${entry.contextWindow}(${entry.source})`)
+        .join(', ')
       if (info !== null) {
         return `Model context: ${info.contextWindow} tokens (source=${info.source})`
           + (info.model === undefined ? '' : `, model=${info.model}`)
           + (info.provider === undefined ? '' : `, provider=${info.provider}`)
+          + (perModel.length === 0 ? '' : `\nPer-model windows: ${perModel}`)
       }
       return `Model context: ${ctx.memoryContext.contextWindow} tokens (source=config fallback; `
         + 'no request context or live probe resolved one yet)'
+      + (perModel.length === 0 ? '' : `\nPer-model windows: ${perModel}`)
     },
     presentCall: args => ({ card: 'generic', title: 'Memory model probe', kind: 'other', rawInput: args }),
   }))
