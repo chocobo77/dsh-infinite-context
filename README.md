@@ -120,15 +120,29 @@ tests/                    62 个单元测试
 > 因此 bundle 必须发布编译后 JS；bundle 补丁里的入口用**裸子路径说明符**
 > （如 `dsh-infinite-context/memory-context`）——相对路径会按 profile 目录解析而失效。
 
+> ⚠️ **`dsh plugin add` 的临时路径陷阱**：`dsh plugin --profile <name> add <tgz>` 会把 tarball
+> 暂存到 `D:\Temp\dsh-plugin-install-<随机>\` 并在 profile 的 `package.json` 里记成
+> `file:D:/Temp/...` —— **临时目录随时会被清理**，之后任何一次 profile 级 `npm install`
+> 都会因解析不到该路径而失败。可靠做法：把 tarball 放到**持久化目录**（如
+> `~/.dsh/packages/`），并让 profile 依赖指向它：
+
 ```sh
 # 方式一：通过 --patch 临时加载（.ts 源码直载，适合本机开发）
 dsh web --patch ./cordis.yml
 
-# 方式二：安装到 profile（tarball，已端到端验证）
-npm pack && dsh plugin --profile <name> add ./dsh-infinite-context-0.1.0.tgz
+# 方式二（推荐）：持久化 tarball 安装 —— npm pack 后把 tgz 放进 ~/.dsh/packages/，
+# 并把 profile package.json 的依赖改为 file:C:/Users/<you>/.dsh/packages/<pkg>.tgz
+npm pack
+mkdir -p ~/.dsh/packages 2>/dev/null; cp dsh-infinite-context-0.1.0.tgz ~/.dsh/packages/
 
-# 方式三：手动复制到 DSH plugins 目录 + 编辑 cordis.patch.yml（.ts 直载）
+# 方式三：dsh plugin add（注意上面的临时路径陷阱；装完后建议把依赖重定向到持久化路径）
+
+# 方式四：手动复制到 DSH plugins 目录 + 编辑 cordis.patch.yml（.ts 直载）
 ```
+
+> **更新已安装插件**：`npm pack` → 覆盖 `~/.dsh/packages/` 里的 tgz → 把新 `dist/*` 与
+> `bundle.patch.yml` 直接复制进
+> `<profile>/node_modules/dsh-infinite-context/`（立即可用，无需 npm install）→ 重启 DSH。
 
 **一键安装脚本**（`scripts/`，通用工具，可用于任何 DSH 插件）：
 
