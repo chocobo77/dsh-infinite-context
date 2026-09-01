@@ -88,6 +88,14 @@ export const DEFAULT_MODEL_PROBE: ResolvedModelProbeConfig = {
 export const DEFAULT_RETRIEVAL_MIN_SCORE = 0.2
 export const DEFAULT_RETRIEVAL_TOP_K = 5
 
+/** One explicit per-model context-window override (config-declared truth). */
+export interface ModelWindowOverride {
+  /** Provider-owned model id the window applies to (exact match). */
+  model: string
+  /** The model's real context window in tokens. */
+  contextWindow: number
+}
+
 /**
  * Raw configuration for the `memoryContext` service (from cordis.yml). Every
  * field is optional; defaults produce a working out-of-the-box setup.
@@ -99,6 +107,15 @@ export interface MemoryContextConfig {
   contextWindow?: number
   /** Fraction of the window reserved for system prompt, tools, input, output. */
   headroomRatio?: number
+  /**
+   * Explicit per-model context windows. The authoritative per-model truth for
+   * models whose declared value is wrong or missing — e.g. a local model whose
+   * server runs 32K while the catalog says 100K, or a remote model whose real
+   * window differs from the declaration. Overrides feed the per-model registry
+   * (a probe result can still narrow them further) and the dynamic compaction
+   * threshold.
+   */
+  modelWindows?: ModelWindowOverride[]
   /**
    * Live model-context probing (fallback for local servers whose model
    * listing does not advertise a context window). The plugin first adopts the
@@ -125,6 +142,10 @@ export const MemoryContextConfigSchema: z<MemoryContextConfig> = z.object({
   storePath: z.string(),
   contextWindow: z.number().step(1).min(1),
   headroomRatio: z.number().min(0).max(0.9),
+  modelWindows: z.array(z.object({
+    model: z.string(),
+    contextWindow: z.number().step(1).min(1),
+  })),
   embedder: z.object({
     kind: z.union(['lightweight', 'transformers'] as const),
     dimension: z.number().step(1).min(8),
@@ -162,6 +183,7 @@ export interface ResolvedMemoryContextConfig {
   readonly storePath: string
   readonly contextWindow: number
   readonly headroomRatio: number
+  readonly modelWindows: readonly ModelWindowOverride[]
   readonly modelProbe: ResolvedModelProbeConfig
   readonly memory: MemoryConfig
 }
@@ -191,6 +213,7 @@ export function resolveMemoryContextConfig(raw: MemoryContextConfig): ResolvedMe
     storePath,
     contextWindow,
     headroomRatio,
+    modelWindows: raw.modelWindows ?? [],
     modelProbe,
     memory: {
       embedder,
@@ -238,6 +261,15 @@ export interface MemoryCompactionConfig {
   }
   /** History compression: number of rounds between compressions (0 disables). */
   compress_round_interval?: number
+  /**
+   * Dynamic compaction threshold: when the routed model's REAL context window
+   * (live probe or an explicit `modelWindows` override) is smaller than the
+   * window DSH declares, force the durable-history compaction as soon as the
+   * measured conversation crosses a threshold derived from the REAL window —
+   * instead of waiting for the declared-window threshold, which a short-context
+   * local model can never reach before overflowing. Default true.
+   */
+  compaction_dynamic_threshold?: boolean
   /**
    * History compression: trigger only when the current context exceeds this
    * fraction of the token budget. Delays compression while context is still
@@ -291,6 +323,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
     minScore: z.number().min(-1).max(1),
   }),
   compress_round_interval: z.number().step(1).min(0),
+  compaction_dynamic_threshold: z.boolean(),
   compress_trigger_ratio: z.number().min(0).max(1),
   compress_target_ratio: z.number().min(0).max(1),
   retain_recent_messages: z.number().step(1).min(1),
