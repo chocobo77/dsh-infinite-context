@@ -93,3 +93,48 @@ describe('ModelContextTracker', () => {
     expect(() => new ModelContextTracker(0, false)).toThrow(RangeError)
   })
 })
+
+describe('ModelContextTracker per-model registry', () => {
+  it('records explicit per-model overrides without moving the global slot', () => {
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.observe({ provider: 'glm', model: 'glm-5.3-flash', contextWindow: 1_000_000 })
+    tracker.setModelWindow({ model: 'Qwen3.8-27B', contextWindow: 32_768, source: 'config' })
+    expect(tracker.windowFor('glm-5.3-flash')).toBe(1_000_000)
+    expect(tracker.windowFor('Qwen3.8-27B')).toBe(32_768)
+    // Global slot still reflects the LAST observed route (glm), not the override.
+    expect(tracker.info?.model).toBe('glm-5.3-flash')
+    expect(tracker.windowFor('unknown-model')).toBeUndefined()
+    expect(tracker.perModel().map(entry => entry.model)).toEqual(['glm-5.3-flash', 'Qwen3.8-27B'])
+  })
+
+  it('keeps per-model windows isolated: one model cannot poison another', () => {
+    // Regression: the single global slot flip-flopped with whichever model
+    // requested last, so a 1M remote chat and an 8K local model shared one
+    // budget and one of them was always wrong.
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.observe({ model: 'local-qwen', contextWindow: 8192 })
+    tracker.observe({ model: 'remote-glm', contextWindow: 1_000_000 })
+    expect(tracker.windowFor('local-qwen')).toBe(8192)
+    expect(tracker.windowFor('remote-glm')).toBe(1_000_000)
+  })
+
+  it('lets a probe narrow a per-model window but never widen it', () => {
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.observe({ model: 'local-qwen', contextWindow: 100_000 })
+    // Probe finds the server really runs 32K: adopt(min(probed, declared)).
+    tracker.adopt({ model: 'local-qwen', contextWindow: 32_768, source: 'probe' })
+    expect(tracker.windowFor('local-qwen')).toBe(32_768)
+    // A later (re-)declaration cannot raise the narrowed value back.
+    tracker.adopt({ model: 'local-qwen', contextWindow: 100_000, source: 'request-context' })
+    expect(tracker.windowFor('local-qwen')).toBe(32_768)
+  })
+
+  it('ignores invalid setModelWindow values', () => {
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.setModelWindow({ model: 'm', contextWindow: 0, source: 'config' })
+    tracker.setModelWindow({ model: 'm', contextWindow: -1, source: 'config' })
+    tracker.setModelWindow({ contextWindow: 100, source: 'config' })
+    expect(tracker.windowFor('m')).toBeUndefined()
+    expect(tracker.perModel()).toEqual([])
+  })
+})

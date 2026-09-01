@@ -235,6 +235,7 @@ export class VectorRetriever {
   async retrieve(
     query: string,
     excludeIds?: ReadonlySet<string>,
+    tokenBudget?: number,
   ): Promise<{ message: UserMessage; hitCount: number; ids: string[] } | null> {
     try {
       const hits = await Promise.race([
@@ -256,17 +257,25 @@ export class VectorRetriever {
 
       // Budget-aware selection: keep whole memories (never slice mid-entry)
       // until the estimated token budget is exhausted, using the same
-      // CJK-aware estimator as the rest of the plugin.
+      // CJK-aware estimator as the rest of the plugin. When the caller passes
+      // an explicit per-call budget (e.g. capped to a share of a short-window
+      // model) the cap is strict: an oversized first memory is skipped rather
+      // than force-injected, and nothing is injected when nothing fits.
       let context = ''
       let contextTokens = 0
-      const budget = this.config.tokenBudget
+      const strict = tokenBudget !== undefined
+      const budget = Math.max(0, tokenBudget ?? this.config.tokenBudget)
       for (const part of parts) {
         const cost = estimateTokens(part) + 2 // +2 for the '\n\n' separator
         if (context.length > 0 && contextTokens + cost > budget) break
+        if (strict && context.length === 0 && cost > budget) continue
         context = context.length === 0 ? part : `${context}\n\n${part}`
         contextTokens += cost
       }
-      if (context.length === 0) context = parts[0] ?? ''
+      if (context.length === 0) {
+        if (strict) return null
+        context = parts[0] ?? ''
+      }
 
       const text =
         '<retrieved_context>\n'

@@ -9,6 +9,7 @@
 一个 DeepSeek Harness (DSH) 插件，通过**多层记忆管理**让长对话拥有「无限上下文」体验：
 
 - **渐进式压缩** — token 压力驱动，最老消息优先摘要，近期对话原样保留
+- **动态压缩阈值** — 按路由模型的**真实** CTX 推导触发水位；单轮超长 think 造成的一次性增长可越过轮次间隔立即介入
 - **三层记忆金字塔** — short（近期原文）→ mid（LLM 摘要）→ long（合并摘要）
 - **持久化存储** — SQLite（`node:sqlite`），重启不丢记忆
 - **语义检索** — 记忆嵌入、索引，每轮注入最相关的 top-K 记忆
@@ -23,6 +24,7 @@
 | 特性 | 说明 |
 |------|------|
 | 渐进式压缩 | `compress_trigger_ratio: 0.85` — 上下文 >85% 才压缩；`compress_target_ratio: 0.6` — 只摘要溢出部分 |
+| 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声名窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；单轮激增（≥20% 窗口）越过轮次间隔 |
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；Ollama 可选主动探测 |
@@ -77,6 +79,7 @@ tests/                    62 个单元测试
 | `storePath` | `dsh-infinite-context.db` | SQLite 路径；`:memory:` 禁用持久化 |
 | `contextWindow` | `94000` | 模型上下文窗口（**回退值**；插件自动采纳 DSH 解析的真实窗口，并会以实时探测结果为上限） |
 | `headroomRatio` | `0.25` | 系统/工具/输入/输出预留比例 |
+| `modelWindows` | `[]` | 逐模型显式窗口表（`[{model, contextWindow}]`）——声名值缺失或虚高/虚低时的**权威真值**；探测结果仍可进一步收窄 |
 | `modelProbe.enabled/kind/baseURL` | `false` | 主动探测本地服务器的**真实**上下文窗口（`llama`/`ollama`/`openai`） |
 | `embedder.kind` | `lightweight` | `lightweight`（无依赖）或 `transformers` |
 | `budget.short/mid/long/retrieved` | `10000/20000/5000/15000` | 分层 token 预算 |
@@ -89,12 +92,19 @@ tests/                    62 个单元测试
 > `llama`/`ollama`）后，插件会在首次观测到该模型时读取服务器的真实运行上下文，
 > 并取 `min(声明值, 探测值)` 作为生效窗口——压缩因此会在真实上限之前触发，而不是
 > 等到溢出。插件自身的每轮 RAG 注入（`rag_token_budget`）也会从压缩触发水位中预留，
-> 避免「插件自己吃掉的上下文」被漏算。
+> 避免「插件自己吃掉的上下文」被漏算。远程模型（无法探测的）用 `modelWindows`
+> 直接钉住真实窗口，例如 `[{model: glm-5.3-flash, contextWindow: 1000000}]`。
+
+> **逐模型窗口注册表**：同一运行时里多个会话可能路由到不同模型（1M 的远程对话 +
+> 8K 的本地模型）。窗口按**模型 id** 分别记录（探测/声明/覆盖取最小值），
+> 压缩预算按「当前会话路由到的模型」取值——上一个请求属于别的模型不会再污染本会话的水位。
+> `memory_status` / `memory_model_probe` 会输出 `perModelWindows` 全表便于核对。
 
 #### `memory-compaction` 配置
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
+| `compaction_dynamic_threshold` | `true` | **动态压缩阈值**：当路由模型的**真实**窗口（探测 / `modelWindows`）小于声名窗口时，按真实窗口推导阈值强制持久化历史压缩（复用 compaction-basic 的溢出式均衡压缩），不再等一个模型永远到不了的声名窗口阈值——短上下文本地模型的「续杯」能力；同一会话两次强制压缩间隔 ≥30s |
 | `compress_trigger_ratio` | `0.85` | 上下文 >85% 预算时才压缩 |
 | `compress_target_ratio` | `0.6` | 压缩目标水位（只处理溢出部分） |
 | `retain_recent_messages` | `4` | 最近 N 条消息永不压缩 |
@@ -149,6 +159,7 @@ A DeepSeek Harness (DSH) plugin that gives long sessions an "infinite context"
 feel via **multi-tier memory management**:
 
 - **Progressive compression** — token-pressure driven, oldest-first summarization, recent context preserved verbatim
+- **Dynamic compaction threshold** — trigger water level derived from the routed model's REAL CTX; a single oversized thinking turn bypasses the round-interval rate limit
 - **Three-tier memory pyramid** — short (recent turns) → mid (LLM summaries) → long (consolidated summaries)
 - **Persistent store** — SQLite (`node:sqlite`), memories survive restarts
 - **Semantic retrieval** — memories embedded, indexed, and top-K spliced into context per turn
@@ -163,6 +174,7 @@ feel via **multi-tier memory management**:
 | Feature | Description |
 |---------|-------------|
 | Progressive compression | `compress_trigger_ratio: 0.85` — compress only when >85% full; `compress_target_ratio: 0.6` — only summarize overflow |
+| Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; a single-round surge (≥20% of window) bypasses the interval |
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; optional active probe for Ollama |
@@ -173,10 +185,10 @@ feel via **multi-tier memory management**:
 | Tool | Description |
 |------|-------------|
 | `memory_search(query?, k?)` | Semantic search over persisted memories |
-| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX |
+| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX + per-model windows |
 | `memory_index(limit?)` | MEMORY.md-style structured index |
 | `memory_maintain` | Read-only audit: duplicates/conflicts/stale |
-| `memory_model_probe(forceProbe?, model?)` | Report model CTX source, force probe |
+| `memory_model_probe(forceProbe?, model?)` | Report model CTX source, force probe, list per-model windows |
 | `memory_forget` | Run a forgetting sweep |
 | `memory_consolidate` | Force pyramid consolidation |
 | `memory_reset` | Erase all memories |

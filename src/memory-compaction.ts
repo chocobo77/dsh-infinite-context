@@ -23,6 +23,7 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig, ResolvedConfig } from '@deepseek-ai/dsh-compaction-basic'
+import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
 import { BlockAssembler, LlmError, contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
@@ -36,6 +37,8 @@ import type {
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
+// Type-only: brings the `ctx.tokenMeter` service declaration into scope.
+import type {} from '@deepseek-ai/dsh-token-meter'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import {
   DEFAULT_INGEST_DENYLIST,
@@ -45,6 +48,11 @@ import {
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { estimateTokens } from './token-budget.ts'
+import {
+  COMPRESS_FAILURE_COOLDOWN,
+  decidePressureCompaction,
+  shouldCompressHistory,
+} from './compaction-policy.ts'
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
 
@@ -67,6 +75,34 @@ type SummaryResult = {
 
 /** The plugin label stamped on synthesized messages for provenance. */
 const PLUGIN = 'dsh-infinite-context'
+
+/**
+ * Minimum delay between two FORCED narrowed-window pressure compactions of the
+ * same session. Prevents a summary that barely shrank the surface from
+ * triggering a summarization storm on the following steps; the next force is
+ * simply deferred, and provider overflow recovery remains the backstop.
+ */
+const FORCED_PRESSURE_COOLDOWN_MS = 30_000
+
+/**
+ * Share of the session's model window the per-turn RAG injection may occupy.
+ * The configured `rag_token_budget` stays the ceiling; on short-window local
+ * models the injection is additionally capped at this share so retrieved
+ * memories cannot crowd out the conversation itself ("续杯" headroom).
+ */
+const RAG_WINDOW_SHARE = 0.08
+
+/**
+ * Resolve the exact provider/model route durably recorded for the session's
+ * latest request (mirrors compaction-basic's own `routedTarget`).
+ */
+function routedTargetOf(session: Session): { provider: string; model: string } | undefined {
+  const config = session.requestHeader()?.config
+  if (config === undefined || config.provider.length === 0 || config.model.length === 0) {
+    return undefined
+  }
+  return { provider: config.provider, model: config.model }
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Message / text helpers                                                     */
@@ -233,12 +269,28 @@ async function summarizeMemoriesWithLlm(
 interface SessionCounter {
   turn: number
   lastActive: number
+  /** Turn number of the last successful compression (undefined = never). */
+  lastCompressedTurn?: number
+  /** Estimated tokens observed at the previous check (for surge detection). */
+  lastTokens?: number
+  /** Remaining rounds to wait after a failed (non-shrinking) compression. */
+  failureCooldown: number
 }
 
 /** Result of a compression operation. */
 export interface CompressResult {
   messages: readonly Message[]
   tokensSaved: number
+}
+
+/** Options for one {@link HistoryCompressor.compress} call. */
+export interface CompressOptions {
+  /**
+   * The session's effective model window (per-model probe/override or the
+   * request context). Defaults to the globally adopted window, which may
+   * belong to a different model when several sessions share the runtime.
+   */
+  window?: number
 }
 
 /**
@@ -300,9 +352,14 @@ export class HistoryCompressor {
     this.injectionBudget = injectionBudget
   }
 
-  /** The effective token budget: context window minus headroom. */
-  tokenBudget(): number {
-    const window = this.ctx.memoryContext.contextWindow
+  /**
+   * The effective token budget: context window minus headroom.
+   * @param windowOverride - the session's effective model window when the
+   *   caller resolved one for the routed model; defaults to the globally
+   *   adopted window (which may belong to a different model).
+   */
+  tokenBudget(windowOverride?: number): number {
+    const window = windowOverride ?? this.ctx.memoryContext.contextWindow
     const headroom = this.ctx.memoryContext.headroomRatio ?? 0.25
     return Math.floor(window * (1 - headroom))
   }
@@ -316,19 +373,20 @@ export class HistoryCompressor {
   }
 
   /**
-   * Increment the turn counter for a session and return the new count.
+   * Increment the turn counter for a session and return the entry.
    * Initializes to 0 if the session has never been seen.
    */
-  private incrementAndGetTurn(sessionId: string): number {
+  private touchSession(sessionId: string): SessionCounter {
     const entry = this.turnCounters.get(sessionId)
     const now = Date.now()
     if (entry === undefined) {
-      this.turnCounters.set(sessionId, { turn: 1, lastActive: now })
-      return 1
+      const created: SessionCounter = { turn: 1, lastActive: now, failureCooldown: 0 }
+      this.turnCounters.set(sessionId, created)
+      return created
     }
     entry.turn++
     entry.lastActive = now
-    return entry.turn
+    return entry
   }
 
   /**
@@ -366,30 +424,76 @@ export class HistoryCompressor {
    * @param force - skip the round-interval check (for manual/force compress).
    * @returns compressed messages + tokens saved, or null if no compression.
    */
-  async compress(sessionId: string, messages: readonly Message[], force = false): Promise<CompressResult | null> {
+  /**
+   * Compress old messages when token pressure warrants it.
+   *
+   * Trigger policy (see {@link shouldCompressHistory}): the token-pressure
+   * condition dominates — once over the trigger water level the compression
+   * runs as soon as the round rate limit allows, and a single-round token surge
+   * (e.g. one very long thinking turn) bypasses the rate limit entirely so a
+   * short-window model gets relief on the very next step.
+   *
+   * Uses a detail-preserving extraction strategy:
+   *   - Short conversations (< 20 messages): single-pass with extractive prompt.
+   *   - Long conversations (>= 20 messages): batch extraction (20/batch, 5 overlap)
+   *     followed by a merge pass to combine batch summaries.
+   *
+   * CRITICAL: The recursion lock must surround the LLM call. Without it, the
+   * summarization call itself would pass through the agent loop and re-trigger
+   * governance (including another compression attempt), causing infinite
+   * recursion → stack overflow → process crash.
+   *
+   * @param sessionId - the current session identifier.
+   * @param messages  - the full message array (will NOT be mutated).
+   * @param force - skip the trigger gates (for manual/force compress).
+   * @param options - `window`: the session's effective model window (defaults
+   *   to the globally adopted window).
+   * @returns compressed messages + tokens saved, or null if no compression.
+   */
+  async compress(
+    sessionId: string,
+    messages: readonly Message[],
+    force = false,
+    options: CompressOptions = {},
+  ): Promise<CompressResult | null> {
     if (!this.available()) return null
 
-    const currentTurn = this.incrementAndGetTurn(sessionId)
+    const entry = this.touchSession(sessionId)
+    const currentTurn = entry.turn
     if (messages.length <= this.retainRecent) return null
+    const window = options.window ?? this.ctx.memoryContext.contextWindow
     const beforeTokens = this.estimateMessageTokens(messages)
 
-    // Token-pressure trigger: compress only when the round interval has
-    // elapsed AND the context is actually over the trigger water level.
-    // This delays compression while the context is still roomy, preserving
-    // more verbatim history for as long as possible. The plugin's own per-turn
-    // RAG injection (spliced in after this check) is reserved up front so the
-    // trigger reflects the REAL request size, not just the message array.
-    if (!force) {
-      if (currentTurn % this.compressInterval !== 0) return null
-      const budget = this.tokenBudget()
-      const triggerTokens = Math.max(0, Math.floor(budget * this.triggerRatio) - this.injectionBudget)
-      if (beforeTokens <= triggerTokens) {
-        this.ctx.logger.debug(
-          `[ContextGovernor] Compression deferred: ${beforeTokens} tokens <= `
-          + `${triggerTokens} trigger (interval reached, injection budget ${this.injectionBudget})`,
-        )
-        return null
-      }
+    // Token-pressure trigger with surge bypass and failure cooldown. The
+    // plugin's own per-turn RAG injection (spliced in after this check) is
+    // reserved up front so the trigger reflects the REAL request size.
+    const budget = this.tokenBudget(window)
+    const triggerTokens = Math.max(0, Math.floor(budget * this.triggerRatio) - this.injectionBudget)
+    const verdict = shouldCompressHistory({
+      force,
+      turn: currentTurn,
+      lastCompressedTurn: entry.lastCompressedTurn,
+      lastTokens: entry.lastTokens,
+      tokens: beforeTokens,
+      triggerTokens,
+      windowTokens: window,
+      compressInterval: this.compressInterval,
+      failureCooldown: entry.failureCooldown,
+    })
+    entry.lastTokens = beforeTokens
+    if (!verdict.compress) {
+      this.ctx.logger.debug(
+        `[ContextGovernor] Compression deferred (${verdict.reason}): ${beforeTokens} tokens, `
+        + `trigger ${triggerTokens}, window ${window}, interval ${this.compressInterval}`,
+      )
+      if (verdict.reason === 'cooldown') entry.failureCooldown--
+      return null
+    }
+    if (verdict.reason === 'surge') {
+      this.ctx.logger.info(
+        `[ContextGovernor] Compression surge trigger: single-round growth reached `
+        + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
+      )
     }
 
     // Acquire recursion lock — blocks re-entrant governance during summarization
@@ -404,7 +508,6 @@ export class HistoryCompressor {
       // newer stays verbatim so recent context remains fully coherent. The
       // injection budget is reserved here too, so after the RAG splice the
       // request still lands at (not above) the target.
-      const budget = this.tokenBudget()
       const targetTokens = Math.max(0, Math.floor(budget * this.targetRatio) - this.injectionBudget)
       const toFree = beforeTokens - targetTokens
 
@@ -479,18 +582,25 @@ export class HistoryCompressor {
 
       // Hard guard (mirrors compaction-basic's "summary not smaller" check):
       // a summary that does not actually shrink the context is useless and
-      // only wastes an LLM call — treat it as a failed compression.
+      // only wastes an LLM call — treat it as a failed compression and cool
+      // down so the next steps do not burn an LLM call per turn on the same
+      // unshrinkable retained tail.
       if (saved <= 0) {
+        entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
         this.ctx.logger.warn(
           `[ContextGovernor] Compression rejected: summary is not smaller `
-          + `(Before: ${beforeTokens}, After: ${afterTokens} tokens)`,
+          + `(Before: ${beforeTokens}, After: ${afterTokens} tokens); `
+          + `cooling down for ${COMPRESS_FAILURE_COOLDOWN} rounds`,
         )
         return null
       }
 
+      entry.lastCompressedTurn = currentTurn
+      entry.failureCooldown = 0
       this.ctx.logger.info(
         `[ContextGovernor] Compressed history: ${oldMessages.length} messages → 1 summary. `
-        + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens`,
+        + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens `
+        + `(trigger reason: ${verdict.reason})`,
       )
 
       // Persist the compression summary as a mid memory. The live summary
@@ -512,6 +622,7 @@ export class HistoryCompressor {
 
       return { messages: newMessages, tokensSaved: saved }
     } catch (err) {
+      entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
       this.ctx.logger.warn(
         `[ContextGovernor] History compression error: ${err instanceof Error ? err.message : String(err)}`,
       )
@@ -853,6 +964,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * which would bloat the context and accumulate contradictions.
    */
   private readonly lastInjectedIds = new WeakMap<Session, ReadonlySet<string>>()
+  /** Last forced narrowed-window pressure compaction per session (epoch ms). */
+  private readonly lastForceAt = new Map<string, number>()
+  /** Whether the narrowed-window (probe/override) compaction override is on. */
+  private readonly dynamicThreshold: boolean
   /** Public so memoryContext can reference it for force-compress. */
   readonly compressor: HistoryCompressor
   private readonly retriever: VectorRetriever
@@ -874,6 +989,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_round_interval,
       compress_trigger_ratio,
       compress_target_ratio,
+      compaction_dynamic_threshold,
       retain_recent_messages,
       sanitize_max_chars,
       rag_top_k,
@@ -904,6 +1020,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const injectionBudget = rag_token_budget ?? 3000
     this.retainRecent = retainRecent
     this.injectionBudget = injectionBudget
+    this.dynamicThreshold = compaction_dynamic_threshold ?? true
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -959,6 +1076,95 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // (Strategy 1) and model-context adoption (G8) — both must keep working
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
+  }
+
+  /**
+   * Step-boundary compaction entry, overridden to make the trigger track the
+   * routed model's REAL context window.
+   *
+   * The inherited pressure policy scales its threshold off the window DSH
+   * declares for the routed model (adapter/catalog). For local servers that
+   * declaration is frequently several times larger than the runtime context,
+   * so the threshold sits beyond what the model can hold and the conversation
+   * overflows before compaction ever fires — a single long thinking turn makes
+   * this worse because a whole round of growth lands at once. When a probe or
+   * a `modelWindows` override has narrowed the routed model's window below the
+   * declared one, this override forces the base overflow-style balanced
+   * reduction as soon as the measured conversation crosses a threshold derived
+   * from the REAL window (see {@link decidePressureCompaction}); otherwise it
+   * delegates unchanged.
+   */
+  override async compactIfNeeded(
+    agent: Agent,
+    trigger: CompactionTrigger,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null> {
+    if (trigger === 'pressure' && this.dynamicThreshold && !signal.aborted) {
+      const handled = await this.forceNarrowedPressure(agent, signal)
+      if (handled !== undefined) return handled
+    }
+    return super.compactIfNeeded(agent, trigger, signal)
+  }
+
+  /**
+   * Evaluate the narrowed-window pressure override for one step.
+   * @returns `undefined` to delegate to the base policy, or the result to
+   *   return in its place (`null` = skip, `CompactionResult` = forced run).
+   */
+  private async forceNarrowedPressure(
+    agent: Agent,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null | undefined> {
+    try {
+      const target = routedTargetOf(agent.session)
+      if (target === undefined) return undefined
+      const narrowed = this.ctx.memoryContext.windowForModel(target.model)
+      if (narrowed === undefined) return undefined
+      const declared = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal))
+        .context?.contextWindow
+      if (signal.aborted) return undefined
+      const measurement = this.ctx.tokenMeter.measure(agent.session)
+      const decision = decidePressureCompaction({
+        declaredWindow: declared,
+        narrowedWindow: narrowed,
+        measuredTokens: measurement.totalTokens,
+        thresholdRatio: this.thresholdRatioFor(target),
+      })
+      if (decision.mode === 'skip') {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Pressure below narrowed threshold: ${measurement.totalTokens} < `
+          + `${decision.thresholdTokens} (model=${target.model}, window=${narrowed})`,
+        )
+        return null
+      }
+      if (decision.mode !== 'force') return undefined
+      const key = String(agent.session.id)
+      const now = Date.now()
+      if (now - (this.lastForceAt.get(key) ?? 0) < FORCED_PRESSURE_COOLDOWN_MS) return null
+      this.lastForceAt.set(key, now)
+      this.ctx.logger.info(
+        `[ContextGovernor] Narrowed-window pressure: ${measurement.totalTokens} tokens >= `
+        + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
+        + `< declared ${declared ?? 'unknown'}); forcing balanced compaction`,
+      )
+      return await super.compactIfNeeded(agent, 'context-overflow', signal)
+    } catch (error) {
+      // Unknown route, resolveModelInfo rejection, aborted probe — fall back to
+      // the base policy, which produces its own structured diagnostics.
+      this.ctx.logger.debug(
+        `[ContextGovernor] Dynamic pressure check unavailable: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return undefined
+    }
+  }
+
+  /** The compaction threshold ratio the base policy resolves for this target. */
+  private thresholdRatioFor(target: { provider: string; model: string }): number {
+    const override = this.config.modelPolicies.find(
+      policy => policy.provider === target.provider && policy.model === target.model,
+    )
+    return override?.thresholdRatio ?? this.config.thresholdRatio
   }
 
   /**
@@ -1048,7 +1254,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // `/models`). This is what makes compression track the real model's
         // context length — a 8K local model compresses early, a 128K online
         // model waits — instead of a hard-coded window. Falls back to the
-        // configured window when DSH has not resolved one yet.
+        // configured window when DSH has not resolved one yet. The per-model
+        // registry (probe / modelWindows overrides) narrows this to the REAL
+        // runtime window for the routed model when one is known.
+        let sessionWindow: number | undefined
         const requestContext = session.requestContext()
         if (requestContext !== undefined) {
           ctx.memoryContext.observeRequestContext({
@@ -1056,7 +1265,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             ...requestContext.model === undefined ? {} : { model: requestContext.model },
             ...requestContext.contextWindow === undefined ? {} : { contextWindow: requestContext.contextWindow },
           })
+          sessionWindow = ctx.memoryContext.windowForModel(requestContext.model)
         }
+        const effectiveWindow = sessionWindow ?? ctx.memoryContext.contextWindow
         // Deep copy here to avoid side effects.
         // Type is Message[] (not UserMessage[]) because compression injects a
         // user-role summary and fallbackTruncate can reshape the array; the
@@ -1065,7 +1276,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         let currentMessages: Message[] = decision.messages.map(m => ({ ...m }))
 
         // --- Strategy 1: History compression (recursion-locked) ---
-        const compressResult = await this.compressor.compress(sessionId, currentMessages)
+        const compressResult = await this.compressor.compress(
+          sessionId,
+          currentMessages,
+          false,
+          { window: effectiveWindow },
+        )
         if (compressResult !== null) {
           currentMessages = [...compressResult.messages]
         }
@@ -1073,11 +1289,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
         // compression and CTX adoption above stay active regardless) ---
         if (this.retrieval.enabled) {
+          // Cap the injection at a share of the session's REAL window so a
+          // short-context local model keeps room for the conversation itself
+          // (the configured rag_token_budget remains the ceiling for large
+          // windows).
+          const injectionCap = Math.min(
+            this.injectionBudget,
+            Math.max(256, Math.floor(effectiveWindow * RAG_WINDOW_SHARE)),
+          )
           const userText = this.latestUserText(currentMessages)
           let memoryMessage: UserMessage | undefined
           if (userText !== undefined) {
             const excludeIds = this.lastInjectedIds.get(session)
-            const retrieval = await this.retriever.retrieve(userText, excludeIds)
+            const retrieval = await this.retriever.retrieve(userText, excludeIds, injectionCap)
             if (retrieval !== null) {
               memoryMessage = retrieval.message
               this.lastInjectedIds.set(session, new Set(retrieval.ids))
@@ -1113,10 +1337,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         }
 
         // --- Fallback truncation (Strategy 2 — deterministic last resort) ---
-        // Budget: context window minus headroom (same factor as the
-        // compressor's tokenBudget()).
+        // Budget: the session's effective window minus headroom (same factor
+        // as the compressor's tokenBudget()).
         const headroom = ctx.memoryContext.headroomRatio ?? 0.25
-        const tokenBudget = Math.floor(ctx.memoryContext.contextWindow * (1 - headroom))
+        const tokenBudget = Math.floor(effectiveWindow * (1 - headroom))
         const beforeCount = currentMessages.length
         currentMessages = fallbackTruncate(currentMessages, tokenBudget, this.retainRecent)
         if (currentMessages.length < beforeCount) {
