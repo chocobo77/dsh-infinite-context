@@ -154,7 +154,19 @@ scripts\install-dsh-plugin.bat
 
 # 或直接调用 PowerShell 版
 scripts\install-dsh-plugin.ps1 <目录|tgz|npm:包名|github:owner/repo> -Profile <name>
+
+# 只验证自动探测结果（node / harness / DSH_HOME / profile / 来源），不打包不安装不重启
+scripts\install-dsh-plugin.ps1 -DetectOnly
 ```
+
+> **自动探测与持久化**（2026-09-03）：脚本自动定位 harness 根目录——优先级为
+> **运行中的 DSH 进程工作目录（PEB 读取，最权威）→ cfg 记忆值 → 常见安装位置 → 文件系统浅层检索**，
+> `$DSH_HOME` 取 `$env:DSH_HOME` 或 `~/.dsh`；解析结果持久化到 `scripts/install-dsh-plugin.cfg`
+> （GBK，与 bat 共用）。tarball 固定输出到 `~/.dsh/packages/`（规避 `dsh plugin add` 临时路径陷阱）；
+> 安装前自动移除目标 profile 里指向临时/已失效路径的旧依赖（否则 pnpm add 直接 ENOENT 失败），
+> 安装后校验依赖已指向持久化 tarball。注意：`scripts/install-dsh-plugin.ps1` 必须保存为
+> **带 BOM 的 UTF-8**（powershell.exe 5.1 对无 BOM 文件按 ANSI/GBK 误读中文会解析错乱），
+> `install-dsh-plugin.bat` 必须是 **GBK + CRLF**（cmd 对 LF-only 批处理解析错位）。
 
 ### 测试
 
