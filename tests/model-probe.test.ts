@@ -64,6 +64,34 @@ describe('model probe', () => {
     await expect(probeOpenAI('http://127.0.0.1:8000/v1', 'vllm-model')).resolves.toBe(32_768)
   })
 
+  it('reads llama-server meta.n_ctx from the OpenAI-compatible listing', async () => {
+    mockFetchOnce((url, init) => {
+      expect(url).toBe('http://127.0.0.1:1234/v1/models')
+      expect(init?.method).toBeUndefined()
+      return jsonResponse({
+        data: [
+          { id: 'other', meta: { n_ctx: 8192 } },
+          { id: 'Qwen3.8-27B-UD-Q2_K_XL', meta: { n_ctx: 131_072, n_ctx_train: 262_144 } },
+        ],
+      })
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'Qwen3.8-27B-UD-Q2_K_XL')).resolves.toBe(131_072)
+  })
+
+  it('prefers a top-level context field over the nested llama meta', async () => {
+    mockFetchOnce(() => jsonResponse({
+      data: [{ id: 'qwen3.8-27b', context_length: 32_768, meta: { n_ctx: 4096 } }],
+    }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBe(32_768)
+  })
+
+  it('ignores llama meta.n_ctx when the model id does not match', async () => {
+    mockFetchOnce(() => jsonResponse({
+      data: [{ id: 'other', meta: { n_ctx: 131_072 } }],
+    }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'Qwen3.8-27B-UD-Q2_K_XL')).resolves.toBeUndefined()
+  })
+
   it('falls back to LM Studio /api/v0/models max_total_tokens', async () => {
     mockFetchOnce(url => {
       if (url === 'http://127.0.0.1:1234/v1/models') {

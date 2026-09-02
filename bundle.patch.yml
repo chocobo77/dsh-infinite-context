@@ -32,13 +32,18 @@
         # still narrow them further. Adjust/remove to match the models you
         # actually run:
         #   - glm-5.3-flash: declared in settings.yaml as 1000000.
-        #   - Qwen3.8-27B-UD-Q4_K_XL: local model; set this to the value LM
-        #     Studio reports (max_total_tokens) if probing stays unavailable.
+        #   - Qwen3.8-27B-UD-Q4_K_XL: local model; set to the value LM Studio
+        #     reports (max_total_tokens) if probing stays unavailable.
+        #   - Qwen3.8-27B-UD-Q2_K_XL: local model served by llama.cpp with
+        #     --ctx-size 131072 (its /v1/models reports meta.n_ctx=131072, which
+        #     the openai probe now reads automatically).
         modelWindows:
           - model: glm-5.3-flash
             contextWindow: 1000000
           - model: Qwen3.8-27B-UD-Q4_K_XL
             contextWindow: 32768
+          - model: Qwen3.8-27B-UD-Q2_K_XL
+            contextWindow: 131072
         embedder:
           kind: lightweight
           dimension: 256
