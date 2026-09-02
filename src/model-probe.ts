@@ -24,6 +24,35 @@ import type { ModelProbeKind } from './config.ts'
 /** Timeout for one live probe, in milliseconds. */
 export const PROBE_TIMEOUT_MS = 5000
 
+/** Hostnames that unambiguously point back at this machine. */
+const LOOPBACK_HOSTS = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '::',
+  '0.0.0.0',
+  '::ffff:127.0.0.1',
+])
+
+/**
+ * Whether a hostname denotes a LOCAL server (loopback or an RFC1918 private
+ * LAN address), as opposed to a public online API. The probe path uses this to
+ * decide which models deserve a live context probe: local models are probed
+ * for their REAL runtime context, while online models are trusted at the
+ * window settings/DSH declared for them (and probing them would just hit a
+ * remote endpoint that neither advertises `context_length` nor answers
+ * unauthenticated).
+ */
+export function isLocalHostname(host: string): boolean {
+  const normalized = host.trim().toLowerCase()
+  if (normalized.length === 0) return false
+  if (LOOPBACK_HOSTS.has(normalized)) return true
+  if (normalized.startsWith('10.')) return true
+  if (normalized.startsWith('192.168.')) return true
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(normalized)) return true
+  return false
+}
+
 /** A positive integer field, or `undefined` when absent/unusable. */
 function positiveInt(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value

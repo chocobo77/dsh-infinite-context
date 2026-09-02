@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { probeLlama, probeModelContext, probeOllama, probeOpenAI } from '../src/core.ts'
+import { isLocalHostname, probeLlama, probeModelContext, probeOllama, probeOpenAI } from '../src/core.ts'
 
 const originalFetch = globalThis.fetch
 
@@ -129,5 +129,30 @@ describe('model probe', () => {
   it('returns undefined when probing is disabled or baseURL is blank', async () => {
     await expect(probeModelContext({ enabled: false, kind: 'llama', baseURL: 'http://x' })).resolves.toBeUndefined()
     await expect(probeModelContext({ enabled: true, kind: 'llama', baseURL: '' })).resolves.toBeUndefined()
+  })
+})
+
+describe('isLocalHostname', () => {
+  it('classifies loopback hosts as local', () => {
+    expect(isLocalHostname('127.0.0.1')).toBe(true)
+    expect(isLocalHostname('localhost')).toBe(true)
+    expect(isLocalHostname('::1')).toBe(true)
+    expect(isLocalHostname('0.0.0.0')).toBe(true)
+    expect(isLocalHostname(' LOCALHOST ')).toBe(true)
+  })
+
+  it('classifies RFC1918 private hosts as local', () => {
+    expect(isLocalHostname('10.0.0.5')).toBe(true)
+    expect(isLocalHostname('192.168.1.10')).toBe(true)
+    expect(isLocalHostname('172.16.0.1')).toBe(true)
+    expect(isLocalHostname('172.31.255.255')).toBe(true)
+  })
+
+  it('classifies public online hosts as non-local', () => {
+    expect(isLocalHostname('open.bigmodel.cn')).toBe(false)
+    expect(isLocalHostname('api.xiaomimimo.com')).toBe(false)
+    expect(isLocalHostname('ark.cn-beijing.volces.com')).toBe(false)
+    expect(isLocalHostname('8.8.8.8')).toBe(false)
+    expect(isLocalHostname('')).toBe(false)
   })
 })
