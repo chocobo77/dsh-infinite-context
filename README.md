@@ -88,12 +88,13 @@ tests/                    62 个单元测试
 
 > **本地模型（LM Studio / llama-server / Ollama）**：`settings.yaml` 里声明的
 > `contextWindow` 可能远大于服务器实际运行的上下文（例如声明 100000、实际只有 8k）。
-> 开启 `modelProbe`（`kind: openai` 同时兼容 LM Studio 的 `/api/v0/models`，或
-> `llama`/`ollama`）后，插件会在首次观测到该模型时读取服务器的真实运行上下文，
-> 并取 `min(声明值, 探测值)` 作为生效窗口——压缩因此会在真实上限之前触发，而不是
-> 等到溢出。插件自身的每轮 RAG 注入（`rag_token_budget`）也会从压缩触发水位中预留，
-> 避免「插件自己吃掉的上下文」被漏算。远程模型（无法探测的）用 `modelWindows`
-> 直接钉住真实窗口，例如 `[{model: glm-5.3-flash, contextWindow: 1000000}]`。
+> 开启 `modelProbe`（`kind: openai` 同时兼容 LM Studio 的 `/api/v0/models` 与
+> **llama-server 的 `meta.n_ctx`**，或 `llama`/`ollama`）后，插件会在首次观测到该模型时
+> 读取服务器的真实运行上下文，并取 `min(声明值, 探测值)` 作为生效窗口——压缩因此会在
+> 真实上限之前触发，而不是等到溢出。插件自身的每轮 RAG 注入（`rag_token_budget`）
+> 也会从压缩触发水位中预留，避免「插件自己吃掉的上下文」被漏算。远程模型（无法探测的）
+> 用 `modelWindows` 直接钉住真实窗口，例如 `[{model: glm-5.3-flash, contextWindow: 1000000}]`；
+> 本地模型也可用它兜底（如 llama.cpp `--ctx-size` 固定值），探测结果仍会进一步收窄。
 
 > **逐模型窗口注册表**：同一运行时里多个会话可能路由到不同模型（1M 的远程对话 +
 > 8K 的本地模型）。窗口按**模型 id** 分别记录（探测/声明/覆盖取最小值），
