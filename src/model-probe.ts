@@ -99,7 +99,7 @@ export async function probeOllama(baseURL: string, model?: string): Promise<numb
 }
 
 /** Context-length fields advertised by standard OpenAI-compatible `/models` listings. */
-const CONTEXT_FIELDS = ['context_length', 'context_window', 'max_model_len'] as const
+const CONTEXT_FIELDS = ['context_length', 'context_window', 'max_model_len', 'n_ctx'] as const
 
 /**
  * Context-length fields reported by local servers' NATIVE listings that never
@@ -107,6 +107,29 @@ const CONTEXT_FIELDS = ['context_length', 'context_window', 'max_model_len'] as 
  * `/api/v0/models` reports the loaded model's runtime context here.
  */
 const NATIVE_CONTEXT_FIELDS = ['max_total_tokens', 'max_completion_tokens', 'n_ctx'] as const
+
+/**
+ * Read a context length from one listing entry: first the entry's own fields,
+ * then the nested `meta` object. llama-server's OpenAI-compatible listing
+ * reports the runtime context only as `meta.n_ctx` (never as a top-level
+ * `context_length`), so without this fallback the probe would not discover
+ * the real `--ctx-size` of a local llama.cpp model.
+ */
+function entryContext(entry: Record<string, unknown>, fields: readonly string[]): number | undefined {
+  for (const field of fields) {
+    const found = positiveInt(entry[field])
+    if (found !== undefined) return found
+  }
+  const meta = entry.meta
+  if (typeof meta === 'object' && meta !== null) {
+    const record = meta as Record<string, unknown>
+    for (const field of fields) {
+      const found = positiveInt(record[field])
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
 
 /** Read a context length from a `{ data: [...] }` listing, filtered by model id. */
 async function probeListing(
@@ -125,11 +148,8 @@ async function probeListing(
     ? data
     : data.filter(entry => (entry as { id?: unknown })?.id === name)
   for (const raw of entries) {
-    const entry = raw as Record<string, unknown>
-    for (const field of fields) {
-      const found = positiveInt(entry[field])
-      if (found !== undefined) return found
-    }
+    const found = entryContext(raw as Record<string, unknown>, fields)
+    if (found !== undefined) return found
   }
   return undefined
 }
