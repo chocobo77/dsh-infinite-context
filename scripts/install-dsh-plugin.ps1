@@ -16,7 +16,7 @@
     - 识别已知 pnpm 错误并给出修复提示（supply-chain 策略 / ignored builds / 旧符号链接）。
     - -Restart 安装成功后联动重启脚本（分离进程，先送消息再杀 3080 端口宿主）。
 
-  关键约束（详见 dsh-infinite-context 仓库 DSH插件安装注意事项.md）：
+  关键约束（详见 dsh-infinite-context 仓库 DSH插件开发经验.md）：
     * Node 24 拒绝对 node_modules 下的 .ts 做类型剥离（ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING），
       因此作为包安装的插件必须发布编译后的 dist/ JS，源码 .ts 直载只适用于 file:/// 手工部署。
     * bundle 补丁入口必须用裸子路径说明符（包名/子路径），不能用相对路径（相对 profile 目录解析）。
