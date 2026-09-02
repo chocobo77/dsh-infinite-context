@@ -120,10 +120,20 @@ export class ModelContextTracker {
    * so a live probe is still requested (once per model, respecting the retry
    * cooldown). The probe result (capped at the declared window by the caller)
    * then narrows the effective window to the server's true limit.
+   *
+   * Probing is caller-gated by locality: only models routed to a LOCAL server
+   * (`probe: true`) get a live probe. Online models (`probe: false`) adopt
+   * their declared window and are never probed, so the plugin never wastes a
+   * probe on a remote endpoint that would neither report a context length nor
+   * answer unauthenticated.
    * @param route - the observed route metadata.
+   * @param options - whether a live probe is allowed for this route (locality).
    * @returns a model id to probe (once per model, after cooldown), or undefined.
    */
-  observe(route: ModelRouteObservation): string | undefined {
+  observe(
+    route: ModelRouteObservation,
+    options: { probe?: boolean } = {},
+  ): string | undefined {
     if (route.contextWindow !== undefined) {
       this.adopt({
         ...(route.provider === undefined ? {} : { provider: route.provider }),
@@ -133,7 +143,7 @@ export class ModelContextTracker {
       })
     }
     const model = route.model
-    if (model === undefined || !this.probeEnabled) return undefined
+    if (model === undefined || !this.probeEnabled || options.probe === false) return undefined
     if (this.resolvedModels.has(model)) return undefined
     const lastAttempt = this.lastProbeAttempt.get(model) ?? 0
     if (Date.now() - lastAttempt < PROBE_RETRY_MS) return undefined

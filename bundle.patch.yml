@@ -20,8 +20,13 @@
         # Live model-context probing for LOCAL servers (e.g. qwen3.8-27b at
         # 127.0.0.1:1234). DSH's catalog may declare a much larger window than
         # the server actually runs; the probe reads the REAL runtime context
-        # (LM Studio /api/v0/models) and the plugin caps at min(declared, probed)
-        # so compression triggers before the real limit overflows.
+        # (llama.cpp meta.n_ctx / LM Studio /api/v0/models) and the plugin caps
+        # at min(declared, probed) so compression triggers before the real limit
+        # overflows.
+        # Locality gate: only models whose provider baseURL points at a
+        # loopback / private-LAN host are probed. Online providers (glm / mimo /
+        # ark ...) are NEVER probed — they are trusted at the window declared in
+        # settings.yaml (or pinned via modelWindows below).
         modelProbe:
           enabled: true
           kind: openai
