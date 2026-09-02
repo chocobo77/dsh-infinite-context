@@ -5,13 +5,15 @@ setlocal EnableDelayedExpansion
 title DSH 插件一键安装
 
 rem ==============================================================
-rem  DSH 插件一键安装菜单 v1.3（封装 install-dsh-plugin.ps1）
+rem  DSH 插件一键安装菜单 v1.4（封装 install-dsh-plugin.ps1）
 rem  与 install-dsh-plugin.ps1 放同一目录，或自动回退到插件仓库。
-rem  默认设置持久化在同级 install-dsh-plugin.cfg。
+rem  默认设置持久化在同级 install-dsh-plugin.cfg（GBK）。
 rem  profile 自动检测：已保存的 > web > 手动选择（3 秒倒计时确认）。
+rem  harness / DSH_HOME 由 ps1 自动探测并写回 cfg（HARNESS / DSH_HOME 键）。
 rem ==============================================================
 
 set "PS1=%~dp0install-dsh-plugin.ps1"
+if not exist "%PS1%" if exist "%~dp0..\scripts\install-dsh-plugin.ps1" set "PS1=%~dp0..\scripts\install-dsh-plugin.ps1"
 if not exist "%PS1%" set "PS1=D:\code\上下文精简插件\scripts\install-dsh-plugin.ps1"
 if not exist "%PS1%" (
     echo [X] 找不到 install-dsh-plugin.ps1，请把本 bat 与它放在同一目录。
@@ -21,12 +23,26 @@ if not exist "%PS1%" (
 
 rem ---- 读取持久化默认设置 ----
 set "PROFILE=web"
-set "DEFAULT_DIR=D:\code\上下文精简插件"
+set "DEFAULT_DIR="
+set "HARNESS="
+set "DSH_HOME="
+rem 默认插件目录自动推断：本 bat 位于 scripts\，上一级即插件仓库根（须含 package.json）
+for %%I in ("%~dp0..") do set "DEFAULT_DIR=%%~fI"
+if not exist "%DEFAULT_DIR%\package.json" set "DEFAULT_DIR=%CD%"
 if exist "%~dp0install-dsh-plugin.cfg" (
     for /f "tokens=1,* delims==" %%a in ('type "%~dp0install-dsh-plugin.cfg"') do (
         if /i "%%a"=="PROFILE" set "PROFILE=%%b"
         if /i "%%a"=="DEFAULT_DIR" set "DEFAULT_DIR=%%b"
+        if /i "%%a"=="HARNESS" set "HARNESS=%%b"
+        if /i "%%a"=="DSH_HOME" set "DSH_HOME=%%b"
     )
+)
+rem 配置里的默认目录若已失效（仓库搬走），回退到自动推断
+if defined DEFAULT_DIR if not exist "%DEFAULT_DIR%\" (
+    echo  [!] 配置文件里的默认目录不存在: %DEFAULT_DIR%
+    for %%I in ("%~dp0..") do set "DEFAULT_DIR=%%~fI"
+    if not exist "%DEFAULT_DIR%\package.json" set "DEFAULT_DIR=%CD%"
+    echo  [!] 已回退到: %DEFAULT_DIR%
 )
 set "RESTART=N"
 
@@ -38,6 +54,8 @@ echo    DSH 插件一键安装
 echo  ============================================================
 echo    默认 Profile : %PROFILE%      （自动检测，[7] 可改默认）
 echo    默认插件目录 : %DEFAULT_DIR%
+if defined HARNESS echo    harness     : %HARNESS%
+if defined DSH_HOME echo    DSH_HOME    : %DSH_HOME%
 echo  ------------------------------------------------------------
 echo    选择安装来源：
 echo.
@@ -175,6 +193,8 @@ set /p "DEFAULT_DIR=  新默认插件目录 (回车取消): "
 (
     echo PROFILE=%PROFILE%
     echo DEFAULT_DIR=%DEFAULT_DIR%
+    echo HARNESS=%HARNESS%
+    echo DSH_HOME=%DSH_HOME%
 ) > "%~dp0install-dsh-plugin.cfg"
 echo.
 echo  [OK] 已保存。
@@ -259,6 +279,7 @@ echo  ============================================================
 echo    来源      : %SOURCE%
 echo    目标      : profile "%PROFILE%"
 echo    自动重启  : %RESTART%
+if defined HARNESS echo    harness   : %HARNESS%
 echo  ------------------------------------------------------------
 echo    将执行    :
 echo      install-dsh-plugin.ps1 "%SOURCE%" -Profile %PROFILE%
@@ -290,6 +311,7 @@ if "%RC%"=="0" (
     echo     1. 重启 DSH 后看启动日志无 plugin tree 报错
     echo     2. 出现插件 ready 日志（如 memoryContext ready）
     echo     3. 对话中调用插件工具（如 memory_status）确认功能
+    echo     4. 依赖已指向 ~/.dsh/packages/ 持久化 tarball，不会再因临时目录被清理而重启失败
     echo    卸载方法：dsh plugin --profile %PROFILE% remove 插件包名
 ) else (
     echo    [X] 安装失败（退出码 %RC%）
@@ -311,3 +333,4 @@ echo.
 echo  重新选择来源...
 choice /c Q /n /t 3 /d Q >nul
 goto MENU
+
