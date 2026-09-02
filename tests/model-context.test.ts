@@ -89,6 +89,17 @@ describe('ModelContextTracker', () => {
     expect(tracker.observe({ model: 'qwen' })).toBe('qwen')
   })
 
+  it('never probes a non-local model even when probing is enabled', () => {
+    const tracker = new ModelContextTracker(94_000, true)
+    // Locality gate: online models adopt their declared window but are never probed.
+    expect(tracker.observe({ provider: 'glm', model: 'glm-5.3-flash', contextWindow: 1_000_000 }, { probe: false })).toBeUndefined()
+    expect(tracker.windowFor('glm-5.3-flash')).toBe(1_000_000)
+    // A later attempt still does not probe (no cooldown state is burned either).
+    expect(tracker.observe({ model: 'glm-5.3-flash' }, { probe: false })).toBeUndefined()
+    // The same model IS probed as soon as locality allows it.
+    expect(tracker.observe({ model: 'glm-5.3-flash' }, { probe: true })).toBe('glm-5.3-flash')
+  })
+
   it('rejects a non-positive fallback window at construction', () => {
     expect(() => new ModelContextTracker(0, false)).toThrow(RangeError)
   })

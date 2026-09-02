@@ -23,7 +23,7 @@ import { MemoryStore } from './memory-store.ts'
 import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
 import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn } from './memory-engine.ts'
-import { probeModelContext } from './model-probe.ts'
+import { probeModelContext, isLocalHostname } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
 
@@ -167,11 +167,39 @@ export class MemoryContext extends Service {
    * Observe the current request's resolved route metadata. Called by the
    * compaction hook on every step. When DSH resolved a context window, adopt
    * it immediately; otherwise, if a live probe is configured and this model
-   * was not probed yet, kick off a background probe (never blocks the step).
+   * is LOCAL (routed to a loopback/private server, per `llm-pi-ai` settings),
+   * kick off a background probe (never blocks the step). Online models are
+   * never probed — they are trusted at the window settings/DSH declared.
    */
   observeRequestContext(route: { provider?: string; model?: string; contextWindow?: number }): void {
-    const probeModel = this.modelTracker.observe(route)
+    const probeModel = this.modelTracker.observe(route, { probe: this.isLocalRoute(route.provider) })
     if (probeModel !== undefined) void this.runProbe(probeModel)
+  }
+
+  /**
+   * Whether the routed provider points at a LOCAL server. Reads the provider's
+   * `baseURL` from the DSH `llm-pi-ai` settings namespace and treats loopback /
+   * private-LAN hosts as local. Only local models get a live context probe;
+   * online models are trusted at the window they declared. A provider with no
+   * readable baseURL is treated as non-local (no probe) — the safe default.
+   */
+  private isLocalRoute(provider: string | undefined): boolean {
+    if (provider === undefined || provider.length === 0) return false
+    try {
+      const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings
+      const ns = settings?.get?.('llm-pi-ai') as { providers?: Record<string, { baseURL?: string }> } | undefined
+      const baseURL = ns?.providers?.[provider]?.baseURL
+      if (typeof baseURL !== 'string' || baseURL.length === 0) return false
+      let host: string
+      try {
+        host = new URL(baseURL).hostname
+      } catch {
+        return false
+      }
+      return isLocalHostname(host)
+    } catch {
+      return false
+    }
   }
 
   /**
