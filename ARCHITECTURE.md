@@ -274,3 +274,12 @@ model call sees: ...context..., [retrieved memories], current question
   and optional.
 - **CJK-aware** everywhere: tokenizer, token estimator, and summarization
   framing, so Chinese-language sessions work well.
+- **Summarization follows the session model by default (zero config).** The
+  `summarizationProvider`/`summarizationModel` keys ship EMPTY (`''`): the
+  harness compaction backend resolves `configured ?? latest` and this plugin's
+  `resolveSummarizationTarget()` (src/summarization-target.ts) mirrors that
+  order for its own history-compression and pyramid paths — explicit config
+  wins, otherwise the session's routed model is used, so a local-model session
+  summarizes with the local model and a cloud session with the cloud model.
+  Pinning a provider here overrides the session route and silently breaks every
+  compaction when that endpoint is unavailable or out of balance.

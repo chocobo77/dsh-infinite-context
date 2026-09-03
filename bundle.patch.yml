@@ -77,8 +77,17 @@
         auto: true
         thresholdRatio: 0.8
         retainRatio: 0.4
-        summarizationProvider: qwen3
-        summarizationModel: Qwen3.8-27B-UD-Q2_K_XL
+        # Summarization target is deliberately EMPTY: the compaction backend
+        # (compaction-basic) and this plugin resolve the provider/model from the
+        # SESSION's routed model (`configured ?? latest`), so a local-model
+        # session summarizes with the local model and a cloud session with the
+        # cloud model — no per-profile patch needed. Pinning a hard-coded
+        # provider here (e.g. deepseek-official) overrides the session route and
+        # silently breaks every compaction when that endpoint is down or the
+        # account is out of balance (Insufficient Balance). Set BOTH keys to a
+        # concrete pair only to force a specific summarization model.
+        summarizationProvider: ''
+        summarizationModel: ''
         maxTokens: 8192
         compactionRetries: 1
         maxOverflowRetries: 1

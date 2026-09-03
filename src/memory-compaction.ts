@@ -55,6 +55,11 @@ import {
 } from './compaction-policy.ts'
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
+import {
+  resolveSummarizationTarget,
+  routedTargetOf,
+  type SummarizationTarget,
+} from './summarization-target.ts'
 
 /* -------------------------------------------------------------------------- */
 /*  Summarization types (structural mirrors from dsh-compaction-basic)        */
@@ -91,18 +96,6 @@ const FORCED_PRESSURE_COOLDOWN_MS = 30_000
  * memories cannot crowd out the conversation itself ("续杯" headroom).
  */
 const RAG_WINDOW_SHARE = 0.08
-
-/**
- * Resolve the exact provider/model route durably recorded for the session's
- * latest request (mirrors compaction-basic's own `routedTarget`).
- */
-function routedTargetOf(session: Session): { provider: string; model: string } | undefined {
-  const config = session.requestHeader()?.config
-  if (config === undefined || config.provider.length === 0 || config.model.length === 0) {
-    return undefined
-  }
-  return { provider: config.provider, model: config.model }
-}
 
 /* -------------------------------------------------------------------------- */
 /*  Message / text helpers                                                     */
@@ -202,14 +195,17 @@ async function summarizeMemoriesWithLlm(
   config: ResolvedConfig,
   texts: readonly string[],
   purpose: string,
+  target?: SummarizationTarget,
   signal?: AbortSignal,
 ): Promise<string> {
-  const { summarizationProvider: provider, summarizationModel: model } = config
-  if (provider.length === 0 || model.length === 0) {
+  const resolved = target ?? resolveSummarizationTarget(config)
+  if (resolved === undefined) {
     throw new Error(
-      'memory pyramid consolidation requires summarizationProvider and summarizationModel to be configured',
+      'memory pyramid consolidation requires summarizationProvider/Model configured '
+      + 'or a session-routed model',
     )
   }
+  const { provider, model } = resolved
   const textsJoined = texts.join('\n')
   const inputTokens = estimateTokens(textsJoined)
   const targetTokens = summarizationTargetTokens(config, inputTokens)
@@ -291,6 +287,13 @@ export interface CompressOptions {
    * belong to a different model when several sessions share the runtime.
    */
   window?: number
+  /**
+   * The session whose summarization is being computed. Used to resolve the
+   * summarization target (provider/model) when `summarizationProvider`/
+   * `summarizationModel` are not configured — the summarization then follows
+   * the session's own routed model.
+   */
+  session?: Session
 }
 
 /**
@@ -456,7 +459,14 @@ export class HistoryCompressor {
     force = false,
     options: CompressOptions = {},
   ): Promise<CompressResult | null> {
-    if (!this.available()) return null
+    const target = resolveSummarizationTarget(this.config, options.session)
+    if (target === undefined) {
+      this.ctx.logger.info(
+        '[ContextGovernor] Compression skipped: no summarization target '
+        + '(configure summarizationProvider/Model or route a request first)',
+      )
+      return null
+    }
 
     const entry = this.touchSession(sessionId)
     const currentTurn = entry.turn
@@ -537,7 +547,7 @@ export class HistoryCompressor {
 
       if (oldMessages.length <= 20) {
         // Short block: single-pass extraction
-        summaryText = await this.extractBatch(oldMessages, false)
+        summaryText = await this.extractBatch(oldMessages, false, target)
       } else {
         // Long block: batch extraction with overlap, then merge
         const BATCH_SIZE = 20
@@ -547,14 +557,14 @@ export class HistoryCompressor {
         for (let i = 0; i < oldMessages.length; i += BATCH_SIZE - OVERLAP) {
           const batch = oldMessages.slice(i, i + BATCH_SIZE)
           if (batch.length === 0) break
-          const batchSummary = await this.extractBatch(batch, true)
+          const batchSummary = await this.extractBatch(batch, true, target)
           batchSummaries.push(batchSummary)
         }
 
         if (batchSummaries.length === 1) {
           summaryText = batchSummaries[0]
         } else {
-          summaryText = await this.mergeBatches(batchSummaries)
+          summaryText = await this.mergeBatches(batchSummaries, target)
         }
       }
 
@@ -636,9 +646,17 @@ export class HistoryCompressor {
    * Force-compress with full error propagation (for tool use).
    * Unlike compress(), this never silently returns null — it throws on failure.
    */
-  async compressForce(sessionId: string, messages: readonly Message[]): Promise<CompressResult> {
-    if (!this.available()) {
-      throw new Error('Summarizer not available (provider/model not configured)')
+  async compressForce(
+    sessionId: string,
+    messages: readonly Message[],
+    options: CompressOptions = {},
+  ): Promise<CompressResult> {
+    const target = resolveSummarizationTarget(this.config, options.session)
+    if (target === undefined) {
+      throw new Error(
+        'Summarizer not available: configure summarizationProvider/Model or route a request first '
+        + '(the summarization target is resolved from the session model otherwise)',
+      )
     }
     if (messages.length <= this.retainRecent) {
       throw new Error(`Not enough messages: ${messages.length} <= retainRecent(${this.retainRecent})`)
@@ -654,7 +672,7 @@ export class HistoryCompressor {
 
       let summaryText: string
       if (oldMessages.length <= 20) {
-        summaryText = await this.extractBatch(oldMessages, false)
+        summaryText = await this.extractBatch(oldMessages, false, target)
       } else {
         const BATCH_SIZE = 20
         const OVERLAP = 5
@@ -662,11 +680,11 @@ export class HistoryCompressor {
         for (let i = 0; i < oldMessages.length; i += BATCH_SIZE - OVERLAP) {
           const batch = oldMessages.slice(i, i + BATCH_SIZE)
           if (batch.length === 0) break
-          batchSummaries.push(await this.extractBatch(batch, true))
+          batchSummaries.push(await this.extractBatch(batch, true, target))
         }
         summaryText = batchSummaries.length === 1
           ? batchSummaries[0]
-          : await this.mergeBatches(batchSummaries)
+          : await this.mergeBatches(batchSummaries, target)
       }
 
       if (summaryText.length === 0) {
@@ -738,6 +756,7 @@ export class HistoryCompressor {
   private async extractBatch(
     messages: readonly { role: string; content: unknown }[],
     isBatch: boolean,
+    target: SummarizationTarget,
   ): Promise<string> {
     const serialized = serializeMessagesForSummary(messages)
     const inputTokens = estimateTokens(serialized)
@@ -791,7 +810,7 @@ export class HistoryCompressor {
       serialized,
     ].join('\n')
 
-    return this.llmSummarize(prompt)
+    return this.llmSummarize(prompt, target)
   }
 
   /**
@@ -801,7 +820,10 @@ export class HistoryCompressor {
    * @param batchSummaries - the per-batch extracted summaries.
    * @returns merged structured summary.
    */
-  private async mergeBatches(batchSummaries: readonly string[]): Promise<string> {
+  private async mergeBatches(
+    batchSummaries: readonly string[],
+    target: SummarizationTarget,
+  ): Promise<string> {
     const combined = batchSummaries
       .map((s, i) => `--- Segment ${i + 1} ---\n${s}`)
       .join('\n\n')
@@ -832,18 +854,18 @@ export class HistoryCompressor {
       combined,
     ].join('\n')
 
-    return this.llmSummarize(prompt)
+    return this.llmSummarize(prompt, target)
   }
 
   /**
    * Call the LLM with a prompt and return the text result.
    * Shared by extractBatch and mergeBatches.
    */
-  private async llmSummarize(prompt: string): Promise<string> {
+  private async llmSummarize(prompt: string, target: SummarizationTarget): Promise<string> {
     const assembler = new BlockAssembler()
     const options: GenerateOptions = {
-      provider: this.config.summarizationProvider,
-      model: this.config.summarizationModel,
+      provider: target.provider,
+      model: target.model,
       messages: [createUserMessage({
         content: [{ type: 'text', text: prompt }],
         source: { kind: 'plugin', plugin: PLUGIN },
@@ -1007,8 +1029,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.retrieval = resolveRetrievalOptions(config)
 
     // Provide the pyramid-consolidation summarizer to the memory context.
-    ctx.memoryContext.setSummarizer((texts, purpose) =>
-      summarizeMemoriesWithLlm(ctx, this.config, texts, purpose),
+    ctx.memoryContext.setSummarizer((texts, purpose, target) =>
+      summarizeMemoriesWithLlm(ctx, this.config, texts, purpose, target),
     )
 
     // Initialize the history compressor (Strategy 1).
@@ -1192,7 +1214,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           kind: 'project',
         })
       }
-      const rebalance = await this.ctx.memoryContext.rebalance()
+      const rebalance = await this.ctx.memoryContext.rebalance(
+        resolveSummarizationTarget(this.config, agent.session),
+      )
       if (rebalance.pyramid?.merged !== null && rebalance.pyramid?.merged !== undefined) {
         this.ctx.logger.info(
           `memory pyramid consolidated ${rebalance.pyramid.droppedMids.length} mid memories into one long memory`,
@@ -1280,7 +1304,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           sessionId,
           currentMessages,
           false,
-          { window: effectiveWindow },
+          { window: effectiveWindow, session },
         )
         if (compressResult !== null) {
           currentMessages = [...compressResult.messages]
