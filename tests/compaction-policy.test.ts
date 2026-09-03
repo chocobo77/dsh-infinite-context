@@ -252,4 +252,14 @@ describe('shouldCompressHistory', () => {
     })
     expect(recovered).toEqual({ compress: true, reason: 'pressure' })
   })
+
+  it('reports the FIRST observation as pressure, not surge, when over the trigger', () => {
+    // A restored/imported session with a big history is not a single-round
+    // surge — it is plain pressure. Compresses immediately (fresh session),
+    // but with the honest reason.
+    const first = shouldCompressHistory({
+      ...base, tokens: 800, lastTokens: undefined, lastCompressedTurn: undefined,
+    })
+    expect(first).toEqual({ compress: true, reason: 'pressure' })
+  })
 })

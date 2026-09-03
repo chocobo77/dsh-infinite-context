@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { isLocalHostname, probeLlama, probeModelContext, probeOllama, probeOpenAI } from '../src/core.ts'
+import { isLocalBaseURL, isLocalHostname, probeLlama, probeModelContext, probeOllama, probeOpenAI } from '../src/core.ts'
 
 const originalFetch = globalThis.fetch
 
@@ -154,5 +154,28 @@ describe('isLocalHostname', () => {
     expect(isLocalHostname('ark.cn-beijing.volces.com')).toBe(false)
     expect(isLocalHostname('8.8.8.8')).toBe(false)
     expect(isLocalHostname('')).toBe(false)
+  })
+})
+
+describe('isLocalBaseURL', () => {
+  it('classifies loopback base URLs as local', () => {
+    expect(isLocalBaseURL('http://127.0.0.1:1234/v1')).toBe(true)
+    expect(isLocalBaseURL('http://localhost:8080')).toBe(true)
+  })
+
+  it('classifies RFC1918 private base URLs as local', () => {
+    expect(isLocalBaseURL('http://192.168.1.10:8080/v1')).toBe(true)
+    expect(isLocalBaseURL('http://10.0.0.5/v1')).toBe(true)
+  })
+
+  it('classifies public online base URLs as non-local (never probed)', () => {
+    expect(isLocalBaseURL('https://open.bigmodel.cn/api/paas/v4')).toBe(false)
+    expect(isLocalBaseURL('https://api.xiaomimimo.com/v1')).toBe(false)
+    expect(isLocalBaseURL('https://ark.cn-beijing.volces.com/api/coding/v3')).toBe(false)
+  })
+
+  it('treats empty and unparseable base URLs as non-local (safe default)', () => {
+    expect(isLocalBaseURL('')).toBe(false)
+    expect(isLocalBaseURL('not a url')).toBe(false)
   })
 })

@@ -916,8 +916,12 @@ function fallbackTruncate(
   retainRecent = 4,
 ): Message[] {
   const estimate = (msgs: readonly Message[]): number => {
+    // Meter content the same way the compressor does (estimateContentTokens):
+    // image blocks get a fixed cost and non-text blocks count their text
+    // payload, so the fallback truncation and the token-pressure trigger
+    // cannot disagree on image-heavy sessions.
     let total = 0
-    for (const msg of msgs) total += estimateTokens(messageText(msg))
+    for (const msg of msgs) total += estimateContentTokens(msg.content)
     return total
   }
 
