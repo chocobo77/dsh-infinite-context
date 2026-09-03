@@ -53,6 +53,21 @@ export function isLocalHostname(host: string): boolean {
   return false
 }
 
+/**
+ * Whether a base URL points at a LOCAL server (loopback / RFC1918 private LAN
+ * host). A provider whose baseURL passes this check is eligible for a live
+ * context probe; public online APIs never are. An unparseable or empty URL is
+ * non-local — the safe default (no probe).
+ */
+export function isLocalBaseURL(baseURL: string): boolean {
+  if (typeof baseURL !== 'string' || baseURL.length === 0) return false
+  try {
+    return isLocalHostname(new URL(baseURL).hostname)
+  } catch {
+    return false
+  }
+}
+
 /** A positive integer field, or `undefined` when absent/unusable. */
 function positiveInt(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value
