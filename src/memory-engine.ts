@@ -30,8 +30,23 @@ import type {
   Tier,
 } from './types.ts'
 
-/** A summarizer that folds several memory texts into a single consolidated text. */
-export type SummarizeFn = (texts: readonly string[], purpose: string) => Promise<string>
+/** Provider/model pair for an LLM summarization call (explicit config or session route). */
+export type SummarizationTarget = {
+  readonly provider: string
+  readonly model: string
+}
+
+/**
+ * A summarizer that folds several memory texts into a single consolidated text.
+ * `target` is the optional resolved provider/model the caller wants for this
+ * consolidation (e.g. the session's routed model); when omitted the summarizer
+ * falls back to its configured target.
+ */
+export type SummarizeFn = (
+  texts: readonly string[],
+  purpose: string,
+  target?: SummarizationTarget,
+) => Promise<string>
 
 /** Result of the memory maintenance audit. */
 export interface MaintenanceReport {
@@ -233,9 +248,11 @@ export class MemoryEngine {
    * Consolidate the pyramid: when enough `mid` memories have accumulated, fold
    * the oldest batch into a single `long` memory (via the summarizer) and drop
    * the folded mids. Also trims `long` memories beyond the cap.
+   * @param target - optional resolved summarization target (e.g. the session's
+   *   routed model); forwarded to the summarizer.
    * @returns the consolidation result, or `null` when nothing was merged.
    */
-  async consolidate(): Promise<PyramidResult | null> {
+  async consolidate(target?: SummarizationTarget): Promise<PyramidResult | null> {
     const pyramid = this.config.pyramid
     if (pyramid.mergeThreshold <= 0) return null
     const mids = this.store.list('mid').reverse() // oldest first
@@ -248,6 +265,7 @@ export class MemoryEngine {
       batch.map(doc => doc.text),
       'Consolidate the following earlier summaries into one higher-level summary. '
       + 'Preserve decisions, goals, file paths, and open questions; drop stale detail.',
+      target,
     )
     const embedding = await this.embedder.embed(mergedText)
     const importance = Math.max(...batch.map(doc => doc.importance))
@@ -286,13 +304,15 @@ export class MemoryEngine {
 
   /**
    * Run a full rebalance: forgetting first, then pyramid consolidation.
+   * @param target - optional resolved summarization target for the pyramid
+   *   consolidation (e.g. the session's routed model).
    * @returns both results.
    */
-  async rebalance(): Promise<{ forgetting: ForgettingResult; pyramid: PyramidResult | null }> {
+  async rebalance(target?: SummarizationTarget): Promise<{ forgetting: ForgettingResult; pyramid: PyramidResult | null }> {
     const forgetting = await this.forget()
     let pyramid: PyramidResult | null = null
     try {
-      pyramid = await this.consolidate()
+      pyramid = await this.consolidate(target)
     } catch (err) {
       // Consolidation is best-effort; forgetting already applied. But the
       // failure must stay visible (e.g. a misconfigured summarizer would
