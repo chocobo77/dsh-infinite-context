@@ -47,6 +47,24 @@
       maxLong: 20
     retrievalMinScore: 0.2
     retrievalTopK: 5
+    # Live model-context probing for LOCAL servers. baseURL left empty so the
+    # probe targets whatever local server the session routes to (resolved from
+    # the provider's llm-pi-ai baseURL) — zero per-deployment config. Online
+    # models are never probed; declare their real window in settings.yaml or
+    # pin it via modelWindows below.
+    modelProbe:
+      enabled: true
+      kind: openai
+      baseURL: ''
+    # Authoritative per-model context windows for online models whose declared
+    # window is missing/wrong in a deployment's settings.yaml. Local qwen3
+    # models are intentionally NOT listed: their real window comes from the
+    # live probe (llama.cpp n_ctx), and a stale pin would block the probe.
+    modelWindows:
+      - model: glm-5.3-flash
+        contextWindow: 1000000
+      - model: mimo-v2.5-pro
+        contextWindow: 1000000
 
 # 2) The compaction engine that persists summaries, rebalances the pyramid,
 #    and injects retrieved memories into the context.
@@ -76,6 +94,16 @@
     compress_round_interval: 7   # compress old history every N rounds
     compress_trigger_ratio: 0.85 # compress only when context > 85% of budget (delays compression)
     compress_target_ratio: 0.6   # progressive: only the oldest overflow is summarized
+    # Dynamic compaction threshold: when the routed model's REAL window (live
+    # probe / modelWindows) is smaller than DSH declares, force compaction from
+    # a threshold derived from the REAL window instead of waiting for a
+    # declared-window threshold the model can never reach before overflowing.
+    compaction_dynamic_threshold: true
+    # Dynamic trigger ratio floor: as the real window fills past ~50%, the
+    # effective trigger ratio slides from thresholdRatio (0.8) toward this
+    # floor (0.6), so compaction fires at ~70% of the window — leaving the
+    # model enough remaining context to run the summarization pass itself.
+    compaction_dynamic_floor: 0.6
     retain_recent_messages: 4    # keep the most recent N messages uncompressed
     # --- output sanitization (Strategy 3) ---
     sanitize_max_chars: 2000     # max chars for generic JSON string fields

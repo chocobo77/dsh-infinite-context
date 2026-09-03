@@ -3,6 +3,7 @@ import {
   COMPRESS_FAILURE_COOLDOWN,
   SURGE_RATIO,
   decidePressureCompaction,
+  dynamicCompactionRatio,
   shouldCompressHistory,
 } from '../src/core.ts'
 
@@ -85,6 +86,108 @@ describe('decidePressureCompaction', () => {
       thresholdRatio: 0.5,
     })
     expect(decision.mode).toBe('skip')
+    expect(decision.thresholdTokens).toBe(16_384)
+  })
+})
+
+describe('dynamicCompactionRatio', () => {
+  it('applies the base ratio unchanged at or below 50% fill', () => {
+    expect(dynamicCompactionRatio(0.8, 0.6, 0.4)).toBeCloseTo(0.8)
+    expect(dynamicCompactionRatio(0.8, 0.6, 0.5)).toBeCloseTo(0.8)
+    expect(dynamicCompactionRatio(0.8, 0.6, 0)).toBeCloseTo(0.8)
+  })
+
+  it('slides linearly between base and floor as the window fills past 50%', () => {
+    // t = (0.6-0.5)/0.4 = 0.25 → 0.8 - 0.2×0.25 = 0.75
+    expect(dynamicCompactionRatio(0.8, 0.6, 0.6)).toBeCloseTo(0.75)
+    // t = (0.7-0.5)/0.4 = 0.5 → 0.8 - 0.2×0.5 = 0.7
+    expect(dynamicCompactionRatio(0.8, 0.6, 0.7)).toBeCloseTo(0.7)
+  })
+
+  it('bottoms out at the floor at 90% fill and stays there', () => {
+    expect(dynamicCompactionRatio(0.8, 0.6, 0.9)).toBeCloseTo(0.6)
+    expect(dynamicCompactionRatio(0.8, 0.6, 1)).toBeCloseTo(0.6)
+  })
+
+  it('honors a custom base/floor pair', () => {
+    expect(dynamicCompactionRatio(0.7, 0.5, 0.9)).toBeCloseTo(0.5)
+    expect(dynamicCompactionRatio(0.7, 0.5, 0.5)).toBeCloseTo(0.7)
+  })
+})
+
+describe('decidePressureCompaction with dynamicRatio', () => {
+  it('still skips below the (dynamically lowered) threshold', () => {
+    const decision = decidePressureCompaction({
+      declaredWindow: 100_000,
+      narrowedWindow: 32_768,
+      measuredTokens: 18_000, // fill ≈ 0.55 → ratio ≈ 0.775 → threshold ≈ 25400
+      thresholdRatio: 0.8,
+      dynamicRatio: true,
+      dynamicRatioFloor: 0.6,
+    })
+    expect(decision.mode).toBe('skip')
+    expect(decision.thresholdTokens ?? 0).toBeLessThan(26_214) // lower than the static 0.8 threshold
+  })
+
+  it('forces EARLIER than the static ratio once the real window fills past ~50%', () => {
+    // Static (0.8): threshold 26214 → 24000 measured would SKIP.
+    // Dynamic: fill 24000/32768 ≈ 0.732 → ratio ≈ 0.684 → threshold ≈ 22411 → FORCE.
+    expect(decidePressureCompaction({
+      declaredWindow: 100_000,
+      narrowedWindow: 32_768,
+      measuredTokens: 24_000,
+      thresholdRatio: 0.8,
+    }).mode).toBe('skip')
+    const decision = decidePressureCompaction({
+      declaredWindow: 100_000,
+      narrowedWindow: 32_768,
+      measuredTokens: 24_000,
+      thresholdRatio: 0.8,
+      dynamicRatio: true,
+      dynamicRatioFloor: 0.6,
+    })
+    expect(decision.mode).toBe('force')
+    expect(decision.thresholdTokens ?? 0).toBeLessThan(26_214)
+  })
+
+  it('never forces a window equal to the declared one, even when nearly full (online model)', () => {
+    // 1M online model: at 90% fill the dynamic ratio drops to 0.6, but since
+    // narrowed == declared (1M), the base path must handle it (proper tail
+    // retention) rather than the overflow-style forced reduction.
+    const decision = decidePressureCompaction({
+      declaredWindow: 1_000_000,
+      narrowedWindow: 1_000_000,
+      measuredTokens: 900_000,
+      thresholdRatio: 0.8,
+      dynamicRatio: true,
+      dynamicRatioFloor: 0.6,
+    })
+    expect(decision.mode).toBe('delegate')
+    expect(decision.thresholdTokens).toBe(600_000)
+  })
+
+  it('forces with no declared capacity when over the dynamic threshold', () => {
+    const decision = decidePressureCompaction({
+      declaredWindow: undefined,
+      narrowedWindow: 32_768,
+      measuredTokens: 24_000,
+      thresholdRatio: 0.8,
+      dynamicRatio: true,
+      dynamicRatioFloor: 0.6,
+    })
+    expect(decision.mode).toBe('force')
+  })
+
+  it('honors a custom dynamic floor', () => {
+    const decision = decidePressureCompaction({
+      declaredWindow: 100_000,
+      narrowedWindow: 32_768,
+      measuredTokens: 31_000,
+      thresholdRatio: 0.8,
+      dynamicRatio: true,
+      dynamicRatioFloor: 0.5, // very aggressive: fires at half the window
+    })
+    expect(decision.mode).toBe('force')
     expect(decision.thresholdTokens).toBe(16_384)
   })
 })

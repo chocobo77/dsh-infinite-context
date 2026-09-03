@@ -174,7 +174,7 @@ export class MemoryContext extends Service {
    */
   observeRequestContext(route: { provider?: string; model?: string; contextWindow?: number }): void {
     const probeModel = this.modelTracker.observe(route, { probe: this.isLocalRoute(route.provider) })
-    if (probeModel !== undefined) void this.runProbe(probeModel)
+    if (probeModel !== undefined) void this.runProbe(probeModel, route.provider)
   }
 
   /**
@@ -207,9 +207,10 @@ export class MemoryContext extends Service {
    * Run one background probe for a model's context window and adopt the
    * result. Resolves when the probe settles (success or failure).
    */
-  private async runProbe(model: string): Promise<void> {
+  private async runProbe(model: string, provider?: string): Promise<void> {
     try {
-      const window = await probeModelContext(this.resolved.modelProbe, model)
+      const baseURL = this.resolveProbeBaseURL(provider)
+      const window = await probeModelContext({ ...this.resolved.modelProbe, baseURL }, model)
       if (window !== undefined) {
         // A live probe reflects the server's REAL runtime context, which can
         // be far smaller than the declared catalog window. Cap the adoption at
@@ -236,6 +237,28 @@ export class MemoryContext extends Service {
   }
 
   /**
+   * Resolve the base URL for a live model probe. The configured
+   * `modelProbe.baseURL` wins when set; otherwise the probe targets the LOCAL
+   * server the ROUTED provider points at (read from the DSH `llm-pi-ai`
+   * settings), so enabling the probe requires no per-deployment baseURL config
+   * — the plugin just probes whatever local model the session is using. An
+   * unresolvable target returns `''` and the probe degrades to a no-op.
+   */
+  private resolveProbeBaseURL(provider: string | undefined): string {
+    const configured = this.resolved.modelProbe.baseURL
+    if (configured.length > 0) return configured
+    if (provider === undefined || provider.length === 0) return ''
+    try {
+      const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings
+      const ns = settings?.get?.('llm-pi-ai') as { providers?: Record<string, { baseURL?: string }> } | undefined
+      const baseURL = ns?.providers?.[provider]?.baseURL
+      return typeof baseURL === 'string' ? baseURL : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /**
    * Manually (re)probe the local server for a model's context window.
    * @param model - model id to probe; defaults to the last observed model.
    * @returns the current model context info after the probe attempt.
@@ -243,7 +266,7 @@ export class MemoryContext extends Service {
   async probeModel(model?: string): Promise<ModelContextInfo | null> {
     const target = model ?? this.modelTracker.info?.model
     if (target === undefined) return this.modelInfo
-    await this.runProbe(target)
+    await this.runProbe(target, this.modelTracker.info?.provider)
     return this.modelInfo
   }
 

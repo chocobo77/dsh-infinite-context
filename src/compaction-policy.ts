@@ -51,6 +51,38 @@ export interface PressureDecisionInput {
   readonly measuredTokens: number
   /** Compaction threshold ratio for the routed target (base policy semantics). */
   readonly thresholdRatio: number
+  /**
+   * Whether to apply the dynamic ratio curve ({@link dynamicCompactionRatio}):
+   * as the real window fills, the effective trigger ratio slides from
+   * `thresholdRatio` toward `dynamicRatioFloor`, so compaction fires early
+   * enough to leave the model enough remaining context to run the
+   * summarization pass itself.
+   */
+  readonly dynamicRatio?: boolean
+  /** Lower bound of the dynamic ratio (default 0.6). */
+  readonly dynamicRatioFloor?: number
+}
+
+/**
+ * Dynamic compaction ratio: slide the trigger ratio down as the window fills.
+ * At or below 50% fill the base ratio applies unchanged; past 90% fill the
+ * ratio bottoms out at `floor`. This guarantees the conversation never fills
+ * the real window so completely that the compaction's own summarization pass
+ * (which replays the compacted region as its input) cannot fit in the room
+ * left before the window. With base 0.8 / floor 0.6 the curve crosses at
+ * ~70% fill, reserving ~30% of the window for the compaction call.
+ * @param baseRatio - the configured static threshold ratio.
+ * @param floor - the ratio floor as the window fills (must be < baseRatio).
+ * @param fillRatio - measured tokens / real window (0..1).
+ */
+export function dynamicCompactionRatio(
+  baseRatio: number,
+  floor: number,
+  fillRatio: number,
+): number {
+  const t = Math.max(0, Math.min(1, (fillRatio - 0.5) / 0.4))
+  const effective = baseRatio - (baseRatio - floor) * t
+  return Math.max(floor, Math.min(baseRatio, effective))
 }
 
 /**
@@ -75,7 +107,11 @@ export function decidePressureCompaction(input: PressureDecisionInput): Pressure
   if (narrowedWindow === undefined || !Number.isFinite(narrowedWindow) || narrowedWindow <= 0) {
     return { mode: 'delegate' }
   }
-  const thresholdTokens = Math.max(1, Math.floor(narrowedWindow * Math.min(1, Math.max(0.01, thresholdRatio))))
+  const fill = measuredTokens / narrowedWindow
+  const ratio = input.dynamicRatio
+    ? dynamicCompactionRatio(thresholdRatio, input.dynamicRatioFloor ?? 0.6, fill)
+    : thresholdRatio
+  const thresholdTokens = Math.max(1, Math.floor(narrowedWindow * Math.min(1, Math.max(0.01, ratio))))
   if (measuredTokens < thresholdTokens) return { mode: 'skip', thresholdTokens }
   if (declaredWindow === undefined || narrowedWindow < declaredWindow) {
     return { mode: 'force', thresholdTokens }

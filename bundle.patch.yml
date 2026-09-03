@@ -23,6 +23,9 @@
         # (llama.cpp meta.n_ctx / LM Studio /api/v0/models) and the plugin caps
         # at min(declared, probed) so compression triggers before the real limit
         # overflows.
+        # baseURL is LEFT EMPTY so the probe targets whatever LOCAL server the
+        # session routes to (resolved from the provider's llm-pi-ai baseURL) —
+        # zero per-deployment config.
         # Locality gate: only models whose provider baseURL points at a
         # loopback / private-LAN host are probed. Online providers (glm / mimo /
         # ark ...) are NEVER probed — they are trusted at the window declared in
@@ -30,25 +33,26 @@
         modelProbe:
           enabled: true
           kind: openai
-          baseURL: http://127.0.0.1:1234/v1
+          baseURL: ''
         # Explicit per-model context windows (authoritative per-model truth).
         # These feed the per-model registry that the dynamic compaction
         # threshold and per-session budgets read; a successful live probe can
-        # still narrow them further. Adjust/remove to match the models you
-        # actually run:
-        #   - glm-5.3-flash: declared in settings.yaml as 1000000.
-        #   - Qwen3.8-27B-UD-Q4_K_XL: local model; set to the value LM Studio
-        #     reports (max_total_tokens) if probing stays unavailable.
-        #   - Qwen3.8-27B-UD-Q2_K_XL: local model served by llama.cpp with
-        #     --ctx-size 131072 (its /v1/models reports meta.n_ctx=131072, which
-        #     the openai probe now reads automatically).
+        # still narrow them further. LOCAL qwen3 models are NOT listed here on
+        # purpose — their real window comes from the live probe (llama.cpp
+        # n_ctx) and a stale pin would block the probe from raising it (the
+        # probe only ever narrows). Adjust/remove to match the models you run:
+        #   - glm-5.3-flash / mimo-v2.5-pro: online models declared in
+        #     settings.yaml (1M). Listed here so the dynamic threshold knows
+        #     the real window even if a deployment omits the settings entry.
+        #   - ark deepseek-v4-*: NOT pinned — their window is left to the
+        #     deployment's settings.yaml (DSH default 262144) because an
+        #     unverified pin would shrink a live session's budget and truncate
+        #     it (2026-09-03 incident).
         modelWindows:
           - model: glm-5.3-flash
             contextWindow: 1000000
-          - model: Qwen3.8-27B-UD-Q4_K_XL
-            contextWindow: 32768
-          - model: Qwen3.8-27B-UD-Q2_K_XL
-            contextWindow: 131072
+          - model: mimo-v2.5-pro
+            contextWindow: 1000000
         embedder:
           kind: lightweight
           dimension: 256
@@ -105,6 +109,11 @@
         # This is what makes short-context local models "refill" (续杯) in time,
         # including after one very long thinking turn.
         compaction_dynamic_threshold: true
+        # Dynamic trigger ratio floor: as the REAL window fills past ~50%, the
+        # effective trigger ratio slides from thresholdRatio (0.8) toward this
+        # floor (0.6), so compaction fires at ~70% of the window — leaving the
+        # model enough remaining context to run the summarization pass itself.
+        compaction_dynamic_floor: 0.6
         retain_recent_messages: 4
         sanitize_max_chars: 2000
         rag_top_k: 3
