@@ -279,6 +279,16 @@ export interface MemoryCompactionConfig {
    */
   compaction_dynamic_threshold?: boolean
   /**
+   * Dynamic compaction threshold: lower bound of the effective trigger ratio
+   * as the real window fills. The ratio slides from `thresholdRatio` down to
+   * this floor once the conversation passes ~50% of the real window, so
+   * compaction fires EARLY ENOUGH to leave the model enough remaining context
+   * to run the summarization pass itself (which replays the compacted region).
+   * With the defaults (0.8 → 0.6) the trigger lands at ~70% of the real
+   * window, reserving ~30% for the compaction call. Default 0.6.
+   */
+  compaction_dynamic_floor?: number
+  /**
    * History compression: trigger only when the current context exceeds this
    * fraction of the token budget. Delays compression while context is still
    * roomy even when the round interval has elapsed. Default 0.85.
@@ -337,6 +347,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   }),
   compress_round_interval: z.number().step(1).min(0),
   compaction_dynamic_threshold: z.boolean(),
+  compaction_dynamic_floor: z.number().min(0).max(1),
   compress_trigger_ratio: z.number().min(0).max(1),
   compress_target_ratio: z.number().min(0).max(1),
   retain_recent_messages: z.number().step(1).min(1),
