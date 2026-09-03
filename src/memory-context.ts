@@ -22,7 +22,8 @@ import { VectorIndex } from './vector-index.ts'
 import { MemoryStore } from './memory-store.ts'
 import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
-import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn } from './memory-engine.ts'
+import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type SummarizationTarget } from './memory-engine.ts'
+import type { Session } from '@deepseek-ai/dsh-session'
 import { probeModelContext, isLocalHostname } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
@@ -293,13 +294,13 @@ export class MemoryContext extends Service {
   }
 
   /** Consolidate the pyramid (merge mid memories into long). */
-  consolidate() {
-    return this.requireEngine().consolidate()
+  consolidate(target?: SummarizationTarget) {
+    return this.requireEngine().consolidate(target)
   }
 
   /** Run forgetting then pyramid consolidation. */
-  rebalance() {
-    return this.requireEngine().rebalance()
+  rebalance(target?: SummarizationTarget) {
+    return this.requireEngine().rebalance(target)
   }
 
   /** A point-in-time status snapshot. */
@@ -333,7 +334,11 @@ export class MemoryContext extends Service {
         force?: boolean,
         options?: { window?: number },
       ) => Promise<{ messages: readonly any[]; tokensSaved: number } | null>
-      compressForce: (sid: string, msgs: readonly any[]) => Promise<{ messages: readonly any[]; tokensSaved: number }>
+      compressForce: (
+        sid: string,
+        msgs: readonly any[],
+        options?: { session?: Session },
+      ) => Promise<{ messages: readonly any[]; tokensSaved: number }>
     }
   } | null = null
 

@@ -162,9 +162,16 @@ export function apply(ctx: Context) {
       render: (_args, value: string) => [{ type: 'text', text: value }],
     },
     async execute() {
-      const result = await ctx.memoryContext.consolidate()
-      if (result === null) return 'Nothing to consolidate (below the merge threshold).'
-      return `Consolidated ${result.droppedMids.length} mid memories into one long memory (${result.merged?.id}).`
+      try {
+        const result = await ctx.memoryContext.consolidate()
+        if (result === null) return 'Nothing to consolidate (below the merge threshold).'
+        return `Consolidated ${result.droppedMids.length} mid memories into one long memory (${result.merged?.id}).`
+      } catch (err) {
+        // No summarization target (no configured provider/model and no
+        // session-routed model available) is not an error the tool should
+        // surface as a crash — report it as a skip.
+        return `Pyramid consolidation skipped: ${err instanceof Error ? err.message : String(err)}`
+      }
     },
     presentCall: () => ({ card: 'generic', title: 'Memory consolidate', kind: 'other' }),
   }))
@@ -237,7 +244,7 @@ export function apply(ctx: Context) {
           const session = ctx.sessions.get(SessionId(args.sessionId))
           if (session != null) {
             const messages = typeof session.deriveMessages === 'function' ? session.deriveMessages() : []
-            const result = await engine.compressor.compressForce(args.sessionId, messages)
+            const result = await engine.compressor.compressForce(args.sessionId, messages, { session })
             return `Force compressed session ${args.sessionId}: freed ${result.tokensSaved} tokens.`
           }
           return `Session ${args.sessionId} not found.`

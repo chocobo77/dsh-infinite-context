@@ -238,9 +238,17 @@ export interface MemoryCompactionConfig {
   retainRatio?: number
   /** Delegated: retained recent tail in tokens. */
   retainTokens?: number
-  /** Delegated: provider for the summarization call. */
+  /**
+   * Delegated: provider for the summarization call.
+   *
+   * LEAVE BOTH summarization* EMPTY (`''`) to make summarization follow the
+   * session's routed model (zero-config installs; compaction-basic resolves
+   * `configured ?? latest`). Pinning a provider here OVERRIDES the session
+   * route — avoid unless you want to force one specific model; a dead endpoint
+   * (e.g. an out-of-balance account) silently breaks every compaction.
+   */
   summarizationProvider?: string
-  /** Delegated: model for the summarization call. */
+  /** Delegated: model for the summarization call. See summarizationProvider. */
   summarizationModel?: string
   /** Delegated: max output tokens for the summarization call. */
   maxTokens?: number
@@ -311,6 +319,11 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   thresholdRatio: z.number().min(0).max(1),
   retainRatio: z.number().min(0).max(1),
   retainTokens: z.number().step(1).min(0),
+  // Summarization target is deliberately EMPTY ('') so the compaction backend
+  // and this plugin resolve the provider/model from the SESSION's routed model
+  // (`configured ?? latest`). Pinning a provider here overrides the session
+  // route and silently breaks every compaction when that endpoint is down or
+  // out of balance (Insufficient Balance).
   summarizationProvider: z.string(),
   summarizationModel: z.string(),
   maxTokens: z.number().step(1).min(1),
