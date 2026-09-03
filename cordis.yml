@@ -58,8 +58,8 @@
     thresholdRatio: 0.8          # trigger compaction at 80% of the window
     retainRatio: 0.4            # keep the recent ~40% verbatim (short-term)
     # Required for LLM summarization (mid-term + pyramid consolidation).
-    summarizationProvider: deepseek
-    summarizationModel: deepseek-chat
+    summarizationProvider: qwen3
+    summarizationModel: Qwen3.8-27B-UD-Q2_K_XL
     maxTokens: 8192
     # --- retrieval injection ---
     retrieval:
