@@ -87,7 +87,7 @@ const PLUGIN = 'dsh-infinite-context'
  * triggering a summarization storm on the following steps; the next force is
  * simply deferred, and provider overflow recovery remains the backstop.
  */
-const FORCED_PRESSURE_COOLDOWN_MS = 30_000
+const FORCED_PRESSURE_COOLDOWN_MS = 10_000
 
 /**
  * Share of the session's model window the per-turn RAG injection may occupy.
@@ -990,6 +990,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly lastForceAt = new Map<string, number>()
   /** Whether the narrowed-window (probe/override) compaction override is on. */
   private readonly dynamicThreshold: boolean
+  /** Lower bound of the dynamic trigger ratio as the real window fills. */
+  private readonly dynamicThresholdFloor: number
   /** Public so memoryContext can reference it for force-compress. */
   readonly compressor: HistoryCompressor
   private readonly retriever: VectorRetriever
@@ -1012,6 +1014,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_trigger_ratio,
       compress_target_ratio,
       compaction_dynamic_threshold,
+      compaction_dynamic_floor,
       retain_recent_messages,
       sanitize_max_chars,
       rag_top_k,
@@ -1043,6 +1046,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.retainRecent = retainRecent
     this.injectionBudget = injectionBudget
     this.dynamicThreshold = compaction_dynamic_threshold ?? true
+    this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -1151,6 +1155,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         narrowedWindow: narrowed,
         measuredTokens: measurement.totalTokens,
         thresholdRatio: this.thresholdRatioFor(target),
+        dynamicRatio: this.dynamicThreshold,
+        dynamicRatioFloor: this.dynamicThresholdFloor,
       })
       if (decision.mode === 'skip') {
         this.ctx.logger.debug(

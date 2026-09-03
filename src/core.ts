@@ -36,6 +36,7 @@ export {
   COMPRESS_FAILURE_COOLDOWN,
   SURGE_RATIO,
   decidePressureCompaction,
+  dynamicCompactionRatio,
   shouldCompressHistory,
   type HistoryTriggerInput,
   type HistoryTriggerReason,
