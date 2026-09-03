@@ -182,7 +182,12 @@ export function shouldCompressHistory(input: HistoryTriggerInput): HistoryTrigge
   if (force) return { compress: true, reason: 'forced' }
   if (tokens <= triggerTokens) return { compress: false, reason: 'below-trigger' }
   if (failureCooldown > 0) return { compress: false, reason: 'cooldown' }
-  const delta = lastTokens === undefined ? Number.POSITIVE_INFINITY : tokens - lastTokens
+  // Surge detection compares the CURRENT round's growth to the previous check.
+  // On the very first observation (no baseline) a big history is not a
+  // "single-round surge" — fall through to the pressure path, which already
+  // fires immediately on a fresh session (lastCompressedTurn is undefined) and
+  // carries the honest 'pressure' reason instead of a misleading 'surge'.
+  const delta = lastTokens === undefined ? Number.NEGATIVE_INFINITY : tokens - lastTokens
   const surgeThreshold = Math.max(1, Math.floor(windowTokens * SURGE_RATIO))
   if (delta >= surgeThreshold) return { compress: true, reason: 'surge' }
   if (lastCompressedTurn === undefined || turn - lastCompressedTurn >= Math.max(1, compressInterval)) {

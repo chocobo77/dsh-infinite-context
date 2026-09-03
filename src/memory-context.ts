@@ -24,7 +24,7 @@ import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
 import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type SummarizationTarget } from './memory-engine.ts'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { probeModelContext, isLocalHostname } from './model-probe.ts'
+import { isLocalBaseURL, probeModelContext } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
 
@@ -190,14 +190,7 @@ export class MemoryContext extends Service {
       const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings
       const ns = settings?.get?.('llm-pi-ai') as { providers?: Record<string, { baseURL?: string }> } | undefined
       const baseURL = ns?.providers?.[provider]?.baseURL
-      if (typeof baseURL !== 'string' || baseURL.length === 0) return false
-      let host: string
-      try {
-        host = new URL(baseURL).hostname
-      } catch {
-        return false
-      }
-      return isLocalHostname(host)
+      return isLocalBaseURL(baseURL ?? '')
     } catch {
       return false
     }
@@ -214,9 +207,13 @@ export class MemoryContext extends Service {
       if (window !== undefined) {
         // A live probe reflects the server's REAL runtime context, which can
         // be far smaller than the declared catalog window. Cap the adoption at
-        // the current (declared) window so a probe can only LOWER it, never
-        // inflate it.
-        const ceiling = this.modelTracker.info?.contextWindow ?? this.resolved.contextWindow
+        // the PROBED model's own declared window (per-model registry) — never
+        // the global "last observed" slot, which may belong to a different
+        // model in a multi-model runtime. A probe can only LOWER the window,
+        // never inflate it.
+        const ceiling = this.modelTracker.windowFor(model)
+          ?? this.modelTracker.info?.contextWindow
+          ?? this.resolved.contextWindow
         const adopted = Math.min(window, ceiling)
         this.modelTracker.adopt({ model, contextWindow: adopted, source: 'probe' })
         this.modelTracker.markResolved(model)

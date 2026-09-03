@@ -25,7 +25,7 @@ export { TokenBudget, estimateTokens } from './token-budget.ts'
 export { ForgettingPolicy, recencyFactor, scoreMemory } from './forgetting.ts'
 export { MemoryEngine, type MemoryEngineDeps, type StoreMemoryOptions, type SummarizeFn, type MaintenanceReport } from './memory-engine.ts'
 export { oneLine } from './strings.ts'
-export { probeModelContext, probeLlama, probeOllama, probeOpenAI, isLocalHostname } from './model-probe.ts'
+export { probeModelContext, probeLlama, probeOllama, probeOpenAI, isLocalBaseURL, isLocalHostname } from './model-probe.ts'
 export {
   ModelContextTracker,
   PROBE_RETRY_MS,
