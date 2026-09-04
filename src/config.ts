@@ -289,6 +289,29 @@ export interface MemoryCompactionConfig {
    */
   compaction_dynamic_floor?: number
   /**
+   * Mid-thinking context guard: wraps the agent's LLM stream and, when the
+   * request's estimated input plus output-so-far approaches the CURRENT
+   * model's real context window (live probe for local / declared for online),
+   * injects a `CONTEXT_WINDOW_EXCEEDED` finish so the engine compacts the
+   * durable surface and the request retries with room. This is what lets the
+   * plugin intervene even while the model is deep-thinking — and a takeover
+   * whose input is already over the line is compacted before any output.
+   * The trigger line is DYNAMIC: it fires at `window − reserve`, where the
+   * reserve = system/tools + estimated summary output + margin, so the model's
+   * REMAINING context is always enough to run the plugin's own compaction.
+   * Default true.
+   */
+  thinking_guard_enabled?: boolean
+  /**
+   * CEILING for the mid-thinking guard, as a fraction of the real window. The
+   * guard never waits past this even when the compression reserve is tiny
+   * (e.g. a very large window). Default 0.9 — leaves ~10% so the injected
+   * overflow lands before the adapter's own hard limit. The actual trigger is
+   * usually earlier: `window − (system/tools + summary output + margin)`.
+   * Range 0.5–0.99.
+   */
+  thinking_guard_ratio?: number
+  /**
    * History compression: trigger only when the current context exceeds this
    * fraction of the token budget. Delays compression while context is still
    * roomy even when the round interval has elapsed. Default 0.85.
@@ -348,6 +371,8 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   compress_round_interval: z.number().step(1).min(0),
   compaction_dynamic_threshold: z.boolean(),
   compaction_dynamic_floor: z.number().min(0).max(1),
+  thinking_guard_enabled: z.boolean(),
+  thinking_guard_ratio: z.number().min(0.5).max(0.99),
   compress_trigger_ratio: z.number().min(0).max(1),
   compress_target_ratio: z.number().min(0).max(1),
   retain_recent_messages: z.number().step(1).min(1),
