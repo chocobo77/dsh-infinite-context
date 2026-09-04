@@ -53,6 +53,17 @@ describe('estimateRequestTokens / estimateSystemToolsTokens', () => {
     expect(estimateRequestTokens({ messages: [{ content: '' }] })).toBe(0)
     expect(estimateSystemToolsTokens({})).toBe(0)
   })
+
+  it('counts tool results in the input estimate (file reads the guard must see)', () => {
+    // A big file read arrives as a nested tool-result; the guard's input
+    // estimate must reflect it so the takeover branch fires on over-budget
+    // inputs instead of waiting for the API to error.
+    const request = {
+      messages: [{ content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'y'.repeat(4000) }] }] }],
+    }
+    const estimate = estimateRequestTokens(request)
+    expect(estimate).toBeGreaterThan(500) // ~1000 tokens, not a flat 32
+  })
 })
 
 describe('estimateSummaryOutputTokens', () => {

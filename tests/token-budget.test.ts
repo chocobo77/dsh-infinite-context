@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { TokenBudget, estimateTokens } from '../src/core.ts'
+import { estimateContentTokens, MAX_TOOL_BLOCK_TOKENS } from '../src/token-budget.ts'
 import type { BudgetConfig } from '../src/core.ts'
 
 const BUDGET: BudgetConfig = { short: 10_000, mid: 20_000, long: 5_000, retrieved: 15_000 }
@@ -11,6 +12,48 @@ describe('estimateTokens', () => {
     expect(ascii).toBe(Math.ceil(28 / 4))
     expect(cjk).toBe(6) // 6 Han characters, ~1 token each
     expect(estimateTokens('')).toBe(0)
+  })
+})
+
+describe('estimateContentTokens', () => {
+  it('meters plain text and image blocks', () => {
+    expect(estimateContentTokens('hello')).toBeGreaterThan(0)
+    expect(estimateContentTokens([{ type: 'text', text: 'hello' }])).toBeGreaterThan(0)
+    expect(estimateContentTokens([{ type: 'image' }])).toBe(1500)
+    expect(estimateContentTokens([])).toBe(0)
+    expect(estimateContentTokens(42)).toBe(0)
+  })
+
+  it('recurses into NESTED tool-result content (file reads / command output)', () => {
+    // Regression: a tool-result's payload is nested under content; before the
+    // fix a 200-char result was flat-metered as 32 tokens regardless of size.
+    const payload = 'x'.repeat(200) // ~50 tokens
+    const content = [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: payload }] }]
+    const estimate = estimateContentTokens(content)
+    expect(estimate).toBeGreaterThan(32)
+    expect(estimate).toBe(estimateTokens(payload))
+  })
+
+  it('meters tool-call arguments, capped at MAX_TOOL_BLOCK_TOKENS', () => {
+    const args = '{"path":"/a/b","opts":' + 'x'.repeat(200) + '}'
+    const estimate = estimateContentTokens([{ type: 'tool-call', id: 'c1', name: 'read', arguments: args }])
+    // The real argument payload is metered (not a flat 32), and a small call
+    // with a short argument estimates BELOW the old flat constant.
+    expect(estimate).toBe(estimateTokens(args))
+    expect(estimate).toBeGreaterThan(32)
+    // A base64-laden monster argument is capped so it cannot poison the meter.
+    const huge = estimateContentTokens([{ type: 'tool-call', id: 'c2', name: 'x', arguments: 'y'.repeat(MAX_TOOL_BLOCK_TOKENS * 4 * 4) }])
+    expect(huge).toBeLessThanOrEqual(MAX_TOOL_BLOCK_TOKENS)
+  })
+
+  it('caps a huge nested tool-result payload', () => {
+    const content = [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'y'.repeat(MAX_TOOL_BLOCK_TOKENS * 4 * 4) }] }]
+    expect(estimateContentTokens(content)).toBeLessThanOrEqual(MAX_TOOL_BLOCK_TOKENS)
+  })
+
+  it('meters reasoning text and unknown blocks with a small constant', () => {
+    expect(estimateContentTokens([{ type: 'reasoning', text: '思考中' }])).toBeGreaterThan(0)
+    expect(estimateContentTokens([{ type: 'unknown-thing' }])).toBe(32)
   })
 })
 
