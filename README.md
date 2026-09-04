@@ -24,8 +24,8 @@
 
 | 特性 | 说明 |
 |------|------|
-| 渐进式压缩 | `compress_trigger_ratio: 0.85` — 上下文 >85% 才压缩；`compress_target_ratio: 0.6` — 只摘要溢出部分 |
-| 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声明窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；`compaction_dynamic_floor: 0.6` — 触发比例随窗口填充从 0.8 滑向 0.6（~70% 触发，预留 ~30% 给摘要 pass）；单轮激增（≥20% 窗口）越过轮次间隔；同一会话两次强制压缩间隔 ≥10s |
+| 渐进式压缩 | `compress_trigger_ratio: 0.75` — 上下文 >75% 就压缩（本地模型长上下文 TPS 骤降，提前介入）；`compress_target_ratio: 0.6` — 只摘要溢出部分 |
+| 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声明窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；`thresholdRatio: 0.7` + `compaction_dynamic_floor: 0.5` — 触发比例随窗口填充从 0.7 滑向 0.5（~60% 触发，本地模型留在高速区）；单轮激增（≥20% 窗口）越过轮次间隔；同一会话两次强制压缩间隔 ≥10s |
 | 深度思考介入 | `thinking_guard_enabled: true` — 包装 `llm/stream`：`input + output` 逼近 `窗口 − (system/tools + 摘要估算 + 余量)` 动态线时注入 `CONTEXT_WINDOW_EXCEEDED` → 持久压缩 → 重试；输入单独超线则生成前先压缩；`thinking_guard_ratio: 0.9` 为触发上限 |
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
@@ -126,11 +126,12 @@ tests/                    133 个单元测试
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
+| `thresholdRatio` | `0.7` | **压缩触发比例**：context ≥ 窗口×0.7 触发基础压缩（原 0.8）。本地模型长上下文 TPS 骤降，提前到 ~70% 让模型留在高速区（qwen3 167936 → ~117K 触发） |
 | `compaction_dynamic_threshold` | `true` | **动态压缩阈值**：当路由模型的**真实**窗口（探测 / `modelWindows`）小于声明窗口时，按真实窗口推导阈值强制持久化历史压缩（复用 compaction-basic 的溢出式均衡压缩），不再等一个模型永远到不了的声明窗口阈值——短上下文本地模型的「续杯」能力；同一会话两次强制压缩间隔 ≥10s |
-| `compaction_dynamic_floor` | `0.6` | 动态触发比例下限：窗口填充过 ~50% 后，触发比例从 `thresholdRatio`(0.8) 滑向此值（~70% 触发，预留 ~30% 给摘要 pass） |
+| `compaction_dynamic_floor` | `0.5` | 动态触发比例下限：窗口填充过 ~50% 后，触发比例从 `thresholdRatio`(0.7) 滑向此值（~60% 触发，本地模型尽早离开慢速长上下文区） |
 | `thinking_guard_enabled` | `true` | **深度思考介入**：包装 agent 的 LLM 流，`input + output` 逼近当前模型真实窗口的动态线时注入 `CONTEXT_WINDOW_EXCEEDED` → 持久压缩 → 带余量重试；输入单独超线则生成前先压缩 |
 | `thinking_guard_ratio` | `0.9` | 触发线**上限**（窗口占比）；实际触发通常更早：`窗口 − (system/tools + 摘要估算 + 余量)` |
-| `compress_trigger_ratio` | `0.85` | 上下文 >85% 预算时才压缩 |
+| `compress_trigger_ratio` | `0.75` | 上下文 >75% 预算时就压缩（原 0.85；本地模型尽早介入避免慢速长上下文） |
 | `compress_target_ratio` | `0.6` | 压缩目标水位（只处理溢出部分） |
 | `retainRatio` | `0.3` | **保留尾部比例**：压缩时最近 ~30% 窗口原样保留，更老的头部被摘要替换（0.4 时实测 137K→95K；0.3 可压到 ~60K，配合下方 `maxTokens` 提升保证摘要质量） |
 | `maxTokens` | `10000` | **摘要输出上限**：调高到 10000 让更大的遮蔽跨度仍能生成完整、细节保留的检查点（原 8192） |
@@ -227,8 +228,8 @@ feel via **multi-tier memory management**:
 
 | Feature | Description |
 |---------|-------------|
-| Progressive compression | `compress_trigger_ratio: 0.85` — compress only when >85% full; `compress_target_ratio: 0.6` — only summarize overflow; `retainRatio: 0.3` — newest ~30% of the window stays verbatim; `maxTokens: 10000` — summarizer output cap raised to preserve detail |
-| Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; `compaction_dynamic_floor: 0.6` — the trigger ratio slides from 0.8 toward the floor as the window fills (~70% trigger, reserving ~30% for the summarization pass); a single-round surge (≥20% of window) bypasses the interval; forced compactions ≥10s apart |
+| Progressive compression | `compress_trigger_ratio: 0.75` — compress already when >75% full (local long-context TPS collapses, so intervene early); `compress_target_ratio: 0.6` — only summarize overflow; `retainRatio: 0.3` — newest ~30% of the window stays verbatim; `maxTokens: 10000` — summarizer output cap raised to preserve detail |
+| Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; `thresholdRatio: 0.7` + `compaction_dynamic_floor: 0.5` — the trigger ratio slides from 0.7 toward the floor as the window fills (~60% trigger, keeping slow local models in their fast zone); a single-round surge (≥20% of window) bypasses the interval; forced compactions ≥10s apart |
 | Mid-thinking guard | `thinking_guard_enabled: true` — wraps `llm/stream`: when `input + output` nears the dynamic line `window − (system/tools + summary estimate + margin)`, injects `CONTEXT_WINDOW_EXCEEDED` → durable compaction → retry; input already over the line is compacted BEFORE generation; `thinking_guard_ratio: 0.9` is the ceiling |
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
