@@ -213,7 +213,7 @@ export async function* guardedStream(
   let outputTokens = 0
   for await (const chunk of inner) {
     outputTokens += estimate(chunk)
-    if (options.inputTokens + outputTokens >= options.guardLine) {
+    if (decideGuardTrigger(options.inputTokens, outputTokens, options.guardLine)) {
       options.onTrigger?.(outputTokens, options.guardLine)
       yield overflowFinishChunk(
         `mid-thinking context guard: input ~${options.inputTokens} + output ~${outputTokens} reached `

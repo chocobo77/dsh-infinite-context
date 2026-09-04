@@ -44,26 +44,55 @@ export function estimateTokens(text: string): number {
 export const IMAGE_BLOCK_TOKEN_COST = 1500
 
 /**
+ * Per tool-result / tool-call block, the estimated tokens are capped at this
+ * value. Tool payloads can be huge or base64-laden; bounding a single block
+ * keeps the conversation estimate honest without letting one monster result
+ * dominate (and skew) the compression and thinking-guard metering.
+ */
+export const MAX_TOOL_BLOCK_TOKENS = 8192
+
+/** Meter ONE content block (recursing into nested content where present). */
+function estimateBlockTokens(block: { type?: unknown } & Record<string, unknown>): number {
+  switch (block.type) {
+    case 'text':
+      return typeof block.text === 'string' ? estimateTokens(block.text) : 0
+    case 'image':
+      return IMAGE_BLOCK_TOKEN_COST
+    case 'reasoning':
+      return typeof block.text === 'string' ? estimateTokens(block.text) : 32
+    case 'tool-result':
+      // The real payload is NESTED (content: [{type:'text', text: fileContents}]).
+      // Recursing is what makes file reads and command output count — without
+      // it a 50K-token read was metered as a flat 32 tokens.
+      if (Array.isArray(block.content)) {
+        return Math.min(MAX_TOOL_BLOCK_TOKENS, estimateContentTokens(block.content))
+      }
+      return typeof block.text === 'string' ? estimateTokens(block.text) : 32
+    case 'tool-call':
+      // `arguments` is raw JSON (may embed base64) — count it, capped, so a
+      // giant call payload cannot poison the estimate.
+      if (typeof block.arguments === 'string' && block.arguments.length > 0) {
+        return Math.min(MAX_TOOL_BLOCK_TOKENS, estimateTokens(block.arguments))
+      }
+      return 32
+    default:
+      return typeof block.text === 'string' ? estimateTokens(block.text) : 32
+  }
+}
+
+/**
  * Heuristic token estimate across a message content (string or block array).
  * Text blocks are metered normally, image blocks get a fixed cost, and every
  * other block type (reasoning / tool-call / tool-result) contributes either
- * its textual payload when it carries one or a small constant — never its raw
- * JSON, which may embed base64 data that would poison the estimate.
+ * its textual payload when it carries one or a small constant. Tool results
+ * and tool calls are metered from their NESTED payload (content / arguments)
+ * with a per-block cap — never the raw wire JSON's base64 image data.
  */
 export function estimateContentTokens(content: unknown): number {
   if (typeof content === 'string') return estimateTokens(content)
   if (!Array.isArray(content)) return 0
   let total = 0
-  for (const block of content) {
-    if (block.type === 'text') {
-      total += estimateTokens(block.text)
-    } else if (block.type === 'image') {
-      total += IMAGE_BLOCK_TOKEN_COST
-    } else {
-      const maybeText = (block as { text?: unknown }).text
-      total += typeof maybeText === 'string' ? estimateTokens(maybeText) : 32
-    }
-  }
+  for (const block of content) total += estimateBlockTokens(block)
   return total
 }
 
