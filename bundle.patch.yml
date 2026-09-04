@@ -79,7 +79,12 @@
       name: dsh-infinite-context/memory-compaction
       config:
         auto: true
-        thresholdRatio: 0.8
+        # Compaction trigger ratio: lowered from 0.8 to 0.7 so LOCAL models
+        # compact earlier — long-context local inference TPS collapses well
+        # before the window is full, so compacting at ~70% of the real window
+        # (qwen3 167936 → ~117K) keeps the model in its fast zone. The dynamic
+        # floor below still pulls the trigger earlier as the window fills.
+        thresholdRatio: 0.7
         # Recent-tail retention: 0.3 keeps ~30% of the window verbatim and
         # compacts the older head more aggressively than 0.4 (verified 2026-09-04
         # on local qwen3: 137K-token session compacted to ~95K at 0.4; 0.3 would
@@ -108,7 +113,10 @@
           topK: 3
           minScore: 0.2
         compress_round_interval: 7
-        compress_trigger_ratio: 0.85
+        # History-compression trigger: lowered from 0.85 to 0.75 so the
+        # plugin's own per-step history compression also fires earlier — again
+        # keeping short-context local models out of the slow long-context zone.
+        compress_trigger_ratio: 0.75
         compress_target_ratio: 0.6
         # Track the routed model's REAL context window (probe / modelWindows):
         # when it is smaller than the declared window, force durable-history
@@ -118,10 +126,11 @@
         # including after one very long thinking turn.
         compaction_dynamic_threshold: true
         # Dynamic trigger ratio floor: as the REAL window fills past ~50%, the
-        # effective trigger ratio slides from thresholdRatio (0.8) toward this
-        # floor (0.6), so compaction fires at ~70% of the window — leaving the
-        # model enough remaining context to run the summarization pass itself.
-        compaction_dynamic_floor: 0.6
+        # effective trigger ratio slides from thresholdRatio (0.7) toward this
+        # floor (0.5), so compaction fires around ~60% of the window — early
+        # enough for slow local models to stay in their fast zone while leaving
+        # enough remaining context to run the summarization pass itself.
+        compaction_dynamic_floor: 0.5
         # Mid-thinking context guard: wraps the agent's LLM stream and, when
         # input + output-so-far approaches the CURRENT model's real window,
         # injects a CONTEXT_WINDOW_EXCEEDED finish so the engine compacts
