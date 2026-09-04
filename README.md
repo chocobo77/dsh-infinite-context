@@ -10,6 +10,7 @@
 
 - **渐进式压缩** — token 压力驱动，最老消息优先摘要，近期对话原样保留
 - **动态压缩阈值** — 按路由模型的**真实** CTX 推导触发水位；单轮超长 think 造成的一次性增长可越过轮次间隔立即介入
+- **深度思考介入** — 包装 agent 的 LLM 流：`input + output` 逼近当前模型真实窗口时注入溢出信号 → 持久压缩 → 带余量重试，**模型思考中也能被介入**
 - **三层记忆金字塔** — short（近期原文）→ mid（LLM 摘要）→ long（合并摘要）
 - **持久化存储** — SQLite（`node:sqlite`），重启不丢记忆
 - **语义检索** — 记忆嵌入、索引，每轮注入最相关的 top-K 记忆
@@ -24,10 +25,11 @@
 | 特性 | 说明 |
 |------|------|
 | 渐进式压缩 | `compress_trigger_ratio: 0.85` — 上下文 >85% 才压缩；`compress_target_ratio: 0.6` — 只摘要溢出部分 |
-| 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声名窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；单轮激增（≥20% 窗口）越过轮次间隔 |
+| 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声明窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；`compaction_dynamic_floor: 0.6` — 触发比例随窗口填充从 0.8 滑向 0.6（~70% 触发，预留 ~30% 给摘要 pass）；单轮激增（≥20% 窗口）越过轮次间隔；同一会话两次强制压缩间隔 ≥10s |
+| 深度思考介入 | `thinking_guard_enabled: true` — 包装 `llm/stream`：`input + output` 逼近 `窗口 − (system/tools + 摘要估算 + 余量)` 动态线时注入 `CONTEXT_WINDOW_EXCEEDED` → 持久压缩 → 重试；输入单独超线则生成前先压缩；`thinking_guard_ratio: 0.9` 为触发上限 |
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
-| 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；Ollama 可选主动探测 |
+| 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；本地模型主动探测真实运行窗口（llama/ollama/openai，含 llama-server `meta.n_ctx`）；per-model 注册表按模型隔离 |
 | 高价值过滤 | denylist 过滤 23 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
 
 ### 架构
@@ -38,21 +40,24 @@ src/
 ├── embedder.ts           轻量级特征哈希嵌入器（无依赖）
 ├── vector-index.ts       内存向量索引（无依赖）
 ├── memory-store.ts       SQLite 持久化存储（无依赖）
-├── token-budget.ts       CJK-aware token 估算（无依赖）
+├── token-budget.ts       CJK-aware token 估算 + 内容块计量（无依赖）
 ├── forgetting.ts         遗忘策略（无依赖）
 ├── memory-engine.ts      记忆引擎核心（无依赖）
-├── model-context.ts      模型上下文跟踪器（无依赖）
-├── model-probe.ts        主动探测：llama/ollama/openai
+├── model-context.ts      模型上下文跟踪器：探测时机 + per-model 注册表（无依赖）
+├── model-probe.ts        主动探测：llama/ollama/openai + 本地/在线判定（无依赖）
+├── compaction-policy.ts  压缩触发决策：动态比例、skip/force/delegate（无依赖）
+├── summarization-target.ts 摘要目标路由（跟随会话模型，无依赖）
 ├── config.ts             schemastery 配置解析
-├── memory-context.ts     Cordis 服务（动态 CTX 感知）
-├── memory-compaction.ts  压缩引擎（渐进式 + RAG + 清理）
+├── memory-context.ts     Cordis 服务（动态 CTX 感知 + 探测接线）
+├── memory-compaction.ts  压缩引擎（渐进式 + RAG + 清理 + thinking guard 接线）
+├── thinking-guard.ts     深度思考介入：llm/stream 包装 + 动态触发线
 ├── OutputSanitizer.ts    工具结果清理
 ├── VectorRetriever.ts    RAG 检索/入库
 ├── strings.ts            共享字符串工具
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
 └── tools.ts              10 个手动工具
-tests/                    62 个单元测试
+tests/                    133 个单元测试
 ```
 
 ### 手动工具
@@ -101,11 +106,30 @@ tests/                    62 个单元测试
 > 压缩预算按「当前会话路由到的模型」取值——上一个请求属于别的模型不会再污染本会话的水位。
 > `memory_status` / `memory_model_probe` 会输出 `perModelWindows` 全表便于核对。
 
+> **深度思考介入（mid-thinking guard）**：DSH 只在 API 报 `CONTEXT_WINDOW_EXCEEDED`
+> 后才做"溢出→压缩→重试"。本插件把介入点提前到**生成流里**：包装 `llm/stream`
+> waterfall（仅守护 agent 请求，`isAgentLoopRequest` 精确区分，插件自己的摘要调用永不误伤），
+> 逐块计量 `input + output`，逼近**当前模型真实窗口**（本地探测/在线声明的动态值）时注入
+> 溢出终止块 → 复用 DSH 现成的 `agent/request-error` → **持久压缩 → 带余量重试**，
+> 模型"被叫停→压缩→重想"。触发线是**动态的**：
+>
+> ```
+> 触发线 = min( 窗口 − reserve, 窗口 × thinking_guard_ratio )
+> reserve = system/tools 占用 + 摘要输出估算 + 余量
+> ```
+>
+> 因为压缩会把可压缩 surface 整段重放进摘要器，`window − reserve` 保证**触发时当前模型的
+> 剩余 CTX 足够跑完本插件的压缩**；接管大项目时若 input 单独就已超线，会在**生成前**先压缩，
+> 不浪费一次注定失败的生成。文件读取（tool-result 嵌套内容）已被准确计入估算（见 `token-budget.ts`）。
+
 #### `memory-compaction` 配置
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
-| `compaction_dynamic_threshold` | `true` | **动态压缩阈值**：当路由模型的**真实**窗口（探测 / `modelWindows`）小于声名窗口时，按真实窗口推导阈值强制持久化历史压缩（复用 compaction-basic 的溢出式均衡压缩），不再等一个模型永远到不了的声名窗口阈值——短上下文本地模型的「续杯」能力；同一会话两次强制压缩间隔 ≥30s |
+| `compaction_dynamic_threshold` | `true` | **动态压缩阈值**：当路由模型的**真实**窗口（探测 / `modelWindows`）小于声明窗口时，按真实窗口推导阈值强制持久化历史压缩（复用 compaction-basic 的溢出式均衡压缩），不再等一个模型永远到不了的声明窗口阈值——短上下文本地模型的「续杯」能力；同一会话两次强制压缩间隔 ≥10s |
+| `compaction_dynamic_floor` | `0.6` | 动态触发比例下限：窗口填充过 ~50% 后，触发比例从 `thresholdRatio`(0.8) 滑向此值（~70% 触发，预留 ~30% 给摘要 pass） |
+| `thinking_guard_enabled` | `true` | **深度思考介入**：包装 agent 的 LLM 流，`input + output` 逼近当前模型真实窗口的动态线时注入 `CONTEXT_WINDOW_EXCEEDED` → 持久压缩 → 带余量重试；输入单独超线则生成前先压缩 |
+| `thinking_guard_ratio` | `0.9` | 触发线**上限**（窗口占比）；实际触发通常更早：`窗口 − (system/tools + 摘要估算 + 余量)` |
 | `compress_trigger_ratio` | `0.85` | 上下文 >85% 预算时才压缩 |
 | `compress_target_ratio` | `0.6` | 压缩目标水位（只处理溢出部分） |
 | `retain_recent_messages` | `4` | 最近 N 条消息永不压缩 |
@@ -171,7 +195,7 @@ scripts\install-dsh-plugin.ps1 -DetectOnly
 ### 测试
 
 ```sh
-# 单元测试（62 个，无 DSH 依赖）
+# 单元测试（133 个，无 DSH 依赖）
 vitest run --config vitest.config.ts
 
 # 类型检查
@@ -187,6 +211,7 @@ feel via **multi-tier memory management**:
 
 - **Progressive compression** — token-pressure driven, oldest-first summarization, recent context preserved verbatim
 - **Dynamic compaction threshold** — trigger water level derived from the routed model's REAL CTX; a single oversized thinking turn bypasses the round-interval rate limit
+- **Mid-thinking guard** — wraps the agent's LLM stream: when `input + output` approaches the current model's real window, injects an overflow signal → durable compaction → retry with room; **the plugin intervenes even while the model is deep-thinking**
 - **Three-tier memory pyramid** — short (recent turns) → mid (LLM summaries) → long (consolidated summaries)
 - **Persistent store** — SQLite (`node:sqlite`), memories survive restarts
 - **Semantic retrieval** — memories embedded, indexed, and top-K spliced into context per turn
@@ -201,10 +226,11 @@ feel via **multi-tier memory management**:
 | Feature | Description |
 |---------|-------------|
 | Progressive compression | `compress_trigger_ratio: 0.85` — compress only when >85% full; `compress_target_ratio: 0.6` — only summarize overflow |
-| Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; a single-round surge (≥20% of window) bypasses the interval |
+| Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; `compaction_dynamic_floor: 0.6` — the trigger ratio slides from 0.8 toward the floor as the window fills (~70% trigger, reserving ~30% for the summarization pass); a single-round surge (≥20% of window) bypasses the interval; forced compactions ≥10s apart |
+| Mid-thinking guard | `thinking_guard_enabled: true` — wraps `llm/stream`: when `input + output` nears the dynamic line `window − (system/tools + summary estimate + margin)`, injects `CONTEXT_WINDOW_EXCEEDED` → durable compaction → retry; input already over the line is compacted BEFORE generation; `thinking_guard_ratio: 0.9` is the ceiling |
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
-| Model CTX awareness | Auto-reads DSH model catalog contextWindow; optional active probe for Ollama |
+| Model CTX awareness | Auto-reads DSH model catalog contextWindow; local models are actively probed for their REAL runtime window (llama/ollama/openai incl. llama-server `meta.n_ctx`); per-model registry isolates concurrent sessions |
 | High-value filtering | denylist filters 23 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
 
 ### Manual Tools
@@ -255,7 +281,7 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (62, no DSH dependency)
+# Unit tests (133, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check
