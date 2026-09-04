@@ -24,7 +24,7 @@ import z from '@deepseek-ai/schemastery'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig, ResolvedConfig } from '@deepseek-ai/dsh-compaction-basic'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
-import { BlockAssembler, LlmError, contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, LlmError, contentHasImage, createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   FinishReason,
@@ -35,7 +35,7 @@ import type {
   UserMessage,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { Session } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only: brings the `ctx.tokenMeter` service declaration into scope.
 import type {} from '@deepseek-ai/dsh-token-meter'
@@ -47,7 +47,8 @@ import {
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
-import { estimateTokens } from './token-budget.ts'
+import { estimateContentTokens, estimateTokens } from './token-budget.ts'
+import { registerThinkingGuard } from './thinking-guard.ts'
 import {
   COMPRESS_FAILURE_COOLDOWN,
   decidePressureCompaction,
@@ -119,32 +120,9 @@ function messageText(message: { role: string; content: unknown }): string {
  * cost varies with resolution; this conservative constant keeps image-heavy
  * sessions from being systematically under-measured (which used to delay
  * compression until compaction-basic's overflow recovery had to step in).
+ * The definition lives in `token-budget.ts` (IMAGE_BLOCK_TOKEN_COST /
+ * estimateContentTokens) and is shared with the thinking guard.
  */
-const IMAGE_BLOCK_TOKEN_COST = 1500
-
-/**
- * Heuristic token estimate across a message content (string or block array).
- * text blocks are metered normally, image blocks get a fixed cost, and every
- * other block type (reasoning / tool-call / tool-result) contributes either
- * its textual payload when it carries one or a small constant — never its raw
- * JSON, which may embed base64 data that would poison the estimate.
- */
-function estimateContentTokens(content: unknown): number {
-  if (typeof content === 'string') return estimateTokens(content)
-  if (!Array.isArray(content)) return 0
-  let total = 0
-  for (const block of content as ContentBlock[]) {
-    if (block.type === 'text') {
-      total += estimateTokens(block.text)
-    } else if (block.type === 'image') {
-      total += IMAGE_BLOCK_TOKEN_COST
-    } else {
-      const maybeText = (block as { text?: unknown }).text
-      total += typeof maybeText === 'string' ? estimateTokens(maybeText) : 32
-    }
-  }
-  return total
-}
 
 /** Map a terminal summarization finish to a fail-closed error. */
 function finishError(finish: FinishReason): Error | undefined {
@@ -996,6 +974,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly dynamicThreshold: boolean
   /** Lower bound of the dynamic trigger ratio as the real window fills. */
   private readonly dynamicThresholdFloor: number
+  /** Whether the mid-thinking context guard is enabled. */
+  private readonly thinkingGuardEnabled: boolean
+  /** Fraction of the real window the thinking guard fires at. */
+  private readonly thinkingGuardRatio: number
   /** Public so memoryContext can reference it for force-compress. */
   readonly compressor: HistoryCompressor
   private readonly retriever: VectorRetriever
@@ -1019,6 +1001,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_target_ratio,
       compaction_dynamic_threshold,
       compaction_dynamic_floor,
+      thinking_guard_enabled,
+      thinking_guard_ratio,
       retain_recent_messages,
       sanitize_max_chars,
       rag_top_k,
@@ -1051,6 +1035,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.injectionBudget = injectionBudget
     this.dynamicThreshold = compaction_dynamic_threshold ?? true
     this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
+    this.thinkingGuardEnabled = thinking_guard_enabled ?? true
+    this.thinkingGuardRatio = thinking_guard_ratio ?? 0.9
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -1106,6 +1092,40 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // (Strategy 1) and model-context adoption (G8) — both must keep working
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
+
+    // Mid-thinking context guard: wrap the agent's LLM stream and inject a
+    // CONTEXT_WINDOW_EXCEEDED finish when input + output-so-far approaches the
+    // CURRENT model's real window, so the engine compacts durably and retries
+    // with room — the plugin intervenes even while the model is thinking, and
+    // a takeover whose input is already over the line is compacted up front.
+    if (this.thinkingGuardEnabled) {
+      this.registerThinkingGuard(ctx)
+    }
+  }
+
+  /**
+   * Register the `llm/stream` guard (see {@link thinking-guard}). Only
+   * agent-loop requests are guarded; the window is the CURRENT routed model's
+   * real context (probe for local / declared for online), resolved through the
+   * per-model registry — so the guard follows whichever model the session is
+   * calling right now, even mid-turn after a model switch.
+   */
+  private registerThinkingGuard(ctx: Context): void {
+    registerThinkingGuard(ctx, {
+      enabled: this.thinkingGuardEnabled,
+      ratio: this.thinkingGuardRatio,
+      maxTokens: this.config.maxTokens ?? 8192,
+      isAgentLoopRequest,
+      windowForSession: (sessionId) => {
+        const session = ctx.sessions.get(SessionId(sessionId))
+        if (session === undefined) return undefined
+        const requestContext = session.requestContext()
+        const model = requestContext?.model
+        if (model === undefined || model.length === 0) return ctx.memoryContext.contextWindow
+        return ctx.memoryContext.windowForModel(model) ?? ctx.memoryContext.contextWindow
+      },
+      log: (message) => ctx.logger.info(message),
+    })
   }
 
   /**

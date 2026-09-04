@@ -114,6 +114,17 @@
         # floor (0.6), so compaction fires at ~70% of the window — leaving the
         # model enough remaining context to run the summarization pass itself.
         compaction_dynamic_floor: 0.6
+        # Mid-thinking context guard: wraps the agent's LLM stream and, when
+        # input + output-so-far approaches the CURRENT model's real window,
+        # injects a CONTEXT_WINDOW_EXCEEDED finish so the engine compacts
+        # durably and the request retries with room — the plugin intervenes
+        # even while the model is deep-thinking, and a takeover whose input is
+        # already over the line is compacted BEFORE any generation. The trigger
+        # line is DYNAMIC: window − (system/tools + estimated summary + margin),
+        # so the model's REMAINING context is always enough to run the plugin's
+        # own compaction. ratio is the CEILING (0.9 default).
+        thinking_guard_enabled: true
+        thinking_guard_ratio: 0.9
         retain_recent_messages: 4
         sanitize_max_chars: 2000
         rag_top_k: 3
