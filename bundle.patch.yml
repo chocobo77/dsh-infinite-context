@@ -80,7 +80,12 @@
       config:
         auto: true
         thresholdRatio: 0.8
-        retainRatio: 0.4
+        # Recent-tail retention: 0.3 keeps ~30% of the window verbatim and
+        # compacts the older head more aggressively than 0.4 (verified 2026-09-04
+        # on local qwen3: 137K-token session compacted to ~95K at 0.4; 0.3 would
+        # compact to ~60K). Compensate with a higher summarizer cap below so the
+        # bigger shadowed span still yields a detail-preserving summary.
+        retainRatio: 0.3
         # Summarization target is deliberately EMPTY: the compaction backend
         # (compaction-basic) and this plugin resolve the provider/model from the
         # SESSION's routed model (`configured ?? latest`), so a local-model
@@ -92,7 +97,10 @@
         # concrete pair only to force a specific summarization model.
         summarizationProvider: ''
         summarizationModel: ''
-        maxTokens: 8192
+        # Summarizer output cap: raised from 8192 to 10000 so the larger
+        # shadowed span (retainRatio 0.3) still fits a complete, detail-rich
+        # checkpoint instead of being cut off at the token cap.
+        maxTokens: 10000
         compactionRetries: 1
         maxOverflowRetries: 1
         retrieval:
