@@ -36,6 +36,37 @@ export function estimateTokens(text: string): number {
   return Math.ceil(cjk * 1.0 + other / 4)
 }
 
+/**
+ * Fixed token cost charged per image block by the heuristic meter. The real
+ * cost varies with resolution; this conservative constant keeps image-heavy
+ * sessions from being systematically under-measured.
+ */
+export const IMAGE_BLOCK_TOKEN_COST = 1500
+
+/**
+ * Heuristic token estimate across a message content (string or block array).
+ * Text blocks are metered normally, image blocks get a fixed cost, and every
+ * other block type (reasoning / tool-call / tool-result) contributes either
+ * its textual payload when it carries one or a small constant — never its raw
+ * JSON, which may embed base64 data that would poison the estimate.
+ */
+export function estimateContentTokens(content: unknown): number {
+  if (typeof content === 'string') return estimateTokens(content)
+  if (!Array.isArray(content)) return 0
+  let total = 0
+  for (const block of content) {
+    if (block.type === 'text') {
+      total += estimateTokens(block.text)
+    } else if (block.type === 'image') {
+      total += IMAGE_BLOCK_TOKEN_COST
+    } else {
+      const maybeText = (block as { text?: unknown }).text
+      total += typeof maybeText === 'string' ? estimateTokens(maybeText) : 32
+    }
+  }
+  return total
+}
+
 /** A validated, queryable token budget across tiers. */
 export class TokenBudget {
   readonly budget: BudgetConfig
