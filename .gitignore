@@ -53,3 +53,6 @@ temp/
 # === local process notes (not tracked) ===
 REVIEW*.md
 DSH插件开发经验.md
+# === Machine-specific (install script persistence) ===
+scripts/install-dsh-plugin.cfg
+

@@ -3,8 +3,10 @@
 A DeepSeek Harness (DSH) plugin that delivers "infinite context" through
 **multi-tier memory management**: it automatically summarizes long conversations
 into persistent, searchable memories, retrieves the most relevant ones for each
-new question, and enforces a token budget so the context never overflows a
-94k-token local window.
+new question, and enforces a token budget that tracks the **currently routed
+model's real context window** — probed live for local servers, declared for
+online providers — so the context never overflows, and the plugin can even
+intervene mid-generation while the model is deep-thinking.
 
 ---
 
@@ -185,12 +187,19 @@ provides on-demand retrieval instead.
 | `src/transformers-embedder.ts` | no | Optional `TransformersEmbedder` (all-MiniLM-L6-v2). |
 | `src/vector-index.ts` | no | `VectorIndex` (top-K cosine search). |
 | `src/memory-store.ts` | no | SQLite (`node:sqlite`) persistence of `MemoryDoc`. |
-| `src/token-budget.ts` | no | `TokenBudget`, CJK-aware `estimateTokens`. |
+| `src/token-budget.ts` | no | `TokenBudget`, CJK-aware `estimateTokens` + content-block metering (`estimateContentTokens`: nested tool-result/tool-call payloads, capped). |
 | `src/forgetting.ts` | no | `ForgettingPolicy`, scoring. |
 | `src/memory-engine.ts` | no | Orchestration: store/embed/retrieve/consolidate/forget/status. |
+| `src/model-context.ts` | no | `ModelContextTracker`: probe-once-per-model + retry cooldown, per-model window registry, probe-only-narrows. |
+| `src/model-probe.ts` | no | Live context probes (llama `/props`, ollama `/api/show`, openai `/models` incl. LM Studio native) + `isLocalHostname`/`isLocalBaseURL` locality gate. |
+| `src/compaction-policy.ts` | no | Pure trigger decisions: `decidePressureCompaction` (skip/force/delegate), `dynamicCompactionRatio` curve, `shouldCompressHistory` (surge/pressure/rate-limit). |
+| `src/thinking-guard.ts` | yes | Mid-thinking guard: `llm/stream` wrapper, dynamic trigger line, overflow injection. |
+| `src/summarization-target.ts` | yes | Summarizer routing: `configured ?? session model`. |
 | `src/config.ts` | yes | Schemastery schemas + default resolution. |
-| `src/memory-context.ts` | yes | `MemoryContext` service (`ctx.memoryContext`). |
-| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`). |
+| `src/memory-context.ts` | yes | `MemoryContext` service (`ctx.memoryContext`): probe wiring + locality gate + per-model adoption. |
+| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance + narrowed-window force + thinking-guard wiring. |
+| `src/OutputSanitizer.ts` | no | Tool-result sanitization (web_search/code_exec/generic JSON). |
+| `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval. |
 | `src/tools.ts` | yes | Manual model-callable tools. |
 | `src/core.ts` | no | Barrel re-exporting the dependency-free core. |
 | `src/index.ts` | yes | Package barrel. |
@@ -232,9 +241,10 @@ user message arrives
    ▼
 agent/pre-step (waterfall, registered order)
    │
-   ├─ [BasicCompactionEngine hook]
-   │    measure tokens (ctx.tokenMeter)
-   │    over threshold/overflow? ──► compactRegion ──► summarize()
+   ├─ [BasicCompactionEngine hook → MemoryCompactionEngine.compactIfNeeded override]
+   │    measure tokens (ctx.tokenMeter) + per-model REAL window (probe/registry)
+   │    narrowed < declared and over the DYNAMIC threshold (~70% of real window)?
+   │         ──► force overflow-style compactRegion ──► summarize()
    │                                              │
    │        [MemoryCompactionEngine.summarize]    │
    │          • super.summarize() (LLM checkpoint)
@@ -244,16 +254,88 @@ agent/pre-step (waterfall, registered order)
    │                                    surface replaced with checkpoint
    │
    └─ [MemoryCompactionEngine retrieval hook] (registered after)
+        observe request-context → adopt window / kick local probe (once per model)
+        compress history if over the trigger water level (per-model budget)
         retrieve(topK, minScore) for the latest user text
         relevant? ──► append background memory message to request
+        fallback truncation to window − headroom (image-aware metering)
    │
    ▼
-model call sees: ...context..., [retrieved memories], current question
+llm/stream (waterfall) ── [thinking guard, agent-loop requests only]
+   │    estimate input (system+tools+messages, nested tool payloads included)
+   │    meter output as chunks flow
+   │    input + output ≥ dynamic line (window − reserve, capped at ratio)?
+   │         ──► yield CONTEXT_WINDOW_EXCEEDED finish
+   │               ──► agent/request-error ──► durable compaction ──► retry
 ```
 
 ---
 
-## 11. Key design decisions & trade-offs
+## 11. Model context awareness & the mid-thinking guard
+
+### Per-model context registry
+
+The routed model's window comes from three sources, narrowed in order:
+the DSH catalog / `settings.yaml` declaration (`request-context`), an explicit
+`modelWindows` override (`config`), and — for LOCAL servers only — a live
+probe (`probe`) of the real runtime context. Windows are recorded per model
+id, so a 1M remote session and a 167k local session sharing one runtime never
+poison each other's budgets. Probing is gated by locality (`isLocalBaseURL`:
+loopback / RFC1918 hosts only — online providers are never probed), runs once
+per model with a 60s retry cooldown, and only ever NARROWS the window
+(`min(probed, declared)`; the ceiling is the probed model's own declared
+value, never the global last-observed slot).
+
+OpenAI-compatible probes cover llama-server (`meta.n_ctx`), vLLM
+(`max_model_len`), LM Studio (native `/api/v0/models`), and Ollama
+(`/api/show`).
+
+### Dynamic compaction threshold
+
+`compaction-basic` scales its pressure threshold off the DECLARED window. When
+the real window is smaller (a local model whose server runs 167k while the
+catalog says 262k), that threshold is unreachable before overflow.
+`MemoryCompactionEngine.compactIfNeeded` therefore evaluates
+`decidePressureCompaction` (src/compaction-policy.ts): with a narrowed window it
+forces the overflow-style balanced reduction once the measured conversation
+crosses a threshold derived from the REAL window. The threshold uses the
+`dynamicCompactionRatio` curve — the trigger ratio slides from
+`thresholdRatio` (0.8) toward `compaction_dynamic_floor` (0.6) as the window
+fills, so compaction fires at ~70% of the REAL window, reserving ~30% for the
+summarization pass itself. Forcing only happens when `narrowed < declared`,
+so a correctly-declared 1M online model is never over-forced.
+
+### The mid-thinking guard
+
+DSH recovers from a provider-confirmed context overflow: `agent/request-error`
+with code `CONTEXT_WINDOW_EXCEEDED` compacts the durable surface and returns
+`{kind: 'retry'}`. That only helps AFTER the model already tried against a
+context it cannot hold. The thinking guard (src/thinking-guard.ts) moves the
+intervention INTO the generation: it wraps the `llm/stream` waterfall for
+AGENT-LOOP requests only (`isAgentLoopRequest` — the plugin's own summarization
+calls are never guarded), estimates the request input, meters output as chunks
+flow, and when they cross the dynamic line yields a terminal
+`CONTEXT_WINDOW_EXCEEDED` finish. The agent loop then takes the exact same
+compact-and-retry path — the model is stopped mid-thinking, the surface is
+compacted durably, and the request restarts with room.
+
+The trigger line is DYNAMIC:
+
+```
+line = min(window − reserve, floor(window × thinking_guard_ratio))
+reserve = systemToolsTokens + summaryOutputEstimate + GUARD_MARGIN
+```
+
+The compaction replays the compactable surface (≈ the request input) through a
+summarizer call, so `window − reserve` guarantees the CURRENT model's remaining
+context is enough to run the plugin's own compression when the guard fires.
+A takeover whose input is ALREADY over the line is compacted before any
+generation. Input metering counts nested tool-result/tool-call payloads
+(capped per block), so file reads are seen.
+
+---
+
+## 12. Key design decisions & trade-offs
 
 - **Reuse `BasicCompactionEngine`** instead of reimplementing compaction. The
   hard parts — balanced tool-call/result ranges, durable `compaction/summary`
@@ -283,3 +365,22 @@ model call sees: ...context..., [retrieved memories], current question
   summarizes with the local model and a cloud session with the cloud model.
   Pinning a provider here overrides the session route and silently breaks every
   compaction when that endpoint is unavailable or out of balance.
+- **The real window beats the declared one, per model.** Compression thresholds,
+  history-compression budgets, RAG injection caps, and fallback truncation all
+  scale off the routed model's REAL window (probe for local servers, declared
+  for online), tracked per model id in `ModelContextTracker`. Probes only ever
+  narrow; a wider observation cannot raise a narrowed value. This is what gives
+  short-window local models their "refill" (续杯) ability without breaking
+  correctly-declared 1M online models.
+- **The guard reuses the overflow path instead of inventing one.** The
+  mid-thinking guard injects the same `CONTEXT_WINDOW_EXCEEDED` code the
+  provider would emit, so compaction-basic's proven durable-compact-and-retry
+  machinery (with its retry cap) handles recovery. The guard itself stays
+  stateless per request and never guards the plugin's own summarization calls
+  (`isAgentLoopRequest`), which prevents re-entrancy.
+- **Heuristic metering, bounded.** Token estimates are CJK-aware and deliberately
+  conservative; nested tool-result/tool-call payloads are metered (file reads
+  are seen) but capped per block (`MAX_TOOL_BLOCK_TOKENS`) so base64-laden
+  payloads cannot skew the estimate. The guard's dynamic line reserves
+  system/tools + summary output + a fixed margin, and the adapter's own hard
+  limit remains the final backstop.
