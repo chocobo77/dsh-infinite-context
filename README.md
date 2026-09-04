@@ -132,6 +132,8 @@ tests/                    133 个单元测试
 | `thinking_guard_ratio` | `0.9` | 触发线**上限**（窗口占比）；实际触发通常更早：`窗口 − (system/tools + 摘要估算 + 余量)` |
 | `compress_trigger_ratio` | `0.85` | 上下文 >85% 预算时才压缩 |
 | `compress_target_ratio` | `0.6` | 压缩目标水位（只处理溢出部分） |
+| `retainRatio` | `0.3` | **保留尾部比例**：压缩时最近 ~30% 窗口原样保留，更老的头部被摘要替换（0.4 时实测 137K→95K；0.3 可压到 ~60K，配合下方 `maxTokens` 提升保证摘要质量） |
+| `maxTokens` | `10000` | **摘要输出上限**：调高到 10000 让更大的遮蔽跨度仍能生成完整、细节保留的检查点（原 8192） |
 | `retain_recent_messages` | `4` | 最近 N 条消息永不压缩 |
 | `rag_top_k` | `3` | 每轮注入的记忆数 |
 | `rag_min_score` | `0.3` | 注入的最低相似度 |
@@ -225,7 +227,7 @@ feel via **multi-tier memory management**:
 
 | Feature | Description |
 |---------|-------------|
-| Progressive compression | `compress_trigger_ratio: 0.85` — compress only when >85% full; `compress_target_ratio: 0.6` — only summarize overflow |
+| Progressive compression | `compress_trigger_ratio: 0.85` — compress only when >85% full; `compress_target_ratio: 0.6` — only summarize overflow; `retainRatio: 0.3` — newest ~30% of the window stays verbatim; `maxTokens: 10000` — summarizer output cap raised to preserve detail |
 | Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; `compaction_dynamic_floor: 0.6` — the trigger ratio slides from 0.8 toward the floor as the window fills (~70% trigger, reserving ~30% for the summarization pass); a single-round surge (≥20% of window) bypasses the interval; forced compactions ≥10s apart |
 | Mid-thinking guard | `thinking_guard_enabled: true` — wraps `llm/stream`: when `input + output` nears the dynamic line `window − (system/tools + summary estimate + margin)`, injects `CONTEXT_WINDOW_EXCEEDED` → durable compaction → retry; input already over the line is compacted BEFORE generation; `thinking_guard_ratio: 0.9` is the ceiling |
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
