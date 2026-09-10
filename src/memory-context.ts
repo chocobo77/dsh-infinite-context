@@ -308,6 +308,24 @@ export class MemoryContext extends Service {
     return this.requireEngine().hasTextNormalized(text)
   }
 
+  /** Read plugin state from the persistent KV table (survives restarts). */
+  kvGet(key: string): string | undefined {
+    this.requireEngine()
+    return this.store?.kvGet(key)
+  }
+
+  /** Write plugin state to the persistent KV table (survives restarts). */
+  kvSet(key: string, value: string): void {
+    this.requireEngine()
+    this.store?.kvSet(key, value)
+  }
+
+  /** Delete plugin state from the persistent KV table. */
+  kvDelete(key: string): void {
+    this.requireEngine()
+    this.store?.kvDelete(key)
+  }
+
   /** Run a forgetting sweep. */
   forget() {
     return this.requireEngine().forget()

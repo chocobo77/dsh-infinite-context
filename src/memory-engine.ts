@@ -281,9 +281,14 @@ export class MemoryEngine {
     }
     this.store.insert(longDoc)
     this.index.add(longDoc.id, embedding)
+    // Demote the merged mids to the SHORT tier instead of deleting them: the
+    // long memory is a lossy re-compression, and destroying the mid originals
+    // made that loss irreversible (a merged fact that got dropped could never
+    // be recovered). The demoted mids keep their full text at a LOW importance
+    // so the forgetting policy retires them naturally before the long memory —
+    // while still being retrievable until then.
     for (const doc of batch) {
-      this.store.delete(doc.id)
-      this.index.remove(doc.id)
+      this.store.upsert({ ...doc, tier: 'short', importance: Math.min(doc.importance, 0.3) })
     }
     this.trimLongMemories()
     return { merged: longDoc, droppedMids: batch.map(doc => doc.id) }

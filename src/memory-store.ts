@@ -91,6 +91,48 @@ export class MemoryStore {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories (tier)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at)')
+    // Generic key/value table for plugin state that must survive restarts
+    // (e.g. the HistoryCompressor per-session turn counters). Kept separate
+    // from the memories table so it never pollutes retrieval.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS plugin_kv (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    `)
+  }
+
+  /**
+   * Read a value from the generic key/value table.
+   * @param key - the key.
+   * @returns the stored value, or `undefined` when absent.
+   */
+  kvGet(key: string): string | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT value FROM plugin_kv WHERE key = ?').get(key) as { value: string } | undefined
+    return row?.value
+  }
+
+  /**
+   * Write a value to the generic key/value table (upsert).
+   * @param key - the key.
+   * @param value - the value to store.
+   */
+  kvSet(key: string, value: string): void {
+    this.assertOpen()
+    this.db.prepare(`
+      INSERT INTO plugin_kv (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value)
+  }
+
+  /**
+   * Delete a key from the generic key/value table. A no-op when absent.
+   * @param key - the key to delete.
+   */
+  kvDelete(key: string): void {
+    this.assertOpen()
+    this.db.prepare('DELETE FROM plugin_kv WHERE key = ?').run(key)
   }
 
   private assertOpen(): void {
