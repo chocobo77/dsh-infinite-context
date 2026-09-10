@@ -36,6 +36,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId, type Session } from '@deepseek-ai/dsh-session'
+import { toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only: brings the `ctx.tokenMeter` service declaration into scope.
 import type {} from '@deepseek-ai/dsh-token-meter'
@@ -251,6 +252,13 @@ interface SessionCounter {
   failureCooldown: number
 }
 
+/** Persistent KV interface (backed by the SQLite plugin_kv table). */
+export interface PersistentKV {
+  get(key: string): string | undefined
+  set(key: string, value: string): void
+  delete(key: string): void
+}
+
 /** Result of a compression operation. */
 export interface CompressResult {
   messages: readonly Message[]
@@ -288,13 +296,16 @@ export interface CompressOptions {
  * @module HistoryCompressor
  */
 export class HistoryCompressor {
-  // Turn counter resets on process restart. Compression is idempotent so a
-  // restart just delays the next trigger. Upgrade path: persist to the existing
-  // SQLite store (MemoryStore) as a new table or KV column.
+  // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
+  // process restarts — without persistence a DSH restart reset the counters to
+  // zero and triggered an immediate, unnecessary compression on the next turn.
   private readonly turnCounters = new Map<string, SessionCounter>()
 
   /** Recursion lock: sessionId → true while LLM summarization is in-flight. */
   private readonly compressLocks = new Set<string>()
+
+  /** Optional persistent KV backing (survives restarts); null disables persistence. */
+  private readonly kv: PersistentKV | null
 
   private readonly ctx: Context
   private readonly config: ResolvedConfig
@@ -323,6 +334,7 @@ export class HistoryCompressor {
     triggerRatio = 0.85,
     targetRatio = 0.6,
     injectionBudget = 0,
+    kv: PersistentKV | null = null,
   ) {
     this.ctx = ctx
     this.config = config
@@ -331,6 +343,38 @@ export class HistoryCompressor {
     this.triggerRatio = triggerRatio
     this.targetRatio = targetRatio
     this.injectionBudget = injectionBudget
+    this.kv = kv
+    this.loadPersistedCounters()
+  }
+
+  /** KV key under which a session's counter is persisted. */
+  private static kvKey(sessionId: string): string {
+    return `compression:${sessionId}`
+  }
+
+  /** Restore persisted counters for all sessions after a restart. */
+  private loadPersistedCounters(): void {
+    if (this.kv === null) return
+    // Enumerate by prefix is not supported by the flat KV API; the entries are
+    // loaded lazily per session on first touch instead (see touchSession).
+  }
+
+  /**
+   * Persist one session's counter. Best-effort: a KV failure must never break
+   * the agent loop, so it is swallowed here (the in-memory copy still works).
+   */
+  private persistCounter(sessionId: string): void {
+    if (this.kv === null) return
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      this.kv.delete(HistoryCompressor.kvKey(sessionId))
+      return
+    }
+    try {
+      this.kv.set(HistoryCompressor.kvKey(sessionId), JSON.stringify(entry))
+    } catch {
+      // best-effort persistence; the in-memory map remains authoritative
+    }
   }
 
   /**
@@ -355,19 +399,45 @@ export class HistoryCompressor {
 
   /**
    * Increment the turn counter for a session and return the entry.
-   * Initializes to 0 if the session has never been seen.
+   * Initializes to 0 if the session has never been seen. Restores a
+   * persisted counter across restarts so the round interval survives.
    */
   private touchSession(sessionId: string): SessionCounter {
-    const entry = this.turnCounters.get(sessionId)
-    const now = Date.now()
+    let entry = this.turnCounters.get(sessionId)
     if (entry === undefined) {
-      const created: SessionCounter = { turn: 1, lastActive: now, failureCooldown: 0 }
-      this.turnCounters.set(sessionId, created)
-      return created
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
     }
     entry.turn++
-    entry.lastActive = now
+    entry.lastActive = Date.now()
+    this.persistCounter(sessionId)
     return entry
+  }
+
+  /** Restore a session's persisted counter (or create a fresh one). */
+  private restoreCounter(sessionId: string): SessionCounter {
+    if (this.kv !== null) {
+      try {
+        const raw = this.kv.get(HistoryCompressor.kvKey(sessionId))
+        if (raw !== undefined) {
+          const parsed = JSON.parse(raw) as Partial<SessionCounter> | null
+          if (parsed !== null && typeof parsed === 'object' && typeof parsed.turn === 'number') {
+            const restored: SessionCounter = {
+              turn: parsed.turn,
+              lastActive: Date.now(),
+              ...(typeof parsed.lastCompressedTurn === 'number'
+                ? { lastCompressedTurn: parsed.lastCompressedTurn } : {}),
+              ...(typeof parsed.lastTokens === 'number' ? { lastTokens: parsed.lastTokens } : {}),
+              failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
+            }
+            return restored
+          }
+        }
+      } catch {
+        // corrupt entry — fall through to a fresh counter
+      }
+    }
+    return { turn: 0, lastActive: Date.now(), failureCooldown: 0 }
   }
 
   /**
@@ -575,6 +645,7 @@ export class HistoryCompressor {
       // unshrinkable retained tail.
       if (saved <= 0) {
         entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
+        this.persistCounter(sessionId)
         this.ctx.logger.warn(
           `[ContextGovernor] Compression rejected: summary is not smaller `
           + `(Before: ${beforeTokens}, After: ${afterTokens} tokens); `
@@ -585,6 +656,7 @@ export class HistoryCompressor {
 
       entry.lastCompressedTurn = currentTurn
       entry.failureCooldown = 0
+      this.persistCounter(sessionId)
       this.ctx.logger.info(
         `[ContextGovernor] Compressed history: ${oldMessages.length} messages → 1 summary. `
         + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens `
@@ -611,6 +683,7 @@ export class HistoryCompressor {
       return { messages: newMessages, tokensSaved: saved }
     } catch (err) {
       entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
+      this.persistCounter(sessionId)
       this.ctx.logger.warn(
         `[ContextGovernor] History compression error: ${err instanceof Error ? err.message : String(err)}`,
       )
@@ -719,6 +792,9 @@ export class HistoryCompressor {
     for (const [sessionId, entry] of this.turnCounters) {
       if (now - entry.lastActive > staleThreshold) {
         this.turnCounters.delete(sessionId)
+        if (this.kv !== null) {
+          try { this.kv.delete(HistoryCompressor.kvKey(sessionId)) } catch { /* best-effort */ }
+        }
       }
     }
   }
@@ -1045,6 +1121,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_trigger_ratio ?? 0.85,
       compress_target_ratio ?? 0.6,
       injectionBudget,
+      // Persist turn counters to SQLite so the round interval survives restarts.
+      {
+        get: (key) => ctx.memoryContext.kvGet(key),
+        set: (key, value) => ctx.memoryContext.kvSet(key, value),
+        delete: (key) => ctx.memoryContext.kvDelete(key),
+      },
     )
 
     // Initialize the sanitizer config (Strategy 3)
@@ -1189,17 +1271,40 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         )
         return null
       }
-      if (decision.mode !== 'force') return undefined
-      const key = String(agent.session.id)
-      const now = Date.now()
-      if (now - (this.lastForceAt.get(key) ?? 0) < FORCED_PRESSURE_COOLDOWN_MS) return null
-      this.lastForceAt.set(key, now)
-      this.ctx.logger.info(
-        `[ContextGovernor] Narrowed-window pressure: ${measurement.totalTokens} tokens >= `
-        + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
-        + `< declared ${declared ?? 'unknown'}); forcing balanced compaction`,
-      )
-      return await super.compactIfNeeded(agent, 'context-overflow', signal)
+      if (decision.mode === 'force') {
+        const key = String(agent.session.id)
+        const now = Date.now()
+        if (now - (this.lastForceAt.get(key) ?? 0) < FORCED_PRESSURE_COOLDOWN_MS) return null
+        this.lastForceAt.set(key, now)
+        this.ctx.logger.info(
+          `[ContextGovernor] Narrowed-window pressure: ${measurement.totalTokens} tokens >= `
+          + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
+          + `< declared ${declared ?? 'unknown'}); forcing balanced compaction`,
+        )
+        return await super.compactIfNeeded(agent, 'context-overflow', signal)
+      }
+      // 'delegate' — narrowed >= declared (override == declared, or the probe
+      // matched the declaration). The base pressure path handles this with
+      // proper tail retention, BUT it uses the STATIC thresholdRatio. When the
+      // dynamic ratio has already pulled the trigger line below the static one,
+      // we must NOT wait for the static threshold: a local model whose declared
+      // window equals its probed window (e.g. qwen3 at 167936) would otherwise
+      // run into the slow long-context zone before the static 0.7 line fires.
+      // Fire the base-style balanced compaction at the DYNAMIC line instead.
+      const baseThresholdTokens = Math.max(1, Math.floor(
+        (declared ?? narrowed) * this.thresholdRatioFor(target),
+      ))
+      if (decision.thresholdTokens !== undefined
+        && decision.thresholdTokens < baseThresholdTokens
+        && measurement.totalTokens >= decision.thresholdTokens) {
+        this.ctx.logger.info(
+          `[ContextGovernor] Dynamic delegate line: ${measurement.totalTokens} tokens >= `
+          + `${decision.thresholdTokens} (below the static base line ${baseThresholdTokens}; `
+          + `model=${target.model}); compacting with tail retention`,
+        )
+        return await this.compactWithDynamicLine(agent, signal, decision.thresholdTokens, narrowed)
+      }
+      return undefined
     } catch (error) {
       // Unknown route, resolveModelInfo rejection, aborted probe — fall back to
       // the base policy, which produces its own structured diagnostics.
@@ -1209,6 +1314,59 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       )
       return undefined
     }
+  }
+
+  /**
+   * Run ONE balanced compaction (base-style: retains the configured recent
+   * tail, never the overflow-style retain-0 full squeeze) once the measured
+   * conversation crosses the given dynamic threshold.
+   *
+   * Mirrors the base pressure path's single attempt (prune → select →
+   * compactRegion) so the delegate case honors the dynamic ratio without
+   * duplicating the whole retry loop; the next step re-checks if still over.
+   */
+  private async compactWithDynamicLine(
+    agent: Agent,
+    signal: AbortSignal,
+    thresholdTokens: number,
+    window: number,
+  ): Promise<CompactionResult | null> {
+    const meter = this.ctx.tokenMeter
+    let measurement = meter.measure(agent.session)
+    const prune = this.ctx.get('toolResultPruner')
+    if (prune !== undefined) {
+      prune.pruneSession(agent.session)
+      measurement = meter.measure(agent.session)
+    }
+    if (measurement.totalTokens < thresholdTokens) return null
+    // Resolve the retained-tail budget for the effective window, mirroring the
+    // base resolveCompactSpec (retainRatio defaults to 0.16 in compaction-basic).
+    const retainTokens = this.config.retainTokens === undefined
+      ? Math.max(0, Math.floor(window * (this.config.retainRatio ?? 0.16)))
+      : this.config.retainTokens
+    // Head-anchored range selection (mirrors compaction-basic's
+    // selectCompactableRange): walk from the tail accumulating prices until the
+    // retained tail is covered, then step back to a tool-pairing-balanced cut.
+    const nodes = measurement.nodes
+    if (nodes.length === 0) return null
+    const surfaceNodes = agent.session.surface.nodes
+    let accumulated = 0
+    let keepFromIdx = nodes.length
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- guarded by length
+      accumulated += nodes[index]!.tokens
+      keepFromIdx = index
+      if (accumulated >= retainTokens) break
+    }
+    if (keepFromIdx === 0) return null
+    while (keepFromIdx > 0) {
+      if (toolPairingBalancedBefore(agent.session, surfaceNodes[keepFromIdx]!)) break
+      keepFromIdx -= 1
+    }
+    if (keepFromIdx === 0) return null
+    const start = surfaceNodes[0]!
+    const end = surfaceNodes[keepFromIdx - 1]!
+    return await this.compactRegion(start, end, agent, signal)
   }
 
   /** The compaction threshold ratio the base policy resolves for this target. */

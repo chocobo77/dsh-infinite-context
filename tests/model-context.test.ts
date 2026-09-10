@@ -140,6 +140,27 @@ describe('ModelContextTracker per-model registry', () => {
     expect(tracker.windowFor('local-qwen')).toBe(32_768)
   })
 
+  it('lets an EXPLICIT config override widen a window (user declared truth)', () => {
+    // Regression (2026-09-05): the narrow-only rule also blocked config
+    // overrides, so a user who raised a model's declared window in
+    // settings.yaml after a probe had adopted a narrower value found the
+    // plugin refusing to use the extra capacity.
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.adopt({ model: 'qwen3', contextWindow: 100_000, source: 'request-context' })
+    tracker.adopt({ model: 'qwen3', contextWindow: 32_768, source: 'probe' })
+    expect(tracker.windowFor('qwen3')).toBe(32_768)
+    // User bumps the declared window in settings.yaml: config is authoritative
+    // and may WIDEN a previously narrowed value.
+    tracker.setModelWindow({ model: 'qwen3', contextWindow: 200_000, source: 'config' })
+    expect(tracker.windowFor('qwen3')).toBe(200_000)
+    // A probe that is WIDER than the config truth cannot widen it further.
+    tracker.adopt({ model: 'qwen3', contextWindow: 250_000, source: 'probe' })
+    expect(tracker.windowFor('qwen3')).toBe(200_000)
+    // And a probe CAN still narrow it (real runtime is smaller).
+    tracker.adopt({ model: 'qwen3', contextWindow: 64_000, source: 'probe' })
+    expect(tracker.windowFor('qwen3')).toBe(64_000)
+  })
+
   it('ignores invalid setModelWindow values', () => {
     const tracker = new ModelContextTracker(94_000, false)
     tracker.setModelWindow({ model: 'm', contextWindow: 0, source: 'config' })

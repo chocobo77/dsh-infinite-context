@@ -45,11 +45,51 @@ export const IMAGE_BLOCK_TOKEN_COST = 1500
 
 /**
  * Per tool-result / tool-call block, the estimated tokens are capped at this
- * value. Tool payloads can be huge or base64-laden; bounding a single block
- * keeps the conversation estimate honest without letting one monster result
- * dominate (and skew) the compression and thinking-guard metering.
+ * value ONLY when the payload looks like base64/binary (see
+ * {@link looksLikeBase64Payload}). Real text (file reads, command output) is
+ * metered in full so large-but-valuable content is not undercounted — the
+ * thinking guard and compression must see the true cost of a 50K-token file
+ * read, not a flat cap.
  */
 export const MAX_TOOL_BLOCK_TOKENS = 8192
+
+/**
+ * Whether a tool payload is dominated by base64 data. Base64 is ~4/3 bytes per
+ * character of high-entropy alphabet with long runs and NO whitespace, so it
+ * compresses far worse than real text and inflates a per-token estimate
+ * wildly. Real conversation text (code, logs, natural language) contains
+ * abundant whitespace, so requiring <1% whitespace cleanly separates them.
+ */
+function looksLikeBase64Payload(text: string): boolean {
+  if (text.length < 128) return false
+  let whitespace = 0
+  let total = 0
+  for (const ch of text) {
+    if (ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r') whitespace++
+    total++
+  }
+  if (total === 0) return false
+  // Base64 output never contains spaces/newlines; real text always has a
+  // meaningful share of them. Requiring whitespace < 1% avoids misclassifying
+  // natural-language / code payloads as base64.
+  return whitespace / total < 0.01
+}
+
+/** Whether a nested content array is dominated by base64 text blocks. */
+function contentIsBase64(content: readonly unknown[]): boolean {
+  let text = ''
+  let textLen = 0
+  for (const block of content) {
+    if (typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text') {
+      const t = (block as { text?: unknown }).text
+      if (typeof t === 'string') {
+        text += t
+        textLen += t.length
+      }
+    }
+  }
+  return textLen >= 128 && looksLikeBase64Payload(text)
+}
 
 /** Meter ONE content block (recursing into nested content where present). */
 function estimateBlockTokens(block: { type?: unknown } & Record<string, unknown>): number {
@@ -65,9 +105,17 @@ function estimateBlockTokens(block: { type?: unknown } & Record<string, unknown>
       // Recursing is what makes file reads and command output count — without
       // it a 50K-token read was metered as a flat 32 tokens.
       if (Array.isArray(block.content)) {
-        return Math.min(MAX_TOOL_BLOCK_TOKENS, estimateContentTokens(block.content))
+        const est = estimateContentTokens(block.content)
+        // Cap ONLY base64/binary payloads (an image blob inflates the estimate
+        // wildly); real text is metered in full so big reads are never
+        // undercounted for the guard/compression.
+        return contentIsBase64(block.content) ? Math.min(MAX_TOOL_BLOCK_TOKENS, est) : est
       }
-      return typeof block.text === 'string' ? estimateTokens(block.text) : 32
+      return typeof block.text === 'string'
+        ? (looksLikeBase64Payload(block.text)
+          ? Math.min(MAX_TOOL_BLOCK_TOKENS, estimateTokens(block.text))
+          : estimateTokens(block.text))
+        : 32
     case 'tool-call':
       // `arguments` is raw JSON (may embed base64) — count it, capped, so a
       // giant call payload cannot poison the estimate.

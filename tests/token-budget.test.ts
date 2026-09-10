@@ -46,8 +46,23 @@ describe('estimateContentTokens', () => {
     expect(huge).toBeLessThanOrEqual(MAX_TOOL_BLOCK_TOKENS)
   })
 
-  it('caps a huge nested tool-result payload', () => {
-    const content = [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'y'.repeat(MAX_TOOL_BLOCK_TOKENS * 4 * 4) }] }]
+  it('meters a huge REAL-text tool-result IN FULL (not capped)', () => {
+    // Regression (2026-09-05): a 50K-token file read was capped at
+    // MAX_TOOL_BLOCK_TOKENS, undercounting 6x — the thinking guard then fired
+    // too late. Real text is metered in full; only base64/binary payloads cap.
+    const payload = 'the quick brown fox jumps over the lazy dog '.repeat(1000) // ~27K chars, real text
+    const content = [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: payload }] }]
+    const estimate = estimateContentTokens(content)
+    expect(estimate).toBe(estimateTokens(payload))
+    expect(estimate).toBeGreaterThan(MAX_TOOL_BLOCK_TOKENS)
+  })
+
+  it('caps a base64-laden nested tool-result payload', () => {
+    // Base64 (long high-entropy alnum runs) inflates the per-token estimate
+    // wildly and is low-value content — it stays capped so it cannot poison
+    // the guard/compression metering.
+    const b64 = Buffer.alloc(MAX_TOOL_BLOCK_TOKENS * 8, 0x61).toString('base64')
+    const content = [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: b64 }] }]
     expect(estimateContentTokens(content)).toBeLessThanOrEqual(MAX_TOOL_BLOCK_TOKENS)
   })
 

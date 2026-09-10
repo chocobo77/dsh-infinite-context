@@ -52,11 +52,18 @@ describe('MemoryEngine', () => {
     await engine.storeMemory('fact three about retrieval', 'mid')
     const result = await engine.consolidate()
     expect(result).not.toBeNull()
+    // The mids are DEMOTED to short (full text preserved, low importance) so
+    // the lossy re-compression never destroys recoverable detail.
     expect(store.count('mid')).toBe(0)
+    expect(store.count('short')).toBe(3)
     expect(store.count('long')).toBe(1)
     const longDoc = store.list('long')[0]!
     expect(longDoc.text).toContain('CONSOLIDATED')
     expect(longDoc.mergedFrom).toHaveLength(3)
+    // Original mid texts survive on the short tier, retrievable, low-value.
+    const shorts = store.list('short')
+    expect(shorts.map(d => d.text)).toContain('fact one about persistence')
+    expect(shorts.every(d => d.importance <= 0.3)).toBe(true)
   })
 
   it('does not consolidate below the merge threshold', async () => {

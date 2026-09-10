@@ -90,9 +90,15 @@ export class ModelContextTracker {
 
   /**
    * Record an explicit per-model window (config override or probe result)
-   * WITHOUT moving the global "last observed" slot. Probes only ever narrow:
-   * a later wider observation for the same model cannot raise a recorded
-   * narrower value.
+   * WITHOUT moving the global "last observed" slot.
+   *
+   * Narrow-only rule: a probe or request-observed window may only LOWER a
+   * recorded value (a later wider observation from the same source cannot
+   * raise it). Explicit `config` overrides are the user's declared truth and
+   * are applied even when WIDER — otherwise a user who raised a model's
+   * declared window (e.g. settings.yaml) after the plugin adopted a probe
+   * would find the plugin refusing to use the extra capacity. Probes remain
+   * narrow-only so a wrong probe can never inflate capacity.
    */
   setModelWindow(info: {
     provider?: string
@@ -103,7 +109,9 @@ export class ModelContextTracker {
     if (info.model === undefined) return
     if (!Number.isSafeInteger(info.contextWindow) || info.contextWindow <= 0) return
     const existing = this.windowsByModel.get(info.model)
-    if (existing !== undefined && info.contextWindow >= existing.contextWindow) return
+    const wider = existing !== undefined && info.contextWindow > existing.contextWindow
+    if (wider && info.source !== 'config') return
+    if (existing !== undefined && info.contextWindow === existing.contextWindow) return
     this.windowsByModel.set(info.model, {
       ...(info.provider === undefined ? {} : { provider: info.provider }),
       model: info.model,

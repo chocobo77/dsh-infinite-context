@@ -148,6 +148,35 @@ describe('MemoryStore', () => {
     store.close()
   })
 
+  it('persists plugin KV state across reopen (turn counters survive restart)', () => {
+    const dir = tempDir()
+    const file = join(dir, 'kv.db')
+    const first = new MemoryStore(file)
+    first.kvSet('compression:sess-1', '{"turn":12,"lastCompressedTurn":8,"failureCooldown":0}')
+    first.kvSet('compression:sess-2', '{"turn":3,"failureCooldown":2}')
+    expect(first.kvGet('compression:sess-1')).toContain('"turn":12')
+    expect(first.kvGet('missing-key')).toBeUndefined()
+    first.close()
+
+    const second = new MemoryStore(file)
+    expect(second.kvGet('compression:sess-1')).toContain('"turn":12')
+    expect(second.kvGet('compression:sess-2')).toContain('"failureCooldown":2')
+    // Upsert overwrites; delete removes.
+    second.kvSet('compression:sess-1', '{"turn":13}')
+    expect(second.kvGet('compression:sess-1')).toContain('"turn":13')
+    second.kvDelete('compression:sess-2')
+    expect(second.kvGet('compression:sess-2')).toBeUndefined()
+    second.close()
+  })
+
+  it('does not let KV rows leak into memory retrieval', () => {
+    const store = new MemoryStore(':memory:')
+    store.kvSet('compression:sess-1', '{"turn":1}')
+    expect(store.list()).toHaveLength(0)
+    expect(store.count()).toBe(0)
+    store.close()
+  })
+
   it('throws on use after close', () => {
     const store = new MemoryStore(':memory:')
     store.close()
