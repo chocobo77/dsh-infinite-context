@@ -8,7 +8,10 @@
  * @module dsh-infinite-context/memory-store
  */
 
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { IN_MEMORY_STORE } from './config.ts'
 import type { MemoryDoc, MemoryKind, Tier } from './types.ts'
 
 /** Serialize a vector to a Float32 BLOB payload. */
@@ -69,6 +72,7 @@ export class MemoryStore {
    *   (tests). Missing parent directories are created.
    */
   constructor(path: string) {
+    if (path !== IN_MEMORY_STORE) mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL')
     this.db.exec(`

@@ -17,7 +17,9 @@
   name: ./src/memory-context.ts
   config:
     # SQLite file for persisted memories. Use ':memory:' to disable persistence.
-    storePath: ./dsh-infinite-context.db
+    # A RELATIVE path resolves below <DSH_HOME>/storages — deliberately not the
+    # process cwd, which is only wherever `dsh` happened to be launched.
+    storePath: dsh-infinite-context.db
     # The model's total context window (local 94k deployment).
     contextWindow: 94000
     # Fraction reserved for system prompt + tools + current input + output.

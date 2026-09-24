@@ -9,9 +9,12 @@
  * @module dsh-infinite-context/memory-context
  */
 
+import { existsSync } from 'node:fs'
+import { basename, resolve } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import {
+  IN_MEMORY_STORE,
   MemoryContextConfigSchema,
   resolveMemoryContextConfig,
   type MemoryContextConfig,
@@ -80,7 +83,21 @@ export class MemoryContext extends Service {
    */
   protected async [Service.init](): Promise<void> {
     const embedder = await createEmbedder(this.resolved.memory.embedder)
-    const store = new MemoryStore(this.resolved.storePath)
+    const storePath = this.resolved.storePath
+    if (storePath !== IN_MEMORY_STORE && !existsSync(storePath)) {
+      // Upgrade hazard: earlier builds resolved a relative storePath against
+      // the process cwd, so an existing store may still sit there. Say so
+      // loudly instead of silently starting from an empty memory store.
+      const legacy = resolve(process.cwd(), basename(storePath))
+      if (existsSync(legacy)) {
+        this.context.logger.warn(
+          `[memoryContext] store ${storePath} does not exist yet, but a legacy cwd-relative store `
+          + `is present at ${legacy}; move it (with its -wal/-shm siblings) to the resolved path `
+          + `to keep those memories`,
+        )
+      }
+    }
+    const store = new MemoryStore(storePath)
     const budget = new TokenBudget(
       this.resolved.memory.budget,
       this.resolved.contextWindow,
