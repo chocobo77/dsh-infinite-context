@@ -169,4 +169,13 @@ describe('ModelContextTracker per-model registry', () => {
     expect(tracker.windowFor('m')).toBeUndefined()
     expect(tracker.perModel()).toEqual([])
   })
+
+  it('resolves the provider PER MODEL (probeModel targets the right server)', () => {
+    const tracker = new ModelContextTracker(94_000, false)
+    tracker.observe({ provider: 'local-llama', model: 'qwen3', contextWindow: 32_768 })
+    tracker.observe({ provider: 'ark', model: 'deepseek-v4', contextWindow: 262_144 })
+    expect(tracker.providerFor('qwen3')).toBe('local-llama')
+    expect(tracker.providerFor('deepseek-v4')).toBe('ark')
+    expect(tracker.providerFor('unknown-model')).toBeUndefined()
+  })
 })

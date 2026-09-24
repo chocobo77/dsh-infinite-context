@@ -137,14 +137,18 @@ describe('MemoryStore', () => {
 
   it('supports exact and fuzzy-normalized text dedup', () => {
     const store = new MemoryStore(':memory:')
-    store.insert(makeDoc({ id: 'a', text: '[source: pwsh]\ncmd ran at 13:14:05 and printed 42' }))
+    store.insert(makeDoc({ id: 'a', text: '[source: pwsh]\ncmd ran at 20240903114205 and printed 42000 items' }))
     // Exact match.
-    expect(store.hasText('[source: pwsh]\ncmd ran at 13:14:05 and printed 42')).toBe(true)
+    expect(store.hasText('[source: pwsh]\ncmd ran at 20240903114205 and printed 42000 items')).toBe(true)
     expect(store.hasText('something else entirely')).toBe(false)
-    // Fuzzy match: digit runs and whitespace differ, case differs (full text, incl. prefix).
-    expect(store.hasTextNormalized('[source: pwsh]\nCMD ran at 99:99:99 and printed 7')).toBe(true)
+    // Fuzzy match: long digit runs (4+: timestamps/counters) and whitespace differ, case differs.
+    expect(store.hasTextNormalized('[source: pwsh]\nCMD ran at 19999999999999 and printed 99999 items')).toBe(true)
     // Genuinely different content still misses.
     expect(store.hasTextNormalized('[source: pwsh]\nunrelated text without numbers')).toBe(false)
+    // Short digit runs (1–3: small values like counts/ports) stay significant —
+    // two facts differing only by such a value are NOT deduplicated.
+    store.insert(makeDoc({ id: 'b', text: '[source: pwsh]\nlistening on port 300' }))
+    expect(store.hasTextNormalized('[source: pwsh]\nlistening on port 808')).toBe(false)
     store.close()
   })
 

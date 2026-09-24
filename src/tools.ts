@@ -165,7 +165,7 @@ export function apply(ctx: Context) {
       try {
         const result = await ctx.memoryContext.consolidate()
         if (result === null) return 'Nothing to consolidate (below the merge threshold).'
-        return `Consolidated ${result.droppedMids.length} mid memories into one long memory (${result.merged?.id}).`
+        return `Consolidated ${result.demotedMids.length} mid memories into one long memory (${result.merged?.id}; the mids were demoted to the short tier).`
       } catch (err) {
         // No summarization target (no configured provider/model and no
         // session-routed model available) is not an error the tool should
@@ -210,7 +210,10 @@ export function apply(ctx: Context) {
     async execute(args: { source: string; result: string }) {
       try {
         const parsed = (() => { try { return JSON.parse(args.result) } catch { return args.result } })()
-        const sanitized = sanitizeToolResult(parsed, args.source, { maxChars: 2000 })
+        // Reuse the compaction engine's configured sanitizer cap
+        // (sanitize_max_chars) instead of a hard-coded default.
+        const maxChars = ctx.memoryContext.compactionEngine?.sanitizerConfig?.maxChars ?? 2000
+        const sanitized = sanitizeToolResult(parsed, args.source, { maxChars })
         const text = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized)
         // Reuse the compaction engine's configured retriever (rag_* config)
         // instead of constructing a hard-coded one here.

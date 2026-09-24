@@ -67,6 +67,13 @@ import {
 /*  Summarization types (structural mirrors from dsh-compaction-basic)        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The branded seq type {@link Session.eventAt} accepts. The runtime-installed
+ * dsh-session package does not export the `SessionSeq` brander, so this is
+ * derived from the API surface itself — at runtime it is a plain number.
+ */
+type SessionSeqOf = Parameters<Session['eventAt']>[0]
+
 interface SummarizationInput {
   readonly system?: string
   readonly tools?: readonly ToolSchema[]
@@ -114,6 +121,26 @@ function messageText(message: { role: string; content: unknown }): string {
       .join('\n')
   }
   return ''
+}
+
+/** Whether an unknown entry is a content block carrying text. */
+function isTextBlock(block: unknown): block is { type: 'text'; text: string } {
+  return typeof block === 'object' && block !== null
+    && (block as { type?: unknown }).type === 'text'
+    && typeof (block as { text?: unknown }).text === 'string'
+}
+
+/**
+ * Render a sanitized payload to the text stored in memory: strings as-is,
+ * content-block arrays as their joined text (no JSON structure noise),
+ * anything else as JSON.
+ */
+function sanitizedPayloadText(sanitized: unknown): string {
+  if (typeof sanitized === 'string') return sanitized
+  if (Array.isArray(sanitized)) {
+    return sanitized.filter(isTextBlock).map(block => block.text).join('\n').trim()
+  }
+  return JSON.stringify(sanitized)
 }
 
 /**
@@ -208,7 +235,7 @@ async function summarizeMemoriesWithLlm(
   const messages: Message[] = [
     createUserMessage({
       content: [{ type: 'text', text: instruction }],
-      source: { kind: 'plugin', plugin: PLUGIN },
+      source: { kind: 'plugin:' + PLUGIN } as any,
     }),
   ]
   const options: GenerateOptions = {
@@ -458,24 +485,6 @@ export class HistoryCompressor {
   }
 
   /**
-   * Compress old messages if the turn interval has been reached.
-   *
-   * Uses a detail-preserving extraction strategy:
-   *   - Short conversations (< 20 messages): single-pass with extractive prompt.
-   *   - Long conversations (>= 20 messages): batch extraction (20/batch, 5 overlap)
-   *     followed by a merge pass to combine batch summaries.
-   *
-   * CRITICAL: The recursion lock must surround the LLM call. Without it, the
-   * summarization call itself would pass through the agent loop and re-trigger
-   * governance (including another compression attempt), causing infinite
-   * recursion → stack overflow → process crash.
-   *
-   * @param sessionId - the current session identifier.
-   * @param messages  - the full message array (will NOT be mutated).
-   * @param force - skip the round-interval check (for manual/force compress).
-   * @returns compressed messages + tokens saved, or null if no compression.
-   */
-  /**
    * Compress old messages when token pressure warrants it.
    *
    * Trigger policy (see {@link shouldCompressHistory}): the token-pressure
@@ -498,7 +507,8 @@ export class HistoryCompressor {
    * @param messages  - the full message array (will NOT be mutated).
    * @param force - skip the trigger gates (for manual/force compress).
    * @param options - `window`: the session's effective model window (defaults
-   *   to the globally adopted window).
+   *   to the globally adopted window); `session`: the session whose routed
+   *   model resolves the summarization target.
    * @returns compressed messages + tokens saved, or null if no compression.
    */
   async compress(
@@ -584,7 +594,11 @@ export class HistoryCompressor {
         ...compressible.slice(cutIndex),
         ...messages.slice(-this.retainRecent),
       ]
-      if (oldMessages.length === 0) {
+      if (toFree <= 0) {
+        // Unreachable with the documented ordering (trigger ratio > target
+        // ratio puts the trigger above the target), but a misconfiguration
+        // (trigger < target) would otherwise burn an LLM call summarizing a
+        // single message that frees nothing.
         this.ctx.logger.info(
           `[ContextGovernor] Compression skipped: nothing over the ${Math.floor(budget * this.targetRatio)}-token target`,
         )
@@ -631,7 +645,7 @@ export class HistoryCompressor {
           type: 'text',
           text: `[Compressed history — ${oldMessages.length} earlier messages, details preserved below]\n\n${summaryText}`,
         }],
-        source: { kind: 'plugin', plugin: PLUGIN },
+        source: { kind: 'plugin:' + PLUGIN } as any,
       })
       const newMessages: Message[] = [summaryMessage, ...keptMessages.map(m => ({ ...m }))]
 
@@ -747,7 +761,7 @@ export class HistoryCompressor {
           type: 'text',
           text: `[Compressed history — ${oldMessages.length} earlier messages, details preserved below]\n\n${summaryText}`,
         }],
-        source: { kind: 'plugin', plugin: PLUGIN },
+        source: { kind: 'plugin:' + PLUGIN } as any,
       })
       const newMessages: Message[] = [summaryMessage, ...recentMessages.map(m => ({ ...m }))]
       const afterTokens = this.estimateMessageTokens(newMessages)
@@ -922,7 +936,7 @@ export class HistoryCompressor {
       model: target.model,
       messages: [createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: PLUGIN },
+        source: { kind: 'plugin:' + PLUGIN } as any,
       })],
       maxTokens: this.config.maxTokens,
       purpose: 'compaction',
@@ -1008,17 +1022,23 @@ function fallbackTruncate(
   }
 
   if (tokens > tokenBudget) {
-    // Last resort: truncate the oldest remaining message's content.
-    // Rebuild the message instead of mutating the readonly `content` field,
-    // and keep the DSH Message contract (content: ContentBlock[]).
+    // Last resort: trim the oldest remaining message's TEXT payload. Only text
+    // blocks are rewritten (preserving images and every other block so the
+    // message keeps its modality and the DSH ContentBlock[] contract), and the
+    // message object is rebuilt instead of mutating readonly fields.
     const oldest = result[0]
-    if (oldest !== undefined && result.length > 1) {
-      const text = messageText(oldest)
+    if (oldest !== undefined && result.length > 1 && Array.isArray(oldest.content)) {
       const overBy = tokens - tokenBudget
       const charsToDrop = overBy * 4 // rough reverse estimate
-      if (charsToDrop > 0 && charsToDrop < text.length) {
-        const kept = text.slice(charsToDrop)
-        result[0] = { ...oldest, content: [{ type: 'text', text: kept }] }
+      if (charsToDrop > 0) {
+        let remaining = charsToDrop
+        const content = oldest.content.map(block => {
+          if (remaining <= 0 || !isTextBlock(block) || block.text.length <= remaining) return block
+          const kept = block.text.slice(remaining)
+          remaining = 0
+          return { ...block, text: kept }
+        })
+        if (remaining === 0) result[0] = { ...oldest, content }
       }
     }
   }
@@ -1150,24 +1170,27 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     this.retriever = new VectorRetriever(ctx, retrieverConfig)
 
-    // Register back-reference so tools.ts can reach the compressor for force-compress
-    // and reuse the configured retriever for ingestion (single config source).
-    ctx.memoryContext.compactionEngine = { compressor: this.compressor }
+    // Register back-reference so tools.ts can reach the compressor for force-compress,
+    // reuse the configured retriever for ingestion (single config source), and
+    // reuse the configured sanitizer cap instead of a hard-coded one.
+    ctx.memoryContext.compactionEngine = {
+      compressor: this.compressor,
+      sanitizerConfig: this.sanitizerConfig,
+    }
     ctx.memoryContext.retriever = { ingest: (text, source) => this.retriever.ingest(text, source) }
 
     // Wire Strategy 3 (output sanitization + ingestion): observe every settled
-    // tool call, sanitize its result, and ingest it into the vector memory so
-    // useful tool outputs survive for later retrieval. Listener failures are
-    // contained by onToolResult's own try/catch.
+    // tool call and hand its STRUCTURED content blocks to the sanitizer — the
+    // source strategies (web_search / code_exec / per-field truncation) must
+    // see the payload; pre-joining it into a string would bypass them all.
+    // Listener failures are contained by onToolResult's own try/catch.
     ctx.on('tools/result', (exec: ToolExecution, result: ToolExecutionResult) => {
       if (exec.signal.aborted) return
-      const text = result.content
-        .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
-        .map(block => block.text)
-        .join('\n')
-        .trim()
-      if (text.length === 0) return
-      void this.onToolResult(exec.name, text)
+      const hasText = result.content.some(
+        block => block.type === 'text' && block.text.trim().length > 0,
+      )
+      if (!hasText) return
+      void this.onToolResult(exec.name, result.content)
     })
 
     // Always register the governance hook: it also drives history compression
@@ -1350,6 +1373,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const nodes = measurement.nodes
     if (nodes.length === 0) return null
     const surfaceNodes = agent.session.surface.nodes
+    // Base contract guard #1: the priced nodes must still match the live
+    // surface seq-for-seq. A stale measurement (surface mutated between
+    // measure and now) would make every positional index below a lie — the
+    // base path throws the same error, and the caller falls back to it.
+    if (surfaceNodes.length !== nodes.length
+      || surfaceNodes.some((seq, index) => seq !== nodes[index]?.seq)) {
+      throw new Error(
+        'dsh-infinite-context: token-meter surface does not match the current session surface',
+      )
+    }
+    // Base contract guard #2: a leading system/message node is NEVER inside the
+    // compactable range — summarizing it would corrupt the system prompt.
+    const firstIdx = this.isSystemHeadNode(agent.session, surfaceNodes[0]!) ? 1 : 0
     let accumulated = 0
     let keepFromIdx = nodes.length
     for (let index = nodes.length - 1; index >= 0; index -= 1) {
@@ -1358,15 +1394,51 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       keepFromIdx = index
       if (accumulated >= retainTokens) break
     }
-    if (keepFromIdx === 0) return null
-    while (keepFromIdx > 0) {
+    if (keepFromIdx <= firstIdx) return null
+    while (keepFromIdx > firstIdx) {
       if (toolPairingBalancedBefore(agent.session, surfaceNodes[keepFromIdx]!)) break
       keepFromIdx -= 1
     }
-    if (keepFromIdx === 0) return null
-    const start = surfaceNodes[0]!
+    if (keepFromIdx <= firstIdx) return null
+    // Base contract guard #3: never enter a second compaction transaction while
+    // one is still open (the base pressure path asserts the same before its
+    // async decision gap; this call has the same gap after resolveModelInfo).
+    this.assertNoActiveCompaction(agent.session, 'dynamic-line pressure compaction')
+    const start = surfaceNodes[firstIdx]!
     const end = surfaceNodes[keepFromIdx - 1]!
     return await this.compactRegion(start, end, agent, signal)
+  }
+
+  /**
+   * Whether the surface node at `seq` is the session's system prompt head
+   * (mirrors compaction-basic's `systemHead`): the event at that seq must be a
+   * `system/message`. Such nodes are never compacted.
+   */
+  private isSystemHeadNode(session: Session, seq: number): boolean {
+    const head = session.eventAt(seq as SessionSeqOf)
+    return head !== undefined && (head as { type?: unknown }).type === 'system/message'
+  }
+
+  /**
+   * Lightweight mirror of compaction-basic's internal compaction-lock check:
+   * scan the event log backwards for the most recent `compaction/start` vs
+   * `compaction/end` marker. An unmatched start (with no later `session/end-seed`
+   * releasing it) means a compaction transaction is already open on this
+   * session — entering a second one would interleave two surface replacements.
+   */
+  private assertNoActiveCompaction(session: Session, stage: string): void {
+    let endSeedSeen = false
+    for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+      const event = session.eventAt(seq as SessionSeqOf)
+      if (event === undefined) break
+      if (!endSeedSeen && (event as { type?: unknown }).type === 'session/end-seed') endSeedSeen = true
+      const type = (event as { type?: unknown }).type
+      if (type === 'compaction/start') {
+        if (endSeedSeen) return
+        throw new Error(`${stage}: compaction already in progress; the session compaction lock is already active`)
+      }
+      if (type === 'compaction/end') return
+    }
   }
 
   /** The compaction threshold ratio the base policy resolves for this target. */
@@ -1407,7 +1479,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       )
       if (rebalance.pyramid?.merged !== null && rebalance.pyramid?.merged !== undefined) {
         this.ctx.logger.info(
-          `memory pyramid consolidated ${rebalance.pyramid.droppedMids.length} mid memories into one long memory`,
+          `memory pyramid consolidated ${rebalance.pyramid.demotedMids.length} mid memories into one long memory `
+            + `(mids demoted to the short tier)`,
         )
       }
       if (rebalance.forgetting.dropped.length > 0) {
@@ -1429,12 +1502,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * Sanitize a tool result and ingest it into the vector memory.
    * Called from the tool execution callback (onToolResult equivalent).
    *
+   * `rawResult` may be the structured `ContentBlock[]` from the `tools/result`
+   * event (the automatic path) or any parsed payload (the manual
+   * `memory_ingest` tool) — {@link sanitizeToolResult} dispatches per shape.
+   *
    * Error-isolated: failures never block the main flow.
    */
   async onToolResult(source: string, rawResult: unknown): Promise<void> {
     try {
       const sanitized = sanitizeToolResult(rawResult, source, this.sanitizerConfig)
-      const text = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized)
+      const text = sanitizedPayloadText(sanitized)
+      if (text.length === 0) return
       await this.retriever.ingest(text, source)
     } catch (err) {
       this.ctx.logger.warn(
@@ -1449,8 +1527,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
       next: () => Promise<PreStepDecision>,
     ): Promise<PreStepDecision> => {
-      // Periodic cleanup of stale session counters
+      // Periodic cleanup of stale session counters + stale forced-pressure marks
       this.compressor.cleanupStale()
+      this.cleanupStaleForceMarks()
 
       const decision = await next()
       if (payload.signal.aborted || decision.kind !== 'enter' || decision.messages.length === 0) {
@@ -1581,6 +1660,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (text.length > 0) return text
     }
     return undefined
+  }
+
+  /**
+   * Periodic cleanup of stale forced-pressure timestamps. The cooldown only
+   * ever needs each session's LATEST mark; entries idle for over an hour are
+   * pure memory-hygiene waste (sessions that long gone will re-mark on their
+   * next force anyway).
+   */
+  private cleanupStaleForceMarks(): void {
+    const staleThreshold = 3600_000
+    const now = Date.now()
+    for (const [key, at] of this.lastForceAt) {
+      if (now - at > staleThreshold) this.lastForceAt.delete(key)
+    }
   }
 }
 

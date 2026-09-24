@@ -57,7 +57,7 @@ src/
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
 └── tools.ts              10 个手动工具
-tests/                    133 个单元测试
+tests/                    160 个单元测试
 ```
 
 ### 手动工具
@@ -198,7 +198,7 @@ scripts\install-dsh-plugin.ps1 -DetectOnly
 ### 测试
 
 ```sh
-# 单元测试（133 个，无 DSH 依赖）
+# 单元测试（160 个，无 DSH 依赖）
 vitest run --config vitest.config.ts
 
 # 类型检查
@@ -284,7 +284,7 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (133, no DSH dependency)
+# Unit tests (160, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check

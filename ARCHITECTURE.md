@@ -82,7 +82,10 @@ Each memory document has a `tier`. The tiers encode *recency and abstraction*:
 **Pyramid consolidation** (`MemoryEngine.consolidate`): when the number of `mid`
 memories reaches `pyramid.mergeThreshold`, the oldest `mergeBatch` are folded —
 via an LLM call — into a single `long` memory (`mergedFrom` records the folded
-ids), and the folded `mid` rows are removed. `long` memories beyond `maxLong`
+ids). The folded `mid` rows are NOT deleted: the merge is lossy, so they are
+demoted to the `short` tier at a low importance (`demotedMids` in the result)
+and the forgetting policy retires them naturally, making the loss reversible
+while the originals are still retrievable. `long` memories beyond `maxLong`
 are trimmed oldest-first. This is the "pyramid" the task asks for: summaries of
 summaries at higher and higher abstraction.
 
@@ -198,7 +201,7 @@ provides on-demand retrieval instead.
 | `src/config.ts` | yes | Schemastery schemas + default resolution. |
 | `src/memory-context.ts` | yes | `MemoryContext` service (`ctx.memoryContext`): probe wiring + locality gate + per-model adoption. |
 | `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance + narrowed-window force + thinking-guard wiring. |
-| `src/OutputSanitizer.ts` | no | Tool-result sanitization (web_search/code_exec/generic JSON). |
+| `src/OutputSanitizer.ts` | no | Tool-result sanitization: per-source strategies for rendered text and `ContentBlock[]` (the automatic `tools/result` path) plus structured JSON objects (web_search/code_exec/generic truncation, the manual ingest path). |
 | `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval. |
 | `src/tools.ts` | yes | Manual model-callable tools. |
 | `src/core.ts` | no | Barrel re-exporting the dependency-free core. |

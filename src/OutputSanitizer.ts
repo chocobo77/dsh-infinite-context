@@ -8,10 +8,14 @@
  * module as a token guard for the live context.
  *
  * Purpose: reduce memory noise from verbose tool outputs while preserving
- * the semantic content worth retrieving later. Three strategies by source type:
- *   - web_search: extract title + snippet, strip HTML
- *   - code_exec: keep tail 200 lines of stdout + errors
- *   - generic JSON: recursive string truncation at configurable max chars
+ * the semantic content worth retrieving later. Strategies by payload shape:
+ *   - ContentBlock[] (the automatic `tools/result` path): each block's text
+ *     payload is sanitized per source strategy; non-text blocks are preserved.
+ *   - plain string: the same source strategies applied to the text directly.
+ *   - structured object (the manual `memory_ingest` path), by source type:
+ *       - web_search: extract title + snippet, strip HTML
+ *       - code_exec: keep tail 200 lines of stdout + errors
+ *       - generic JSON: recursive string truncation at configurable max chars
  *
  * This is a pure utility — no DSH imports, no side effects, fully unit-testable.
  *
@@ -93,16 +97,58 @@ function truncateStrings(obj: unknown, maxChars: number): unknown {
 }
 
 /**
+ * Text-level strategy for payloads that arrive as rendered text (the
+ * `tools/result` listener sees ContentBlock[] / strings, not the tool's
+ * native structured output, so the structured strategies below cannot run):
+ *   - web_search → strip HTML + collapse whitespace
+ *   - code_exec  → keep the tail CODE_EXEC_TAIL_LINES lines
+ *   - everything else → truncate at maxChars
+ */
+function sanitizeTextContent(text: string, source: string, config: SanitizerConfig): string {
+  switch (source) {
+    case 'web_search':
+      return stripHtml(text)
+    case 'code_exec': {
+      const lines = text.split('\n')
+      return lines.length > CODE_EXEC_TAIL_LINES
+        ? lines.slice(-CODE_EXEC_TAIL_LINES).join('\n')
+        : text
+    }
+    default:
+      return text.length > config.maxChars
+        ? text.slice(0, config.maxChars) + '…[truncated]'
+        : text
+  }
+}
+
+/**
+ * Sanitize one entry of a content-block array: rewrite the text payload of
+ * text blocks, pass everything else (images, tool-call blocks, …) through so
+ * the message keeps its modality.
+ */
+function sanitizeBlock(block: unknown, source: string, config: SanitizerConfig): unknown {
+  if (typeof block === 'object' && block !== null
+    && (block as { type?: unknown }).type === 'text'
+    && typeof (block as { text?: unknown }).text === 'string') {
+    return { ...block, text: sanitizeTextContent((block as { text: string }).text, source, config) }
+  }
+  return block
+}
+
+/**
  * Sanitize a raw tool result to fit within the token budget.
  *
- * Dispatches by `source`:
- *   - 'web_search'  → extract title + snippet, strip HTML
- *   - 'code_exec'   → tail 200 lines of stdout + error
- *   - everything else → recursive string truncation
+ * Dispatches by payload shape and `source`:
+ *   - string            → per-source text strategy (web_search strip HTML /
+ *                         code_exec tail / generic maxChars truncation)
+ *   - ContentBlock[]    → per-block text strategy, non-text blocks preserved
+ *   - object, web_search → extract title + snippet, strip HTML
+ *   - object, code_exec  → tail 200 lines of stdout + error
+ *   - object, other      → recursive string truncation
  *
  * @param raw    the raw tool result (never mutated — a sanitized copy is returned).
  * @param source the tool/source identifier (e.g. 'web_search', 'code_exec').
- * @param config sanitizer configuration (maxChars for generic JSON).
+ * @param config sanitizer configuration (maxChars for generic JSON / text).
  * @returns the sanitized result.
  */
 export function sanitizeToolResult(
@@ -111,6 +157,8 @@ export function sanitizeToolResult(
   config: SanitizerConfig = { maxChars: DEFAULT_MAX_CHARS },
 ): unknown {
   if (raw === null || raw === undefined) return raw
+  if (typeof raw === 'string') return sanitizeTextContent(raw, source, config)
+  if (Array.isArray(raw)) return raw.map(block => sanitizeBlock(block, source, config))
   if (typeof raw !== 'object') return raw
 
   const obj = raw as Record<string, unknown>

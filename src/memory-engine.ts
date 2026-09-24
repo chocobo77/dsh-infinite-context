@@ -246,8 +246,9 @@ export class MemoryEngine {
 
   /**
    * Consolidate the pyramid: when enough `mid` memories have accumulated, fold
-   * the oldest batch into a single `long` memory (via the summarizer) and drop
-   * the folded mids. Also trims `long` memories beyond the cap.
+   * the oldest batch into a single `long` memory (via the summarizer) and
+   * demote the folded mids to the short tier. Also trims `long` memories
+   * beyond the cap.
    * @param target - optional resolved summarization target (e.g. the session's
    *   routed model); forwarded to the summarizer.
    * @returns the consolidation result, or `null` when nothing was merged.
@@ -291,7 +292,7 @@ export class MemoryEngine {
       this.store.upsert({ ...doc, tier: 'short', importance: Math.min(doc.importance, 0.3) })
     }
     this.trimLongMemories()
-    return { merged: longDoc, droppedMids: batch.map(doc => doc.id) }
+    return { merged: longDoc, demotedMids: batch.map(doc => doc.id) }
   }
 
   /** Drop the oldest `long` memories beyond the configured cap. */
