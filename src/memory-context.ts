@@ -184,8 +184,11 @@ export class MemoryContext extends Service {
    * private-LAN hosts as local. Only local models get a live context probe;
    * online models are trusted at the window they declared. A provider with no
    * readable baseURL is treated as non-local (no probe) — the safe default.
+   *
+   * Public because routing decisions beyond probing depend on it: the
+   * local-model conciseness directive is injected only on local routes.
    */
-  private isLocalRoute(provider: string | undefined): boolean {
+  isLocalRoute(provider: string | undefined): boolean {
     if (provider === undefined || provider.length === 0) return false
     try {
       const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings

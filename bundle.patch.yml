@@ -150,6 +150,22 @@
         rag_chunk_size: 500
         rag_dedupe_exact: true
         rag_dedupe_min_score: 0.92
+        # Surface-aware retrieval de-dup: a memory whose text is ALREADY on the
+        # active context (typically a tool result ingested a few steps ago but
+        # not yet compressed away) is not re-injected — it would spend tokens on
+        # text the model can already read. Suppression is state-dependent, never
+        # permanent: once compaction removes the text from the surface, the
+        # memory becomes eligible again.
+        rag_surface_dedupe: true
+        # Local-model conciseness mode: when the session is routed to a LOCAL
+        # (loopback / private-LAN baseURL) provider, inject one short runtime
+        # directive that forbids inter-tool narration, requires independent
+        # calls to be batched in one step, and pushes all explanation into the
+        # final answer. Narration written by a local model is re-sent as input
+        # on every later request (and re-paid after each cache expiry), so the
+        # directive pays for itself within a turn. Injected at most once per
+        # surface (re-injected only after compaction drops the previous copy).
+        concise_local_mode: true
         rag_ingest_importance: 0.3
         rag_ingest_denylist:
           - memory_search

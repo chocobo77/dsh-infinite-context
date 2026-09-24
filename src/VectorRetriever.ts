@@ -51,6 +51,16 @@ export interface VectorRetrieverConfig {
   ingestAllowlist?: readonly string[]
   /** Importance score assigned to ingested tool-result memories (default 0.3). */
   ingestImportance?: number
+  /**
+   * Surface-aware retrieval de-dup: skip a memory whose text is already
+   * present in the ACTIVE CONTEXT (the messages the model is about to read),
+   * e.g. a tool result that was ingested but has not been compressed away yet.
+   * Re-injecting it spends tokens on something the model can already see.
+   * Suppression is state-dependent, never permanent: once the content leaves
+   * the surface (after compaction) the memory becomes eligible again.
+   * Default true.
+   */
+  dedupeSurface?: boolean
 }
 
 const TAG = '[VectorRetriever]'
@@ -61,6 +71,71 @@ const MEMORY_STORE_TIMEOUT_MS = 5_000
  * number of chunks and keep the embedder/SQLite loop running for a long time.
  */
 const MAX_INGEST_CHARS = 24_000
+
+/**
+ * Minimum normalized segment length that can count as a surface match. Short
+ * segments ("ok", "done", a bare path) collide by accident; requiring a
+ * sentence-ish run of characters keeps the match meaningful.
+ */
+const SURFACE_SEGMENT_MIN_CHARS = 20
+/**
+ * Fraction of a memory's segments that must be found on the surface before the
+ * memory is considered already-visible. 1.0 is too strict for ingested chunks
+ * that the surface holds with slightly different whitespace/wrapping; 0.7
+ * still requires the memory to be substantially the same text.
+ */
+const SURFACE_MATCH_RATIO = 0.7
+/**
+ * Separator used when joining surface texts into one searchable blob. NUL
+ * never occurs in normalized text, so a segment can never match ACROSS a
+ * message boundary (which would fabricate a false positive from two unrelated
+ * messages).
+ */
+const SURFACE_JOIN = '\u0000'
+
+/**
+ * Normalize text for surface comparison: lowercase and collapse every run of
+ * whitespace to a single space. Whitespace and case are formatting noise here —
+ * the same tool result re-rendered, re-wrapped, or re-cased is still the same
+ * content and must not be re-injected.
+ */
+export function normalizeSurfaceText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Split a memory's text into normalized segments that can be looked up in the
+ * surface blob. The provenance prefix (`[tier=…, …]`) is stripped first — it is
+ * added at injection time and never appears on the surface.
+ */
+export function surfaceSegments(memoryText: string): string[] {
+  const withoutProvenance = memoryText.replace(/^\[tier=[^\]]*\]\s*/i, '')
+  return withoutProvenance
+    .split(/\n+|(?<=\.)\s+/)
+    .map(segment => normalizeSurfaceText(segment))
+    .filter(segment => segment.length >= SURFACE_SEGMENT_MIN_CHARS)
+}
+
+/** Whether `memoryText` is (mostly) already present on the normalized surface. */
+export function isMemoryOnSurface(memoryText: string, surfaceBlob: string): boolean {
+  const segments = surfaceSegments(memoryText)
+  if (segments.length === 0) return false
+  let matched = 0
+  for (const segment of segments) {
+    if (surfaceBlob.includes(segment)) matched++
+  }
+  return matched / segments.length >= SURFACE_MATCH_RATIO
+}
+
+/**
+ * Join the active context's message texts into one normalized blob for
+ * {@link isMemoryOnSurface}. Returns undefined when there is no surface to
+ * compare against, so callers skip the whole check.
+ */
+export function buildSurfaceBlob(texts: readonly string[]): string | undefined {
+  const blob = normalizeSurfaceText(texts.join(SURFACE_JOIN))
+  return blob.length === 0 ? undefined : blob
+}
 
 /** Human-readable relative age for a memory timestamp. */
 function relativeAge(createdAt: number, now: number = Date.now()): string {
@@ -239,11 +314,18 @@ export class VectorRetriever {
    *     when they conflict;
    *   - each hit is tagged with its tier and relative age so the model can
    *     weight newer facts over older ones.
+   *
+   * @param query - the user text to retrieve for.
+   * @param excludeIds - memory ids already injected in recent turns.
+   * @param tokenBudget - per-call ceiling overriding the configured budget.
+   * @param surfaceTexts - texts of the messages the model is about to read;
+   *   memories already present there are skipped (see `dedupeSurface`).
    */
   async retrieve(
     query: string,
     excludeIds?: ReadonlySet<string>,
     tokenBudget?: number,
+    surfaceTexts?: readonly string[],
   ): Promise<{ message: UserMessage; hitCount: number; ids: string[] } | null> {
     try {
       let timer: NodeJS.Timeout | undefined
@@ -256,9 +338,27 @@ export class VectorRetriever {
         }),
       ]).finally(() => clearTimeout(timer))
       // Skip memories already injected in recent turns (cross-turn de-dup).
-      const fresh = excludeIds === undefined || excludeIds.size === 0
+      let fresh = excludeIds === undefined || excludeIds.size === 0
         ? hits
         : hits.filter(({ doc }) => !excludeIds.has(doc.id))
+
+      // Skip memories whose content the model can ALREADY SEE on the active
+      // surface (typically a tool result that was ingested a few steps ago and
+      // has not been compressed away yet). This is a per-call filter, not an
+      // exclusion: nothing is recorded, so the memory is injected normally once
+      // compaction removes its text from the surface.
+      if (this.config.dedupeSurface !== false && surfaceTexts !== undefined && fresh.length > 0) {
+        const surfaceBlob = buildSurfaceBlob(surfaceTexts)
+        if (surfaceBlob !== undefined) {
+          const kept = fresh.filter(({ doc }) => !isMemoryOnSurface(doc.text, surfaceBlob))
+          if (kept.length < fresh.length) {
+            this.ctx.logger.info(
+              `${TAG} surface dedup: skipped ${fresh.length - kept.length}/${fresh.length} memories already in the active context`,
+            )
+            fresh = kept
+          }
+        }
+      }
       if (fresh.length === 0) return null
 
       const now = Date.now()
