@@ -166,8 +166,13 @@ When a new user turn arrives, `memory-compaction` listens on `agent/pre-step`
 1. Extracts the latest user text from the request `messages`.
 2. Calls `memoryContext.retrieve(text, topK, minScore)` → top-K memories above
    the relevance floor.
-3. If any are relevant, appends a clearly-framed background message to the
-   request `messages` and returns `{ kind: 'enter', messages: [...decision.messages, memory] }`.
+3. Filters out hits already injected in the previous turn (`lastInjectedIds`,
+   cross-turn de-dup) and hits already VISIBLE on the active surface (§7.1).
+4. If any are left, splices a clearly-framed background message into the
+   request `messages` **immediately before the latest user message** and
+   returns `{ kind: 'enter', messages: [...] }` — inserting at that anchor
+   (rather than appending) keeps the question last, so instruction ordering in
+   the replayed context stays intact.
 
 Because the pre-step waterfall's final `messages` are appended to the session
 as `user/message` events (the same durable idiom `compaction-basic` uses for its
@@ -178,6 +183,68 @@ themselves eventually compacted away. Injection happens at most once per turn
 
 `retrieval.enabled` can be turned off; the manual `memory_search` tool then
 provides on-demand retrieval instead.
+
+### 7.1 Surface-aware de-dup (`rag_surface_dedupe`)
+
+A tool result is ingested the moment it settles, but its text stays on the
+active context until compaction eats it. Retrieving it back a step later spends
+tokens to re-send what the model can already read — the measured case was three
+short-tier memories scoring 0.46/0.44/0.43 that were verbatim copies of file
+reads still on the surface.
+
+`VectorRetriever.retrieve(query, excludeIds, tokenBudget, surfaceTexts)` takes
+the text of every message in the request and, before the budget loop:
+
+- normalizes each side (`normalizeSurfaceText`: lowercase + collapse every
+  whitespace run to one space — re-wrapped or re-cased copies still match);
+- splits the memory into segments (`surfaceSegments`) on newlines and
+  sentence ends, drops the `[tier=…, score=…]` provenance header (added at
+  injection time, never present on the surface) and any segment shorter than
+  20 chars (short strings collide by accident);
+- suppresses the memory when ≥70% of its segments appear in the surface blob.
+
+Two invariants matter:
+
+- **State-dependent, never permanent.** Suppression is a per-call filter; it
+  writes nothing. Only ids of memories ACTUALLY injected enter
+  `lastInjectedIds`. Once compaction moves the text off the surface the memory
+  is injected normally again.
+- **No cross-message false positives.** Surface messages are joined with a NUL
+  separator, so a segment can never match across a message boundary.
+
+The surface is materialized lazily (once per step, only if a check needs it).
+
+### 7.2 Local-model conciseness mode (`concise_local_mode`)
+
+A local model's narration ("让我先看看…") is re-sent as input on every later
+request and re-paid after each cache expiry; the observed session ran at ≈76:1
+input:output. When `ctx.memoryContext.isLocalRoute(requestContext.provider)`
+holds (loopback / private-LAN `baseURL` from the `llm-pi-ai` settings
+namespace — the same gate that decides whether a live context probe is
+warranted), one short directive is spliced in **after** the memory background
+and immediately before the latest user message:
+
+```
+<runtime_directive scope="dsh-infinite-context:concise">
+本地模型运行中，请压缩输出：工具调用之间不要写任何说明文字，直接连续发起调用；
+相互独立的调用合并到同一回合并行发出；不要复述文件内容或工具输出；
+所有解释、结论与总结集中写在最终答复里。
+</runtime_directive>
+```
+
+Why the injection point is `agent/pre-step` and not the system prompt: the
+`llm/stream` waterfall hands a loop-built request in **deep-frozen** form
+(mutation throws) — listeners read it, never rewrite it; `GenerateOptions.system`
+is for one-shot callers only, and a loop request carries its system prompt as the
+leading system-role message INSIDE `options.messages`. The pre-step decision's
+message list is the supported place to add per-turn text, and it is the same
+mechanism the RAG background already uses.
+
+Idempotence: the directive would otherwise be re-added on every step, since an
+injected message becomes part of the durable session log. `hasConciseDirective`
+scans the current surface for the marker and skips the injection while a copy is
+still present; compaction dropping the copy re-arms it. The check is on surface
+state rather than a turn counter, so it also survives restarts and rewinds.
 
 ---
 
@@ -200,9 +267,10 @@ provides on-demand retrieval instead.
 | `src/summarization-target.ts` | yes | Summarizer routing: `configured ?? session model`. |
 | `src/config.ts` | yes | Schemastery schemas + default resolution. |
 | `src/memory-context.ts` | yes | `MemoryContext` service (`ctx.memoryContext`): probe wiring + locality gate + per-model adoption. |
-| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance + narrowed-window force + thinking-guard wiring. |
+| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance (compression → RAG injection → conciseness directive → truncation) + narrowed-window force + thinking-guard wiring. |
 | `src/OutputSanitizer.ts` | no | Tool-result sanitization: per-source strategies for rendered text and `ContentBlock[]` (the automatic `tools/result` path) plus structured JSON objects (web_search/code_exec/generic truncation, the manual ingest path). |
-| `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval. |
+| `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval + surface-aware de-dup (`normalizeSurfaceText`/`surfaceSegments`/`isMemoryOnSurface`/`buildSurfaceBlob`). |
+| `src/conciseness-mode.ts` | yes | Local-model conciseness directive: marker, default text, `createConciseMessage`, idempotence check `hasConciseDirective`. |
 | `src/tools.ts` | yes | Manual model-callable tools. |
 | `src/core.ts` | no | Barrel re-exporting the dependency-free core. |
 | `src/index.ts` | yes | Package barrel. |
@@ -387,3 +455,20 @@ generation. Input metering counts nested tool-result/tool-call payloads
   payloads cannot skew the estimate. The guard's dynamic line reserves
   system/tools + summary output + a fixed margin, and the adapter's own hard
   limit remains the final backstop.
+- **Retrieval de-dup reads the surface, it does not remember a decision.**
+  Suppressing a memory that is already visible records nothing: the filter runs
+  per call, and only memories actually injected join `lastInjectedIds`. Writing
+  a "suppressed" id into the exclusion set would make the suppression permanent
+  — the memory would stay invisible even after compaction removed its text from
+  the surface, which is exactly when it becomes worth re-injecting.
+- **Per-turn text goes through `agent/pre-step`, not `llm/stream`.** A loop-built
+  request reaches the `llm/stream` waterfall deep-frozen (mutation throws), and
+  its system prompt is a leading system-role message inside `options.messages`
+  (`GenerateOptions.system` serves one-shot callers). Anything the plugin wants
+  the model to read this turn must therefore be spliced into the pre-step
+  decision's message list — the same durable idiom as the RAG background.
+- **Injected directives are idempotent by surface state.** An injected message
+  becomes part of the durable session log, so a per-step injection would add a
+  copy every step. The conciseness directive is therefore re-injected only when
+  its marker is absent from the current surface — a check that also survives
+  restarts, replays, and compaction-driven re-arming.

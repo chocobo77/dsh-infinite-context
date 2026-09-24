@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { VectorRetriever, type VectorRetrieverConfig } from '../src/VectorRetriever.ts'
+import {
+  VectorRetriever,
+  buildSurfaceBlob,
+  isMemoryOnSurface,
+  normalizeSurfaceText,
+  surfaceSegments,
+  type VectorRetrieverConfig,
+} from '../src/VectorRetriever.ts'
 import type { RetrievalHit } from '../src/types.ts'
 
 interface MemoryContextSpies {
@@ -171,5 +178,105 @@ describe('retrieve', () => {
     const out = await retriever.retrieve('query')
     expect(out).toBeNull()
     expect(logger.warn).toHaveBeenCalled()
+  })
+})
+
+describe('surface-aware dedup helpers', () => {
+  it('normalizes case and collapses whitespace runs', () => {
+    expect(normalizeSurfaceText('  Hello\n\tWorld  ')).toBe('hello world')
+  })
+
+  it('strips the injection-time tier header before splitting', () => {
+    const segments = surfaceSegments('[tier=short, 3m ago, score=0.461]\nsome longer memory body text')
+    expect(segments).toEqual(['some longer memory body text'])
+  })
+
+  it('drops segments shorter than the minimum match length', () => {
+    expect(surfaceSegments('memory A')).toEqual([])
+  })
+
+  it('matches on a 70% segment overlap and rejects a single shared segment', () => {
+    const memory = [
+      'first segment of the stored memory',
+      'second segment of the stored memory',
+      'third segment of the stored memory',
+      'fourth segment that is absent here',
+    ].join('\n')
+    const threeOfFour = buildSurfaceBlob([
+      'first segment of the stored memory',
+      'second segment of the stored memory',
+      'third segment of the stored memory',
+    ])
+    const oneOfFour = buildSurfaceBlob(['first segment of the stored memory'])
+    expect(threeOfFour).toBeDefined()
+    expect(isMemoryOnSurface(memory, threeOfFour!)).toBe(true)
+    expect(isMemoryOnSurface(memory, oneOfFour!)).toBe(false)
+  })
+
+  it('never matches ACROSS a message boundary (NUL separator)', () => {
+    // Each half lives in a different message; joining them must not create a
+    // matchable segment.
+    const blob = buildSurfaceBlob(['alpha beta gamma delta', 'epsilon zeta eta theta'])
+    expect(blob).toBeDefined()
+    expect(isMemoryOnSurface('alpha beta gamma delta epsilon zeta eta theta', blob!)).toBe(false)
+  })
+
+  it('buildSurfaceBlob returns undefined for an empty surface', () => {
+    expect(buildSurfaceBlob([])).toBeUndefined()
+    expect(buildSurfaceBlob(['   '])).toBeUndefined()
+  })
+})
+
+describe('retrieve surface dedup', () => {
+  const onSurface = 'the retriever injected three short tier memories verbatim'
+
+  it('skips a memory whose text is already on the active surface', async () => {
+    const { ctx, logger } = makeCtx({
+      retrieve: async () => [hit('dup', onSurface), hit('fresh', 'an unrelated memory body about deployment')],
+    })
+    const retriever = new VectorRetriever(ctx, makeConfig())
+    const out = await retriever.retrieve('query', undefined, undefined, [
+      'a tool result the model can already read',
+      `  The Retriever  Injected Three Short Tier Memories Verbatim\n`,
+    ])
+    expect(out).not.toBeNull()
+    expect(out!.ids).toEqual(['fresh'])
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('surface dedup: skipped 1/2'))
+  })
+
+  it('returns null when every fresh hit is already visible', async () => {
+    const { ctx } = makeCtx({ retrieve: async () => [hit('dup', onSurface)] })
+    const retriever = new VectorRetriever(ctx, makeConfig())
+    const out = await retriever.retrieve('query', undefined, undefined, [onSurface])
+    expect(out).toBeNull()
+  })
+
+  it('keeps a memory whose content has left the surface', async () => {
+    const { ctx } = makeCtx({ retrieve: async () => [hit('dup', onSurface)] })
+    const retriever = new VectorRetriever(ctx, makeConfig())
+    const out = await retriever.retrieve('query', undefined, undefined, ['unrelated compressed summary text'])
+    expect(out!.ids).toEqual(['dup'])
+  })
+
+  it('is disabled by dedupeSurface: false', async () => {
+    const { ctx } = makeCtx({ retrieve: async () => [hit('dup', onSurface)] })
+    const retriever = new VectorRetriever(ctx, makeConfig({ dedupeSurface: false }))
+    const out = await retriever.retrieve('query', undefined, undefined, [onSurface])
+    expect(out!.ids).toEqual(['dup'])
+  })
+
+  it('does nothing when no surface is supplied (back-compat)', async () => {
+    const { ctx } = makeCtx({ retrieve: async () => [hit('dup', onSurface)] })
+    const retriever = new VectorRetriever(ctx, makeConfig())
+    const out = await retriever.retrieve('query')
+    expect(out!.ids).toEqual(['dup'])
+  })
+
+  it('surface suppression does not touch cross-turn exclusion semantics', async () => {
+    const { ctx } = makeCtx({ retrieve: async () => [hit('a', onSurface), hit('b', 'another distinct memory body here')] })
+    const retriever = new VectorRetriever(ctx, makeConfig())
+    // 'a' is excluded by id AND suppressed by the surface; only 'b' is injected.
+    const out = await retriever.retrieve('query', new Set(['a']), undefined, [onSurface])
+    expect(out!.ids).toEqual(['b'])
   })
 })

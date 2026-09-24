@@ -15,6 +15,8 @@
 - **持久化存储** — SQLite（`node:sqlite`），重启不丢记忆
 - **语义检索** — 记忆嵌入、索引，每轮注入最相关的 top-K 记忆
 - **三层去重** — 精确 + 归一化模糊 + 语义余弦，防止重复入库
+- **表面去重检索** — 命中记忆若已存在于当前活动上下文（尚未被压缩掉的工具结果），本轮不再重复注入；文本离开表面后自动恢复可注入
+- **本地简洁模式** — 路由到本地 provider 时注入一条短指令，禁止工具调用间的叙述、要求调用合并，把啰嗦的开销压下去
 - **结构化记忆** — 四分类（user/feedback/project/reference）+ 索引 + 审计 + 忘得可见
 - **模型上下文感知** — 自动采纳 DSH 解析的真实模型 CTX，本地小模型提前压缩
 - **高价值过滤** — 只入库高价值工具结果，低价值工具自动过滤
@@ -28,6 +30,8 @@
 | 动态压缩阈值 | `compaction_dynamic_threshold: true` — 真实窗口 < 声明窗口时按真实窗口强制压缩（探测/modelWindows 驱动）；`thresholdRatio: 0.7` + `compaction_dynamic_floor: 0.5` — 触发比例随窗口填充从 0.7 滑向 0.5（~60% 触发，本地模型留在高速区）；单轮激增（≥20% 窗口）越过轮次间隔；同一会话两次强制压缩间隔 ≥10s |
 | 深度思考介入 | `thinking_guard_enabled: true` — 包装 `llm/stream`：`input + output` 逼近 `窗口 − (system/tools + 摘要估算 + 余量)` 动态线时注入 `CONTEXT_WINDOW_EXCEEDED` → 持久压缩 → 重试；输入单独超线则生成前先压缩；`thinking_guard_ratio: 0.9` 为触发上限 |
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
+| 表面去重检索 | `rag_surface_dedupe: true` — 注入前把 Top-K 记忆与**当前活动上下文的文本**比对（归一化小写 + 折叠空白，按段落 70% 覆盖判定），已在表面上的记忆本轮跳过；抑制**不写入**任何排除集，压缩把文本移出表面后即可再次注入 |
+| 本地简洁模式 | `concise_local_mode: true` — `isLocalRoute(provider)` 为真时，在 `agent/pre-step` 决策消息里、最新用户消息**之前**注入 `<runtime_directive scope="dsh-infinite-context:concise">`；每个表面至多一份（检测到即不再注入），压缩丢弃后自动补回 |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；本地模型主动探测真实运行窗口（llama/ollama/openai，含 llama-server `meta.n_ctx`）；per-model 注册表按模型隔离 |
 | 高价值过滤 | denylist 过滤 23 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
@@ -52,12 +56,14 @@ src/
 ├── memory-compaction.ts  压缩引擎（渐进式 + RAG + 清理 + thinking guard 接线）
 ├── thinking-guard.ts     深度思考介入：llm/stream 包装 + 动态触发线
 ├── OutputSanitizer.ts    工具结果清理
+├── memory-compaction.ts  压缩后端 + 每轮治理钩子
+├── conciseness-mode.ts   本地模型简洁指令（构造/幂等检测）
 ├── VectorRetriever.ts    RAG 检索/入库
 ├── strings.ts            共享字符串工具
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
 └── tools.ts              10 个手动工具
-tests/                    160 个单元测试
+tests/                    178 个单元测试
 ```
 
 ### 手动工具
@@ -140,6 +146,9 @@ tests/                    160 个单元测试
 | `rag_min_score` | `0.3` | 注入的最低相似度 |
 | `rag_ingest_denylist` | 内置 21 个 | 低价值工具过滤列表 |
 | `rag_ingest_importance` | `0.3` | 工具结果重要性（遗忘优先淘汰） |
+| `rag_surface_dedupe` | `true` | **表面去重检索**：命中记忆的文本若已存在于**当前活动上下文**（典型：刚入库、尚未被压缩掉的工具结果），则本轮不注入——避免把模型已经能读到的文本再花 token 送一遍。抑制是**状态相关**的：一旦压缩把该文本移出表面，记忆立刻恢复可注入（旧的 `lastInjectedIds` 排除语义不变，只记录真正注入过的 id） |
+| `concise_local_mode` | `true` | **本地模型简洁模式**：会话路由到**本地**（loopback/私网 baseURL）provider 时，注入一条短运行时指令，禁止工具调用之间的叙述文字、要求独立调用合并到同一步、把解释集中到最终答复。本地模型的叙述会作为后续每个请求的输入反复重发（并在缓存过期后重新付费），一条指令通常在同一轮内回本。**每个表面至多注入一次**（`agent/pre-step` 决策消息，与 RAG 注入同一机制；`llm/stream` 的请求是深度冻结的，监听器只能读不能改） |
+| `concise_local_directive` | 内置文本 | 简洁模式的指令正文（可覆盖为自定义措辞） |
 
 ### 部署
 
@@ -198,7 +207,7 @@ scripts\install-dsh-plugin.ps1 -DetectOnly
 ### 测试
 
 ```sh
-# 单元测试（160 个，无 DSH 依赖）
+# 单元测试（178 个，无 DSH 依赖）
 vitest run --config vitest.config.ts
 
 # 类型检查
@@ -219,6 +228,8 @@ feel via **multi-tier memory management**:
 - **Persistent store** — SQLite (`node:sqlite`), memories survive restarts
 - **Semantic retrieval** — memories embedded, indexed, and top-K spliced into context per turn
 - **Three-layer dedup** — exact + normalized fuzzy + semantic cosine, prevents duplicate ingestion
+- **Surface-aware retrieval dedup** — a hit whose text is still on the active context (an ingested tool result that has not been compacted away) is not injected again; it becomes eligible again as soon as compaction removes the text from the surface
+- **Local conciseness mode** — on a local route the plugin injects one short directive that forbids inter-tool narration, requires batching, and pushes explanation into the final answer
 - **Structured memory** — four classifications (user/feedback/project/reference) + index + audit + visible forgetting
 - **Model-context awareness** — auto-adopts DSH-resolved real model CTX, small local models compress early
 - **High-value filtering** — only high-value tool results ingested, low-value tools filtered
@@ -232,6 +243,8 @@ feel via **multi-tier memory management**:
 | Dynamic compaction threshold | `compaction_dynamic_threshold: true` — when the REAL window (probe / `modelWindows`) is below the declared one, force compaction at a REAL-window threshold; `thresholdRatio: 0.7` + `compaction_dynamic_floor: 0.5` — the trigger ratio slides from 0.7 toward the floor as the window fills (~60% trigger, keeping slow local models in their fast zone); a single-round surge (≥20% of window) bypasses the interval; forced compactions ≥10s apart |
 | Mid-thinking guard | `thinking_guard_enabled: true` — wraps `llm/stream`: when `input + output` nears the dynamic line `window − (system/tools + summary estimate + margin)`, injects `CONTEXT_WINDOW_EXCEEDED` → durable compaction → retry; input already over the line is compacted BEFORE generation; `thinking_guard_ratio: 0.9` is the ceiling |
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
+| Surface-aware retrieval dedup | `rag_surface_dedupe: true` — before injecting, Top-K memories are compared against the text of the ACTIVE context (lowercased + whitespace-collapsed, 70% segment coverage); memories already visible are skipped this turn. Suppression is recorded nowhere, so a memory returns as soon as compaction moves its text off the surface |
+| Local conciseness mode | `concise_local_mode: true` — when `isLocalRoute(provider)` holds, a `<runtime_directive scope="dsh-infinite-context:concise">` message is spliced into the `agent/pre-step` decision right before the latest user message; at most one copy per surface (detected, never duplicated), re-injected after compaction drops it |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; local models are actively probed for their REAL runtime window (llama/ollama/openai incl. llama-server `meta.n_ctx`); per-model registry isolates concurrent sessions |
 | High-value filtering | denylist filters 23 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
@@ -284,7 +297,7 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (160, no DSH dependency)
+# Unit tests (178, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check

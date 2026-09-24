@@ -345,6 +345,23 @@ export interface MemoryCompactionConfig {
   rag_ingest_allowlist?: string[]
   /** RAG ingestion: importance score for tool-result memories (default 0.3). */
   rag_ingest_importance?: number
+  /**
+   * RAG retrieval: skip memories whose text is already present in the active
+   * context (typically an ingested tool result that has not been compressed
+   * away yet). Default true. Suppression is state-dependent: the memory is
+   * injected normally once its content leaves the surface.
+   */
+  rag_surface_dedupe?: boolean
+  /**
+   * Local-model conciseness mode: when the session is routed to a LOCAL
+   * (loopback/private-LAN) provider, inject one short runtime directive that
+   * suppresses inter-tool narration and forces batched tool calls. Default
+   * true. Injected at most once per surface — re-injected only after
+   * compaction drops the previous copy.
+   */
+  concise_local_mode?: boolean
+  /** Local-model conciseness mode: the directive text (defaults to a built-in). */
+  concise_local_directive?: string
 }
 
 /** Schemastery schema for {@link MemoryCompactionConfig} (validates types only). */
@@ -386,6 +403,9 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   rag_ingest_denylist: z.array(z.string()),
   rag_ingest_allowlist: z.array(z.string()),
   rag_ingest_importance: z.number().min(0).max(1),
+  rag_surface_dedupe: z.boolean(),
+  concise_local_mode: z.boolean(),
+  concise_local_directive: z.string(),
 })
 
 /** Default low-value tool sources excluded from ingestion. */

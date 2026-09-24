@@ -142,6 +142,18 @@
     # --- RAG ingestion guards (dedup + high-value filtering) ---
     rag_dedupe_exact: true       # skip chunks whose exact text already exists
     rag_dedupe_min_score: 0.92   # skip chunks near-duplicate to an existing memory (0 disables)
+    # --- retrieval de-dup against the ACTIVE context (Strategy 4b) ---
+    # A hit whose text is still on the surface (an ingested tool result that has
+    # not been compacted away yet) is not injected again. Suppression is
+    # state-dependent: once compaction moves the text off the surface, the
+    # memory is eligible again.
+    rag_surface_dedupe: true
+    # --- local-model conciseness mode (Strategy 5) ---
+    # On a LOCAL route (loopback/private-LAN baseURL), inject one short runtime
+    # directive forbidding inter-tool narration and requiring batched calls.
+    # At most one copy per surface; re-injected after compaction drops it.
+    concise_local_mode: true
+    # concise_local_directive: '自定义指令正文'
     rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
     # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).

@@ -58,6 +58,11 @@ import {
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
 import {
+  DEFAULT_CONCISE_DIRECTIVE,
+  createConciseMessage,
+  hasConciseDirective,
+} from './conciseness-mode.ts'
+import {
   resolveSummarizationTarget,
   routedTargetOf,
   type SummarizationTarget,
@@ -1082,6 +1087,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly retainRecent: number
   /** Reserved tokens for the plugin's own per-turn RAG injection. */
   private readonly injectionBudget: number
+  /** Whether the local-model conciseness directive is injected. */
+  private readonly conciseLocalMode: boolean
+  /** Text of the local-model conciseness directive. */
+  private readonly conciseLocalDirective: string
 
   /**
    * @param ctx - the plugin context.
@@ -1110,6 +1119,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       rag_ingest_denylist,
       rag_ingest_allowlist,
       rag_ingest_importance,
+      rag_surface_dedupe,
+      concise_local_mode,
+      concise_local_directive,
       ...basicConfig
     } = config
     super(ctx, basicConfig as BasicCompactionConfig)
@@ -1133,6 +1145,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
     this.thinkingGuardEnabled = thinking_guard_enabled ?? true
     this.thinkingGuardRatio = thinking_guard_ratio ?? 0.9
+    this.conciseLocalMode = concise_local_mode ?? true
+    this.conciseLocalDirective = concise_local_directive ?? DEFAULT_CONCISE_DIRECTIVE
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -1167,6 +1181,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       ingestDenylist: rag_ingest_denylist ?? DEFAULT_INGEST_DENYLIST,
       ...(rag_ingest_allowlist === undefined ? {} : { ingestAllowlist: rag_ingest_allowlist }),
       ingestImportance: rag_ingest_importance ?? 0.3,
+      dedupeSurface: rag_surface_dedupe ?? true,
     }
     this.retriever = new VectorRetriever(ctx, retrieverConfig)
 
@@ -1579,6 +1594,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
 
         // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
         // compression and CTX adoption above stay active regardless) ---
+        // The active surface — the text of every message the model is about to
+        // read — is materialized lazily: the surface-aware retrieval de-dup and
+        // the conciseness directive both need it, but a step where neither
+        // applies should not pay for the full concatenation.
+        let surfaceCache: string[] | undefined
+        const surface = (): string[] => (surfaceCache ??= currentMessages
+          .map(message => messageText(message).trim())
+          .filter(text => text.length > 0))
+
+        // Messages to splice in BEFORE the latest user message, in order.
+        const injections: UserMessage[] = []
+
         if (this.retrieval.enabled) {
           // Cap the injection at a share of the session's REAL window so a
           // short-context local model keeps room for the conversation itself
@@ -1589,12 +1616,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             Math.max(256, Math.floor(effectiveWindow * RAG_WINDOW_SHARE)),
           )
           const userText = this.latestUserText(currentMessages)
-          let memoryMessage: UserMessage | undefined
           if (userText !== undefined) {
             const excludeIds = this.lastInjectedIds.get(session)
-            const retrieval = await this.retriever.retrieve(userText, excludeIds, injectionCap)
+            const retrieval = await this.retriever.retrieve(
+              userText,
+              excludeIds,
+              injectionCap,
+              surface(),
+            )
             if (retrieval !== null) {
-              memoryMessage = retrieval.message
+              injections.push(retrieval.message)
               this.lastInjectedIds.set(session, new Set(retrieval.ids))
               ctx.logger.info(
                 `[ContextGovernor] RAG injected: ${retrieval.hitCount} memories for query "${userText.slice(0, 60)}…"`,
@@ -1606,25 +1637,42 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
               this.lastInjectedIds.delete(session)
             }
           }
+        }
 
-          // Insert the memory background BEFORE the latest user message so the
-          // model reads it as context, not as a new user input appended after
-          // the question (which would break instruction ordering).
-          if (memoryMessage !== undefined) {
-            let insertAt = currentMessages.length
-            for (let i = currentMessages.length - 1; i >= 0; i--) {
-              const text = messageText(currentMessages[i]).trim()
-              if (currentMessages[i].role === 'user' && text.length > 0) {
-                insertAt = i
-                break
-              }
-            }
-            currentMessages = [
-              ...currentMessages.slice(0, insertAt),
-              memoryMessage,
-              ...currentMessages.slice(insertAt),
-            ]
+        // --- Strategy 5: local-model conciseness directive ---
+        // A local model's narration is re-sent as input on every later request
+        // (and re-paid after each cache expiry), so one short directive that
+        // suppresses it usually pays for itself within the same turn. Injected
+        // at most once per surface — see the module doc for why the check, and
+        // not a turn counter, is what makes this idempotent.
+        if (this.conciseLocalMode && ctx.memoryContext.isLocalRoute(requestContext?.provider)) {
+          if (!hasConciseDirective(surface())) {
+            injections.push(createConciseMessage(this.conciseLocalDirective))
+            ctx.logger.info(
+              `[ContextGovernor] local conciseness directive injected (provider=${requestContext?.provider ?? 'unknown'})`,
+            )
           }
+        }
+
+        // Insert the injected messages BEFORE the latest user message so the
+        // model reads them as context, not as new user input appended after the
+        // question (which would break instruction ordering). The conciseness
+        // directive goes LAST so it sits closest to the question and reads as
+        // the current turn's rule rather than as ancient background.
+        if (injections.length > 0) {
+          let insertAt = currentMessages.length
+          for (let i = currentMessages.length - 1; i >= 0; i--) {
+            const text = messageText(currentMessages[i]).trim()
+            if (currentMessages[i].role === 'user' && text.length > 0) {
+              insertAt = i
+              break
+            }
+          }
+          currentMessages = [
+            ...currentMessages.slice(0, insertAt),
+            ...injections,
+            ...currentMessages.slice(insertAt),
+          ]
         }
 
         // --- Fallback truncation (Strategy 2 — deterministic last resort) ---
