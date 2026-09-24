@@ -9,6 +9,8 @@
  * @module dsh-infinite-context/config
  */
 
+import { homedir } from 'node:os'
+import { isAbsolute, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import type {
   BudgetConfig,
@@ -54,8 +56,72 @@ export const DEFAULT_CONTEXT_WINDOW = 94_000
 /** Default headroom (fraction of the window) left for system/tools/input/output. */
 export const DEFAULT_HEADROOM_RATIO = 0.25
 
-/** Default store path. */
+/** Default store path (relative; see {@link resolveStorePath}). */
 export const DEFAULT_STORE_PATH = 'dsh-infinite-context.db'
+
+/** The SQLite in-process sentinel: not a file, so never path-resolved. */
+export const IN_MEMORY_STORE = ':memory:'
+
+/** Environment variable naming the Harness home (DSH's own spelling). */
+export const DSH_HOME_ENV = 'DSH_HOME'
+
+/** Directory name of the default Harness home below the user's home. */
+export const DSH_HOME_DIR_NAME = '.dsh'
+
+/** Subdirectory of the Harness home that holds plugin-owned databases. */
+export const STORE_DIR_NAME = 'storages'
+
+/** Expand a leading `~` (or `~/`, `~\`) to the user's home directory. */
+function expandHome(path: string, homeDir: string): string {
+  if (path === '~') return homeDir
+  if (/^~[/\\]/.test(path)) return join(homeDir, path.slice(2))
+  return path
+}
+
+/**
+ * Resolve the Harness home directory with DSH's own precedence: a non-blank
+ * `$DSH_HOME`, then `~/.dsh`. A blank or whitespace-only `$DSH_HOME` counts as
+ * unset, so a stray empty override never redirects persistent state to `/`.
+ * @param env - environment to read `DSH_HOME` from (defaults to `process.env`).
+ * @param homeDir - the user's home directory (defaults to `os.homedir()`).
+ * @returns the absolute Harness home path.
+ */
+export function resolveDshHome(
+  env: Record<string, string | undefined> = process.env,
+  homeDir: string = homedir(),
+): string {
+  const fromEnv = (env[DSH_HOME_ENV] ?? '').trim()
+  if (fromEnv.length > 0) return expandHome(fromEnv, homeDir)
+  return join(homeDir, DSH_HOME_DIR_NAME)
+}
+
+/**
+ * Resolve a configured store path into an absolute filesystem path.
+ *
+ * `:memory:` passes through untouched and an absolute path is used as given. A
+ * RELATIVE path resolves against `<DSH_HOME>/storages` — deliberately NOT the
+ * process cwd: the plugin runs inside the Harness, whose cwd is wherever `dsh`
+ * happened to be launched (a source checkout, an install directory, a temp
+ * dir). A cwd-relative store therefore MOVES whenever that changes, which
+ * looks exactly like losing every memory (and leaves the old file orphaned in
+ * a directory that a reinstall/re-clone deletes).
+ *
+ * @param storePath - configured path (`:memory:`, absolute, `~`-relative, or
+ *   relative to the Harness home).
+ * @param env - environment to read `DSH_HOME` from (defaults to `process.env`).
+ * @param homeDir - the user's home directory (defaults to `os.homedir()`).
+ * @returns the absolute store path (or `:memory:`).
+ */
+export function resolveStorePath(
+  storePath: string,
+  env: Record<string, string | undefined> = process.env,
+  homeDir: string = homedir(),
+): string {
+  if (storePath === IN_MEMORY_STORE) return storePath
+  const expanded = expandHome(storePath.trim(), homeDir)
+  if (isAbsolute(expanded)) return expanded
+  return join(resolveDshHome(env, homeDir), STORE_DIR_NAME, expanded)
+}
 
 /** Supported live model-context probe endpoints (for local servers). */
 export type ModelProbeKind = 'llama' | 'ollama' | 'openai'
@@ -101,7 +167,11 @@ export interface ModelWindowOverride {
  * field is optional; defaults produce a working out-of-the-box setup.
  */
 export interface MemoryContextConfig {
-  /** SQLite file path for persisted memories (`:memory:` for in-process). */
+  /**
+   * SQLite file path for persisted memories (`:memory:` for in-process). A
+   * relative path resolves below `<DSH_HOME>/storages`, never against the
+   * process cwd — see {@link resolveStorePath}.
+   */
   storePath?: string
   /** The model's total context window in tokens. */
   contextWindow?: number
@@ -195,7 +265,7 @@ export interface ResolvedMemoryContextConfig {
  * @returns the resolved configuration.
  */
 export function resolveMemoryContextConfig(raw: MemoryContextConfig): ResolvedMemoryContextConfig {
-  const storePath = raw.storePath ?? DEFAULT_STORE_PATH
+  const storePath = resolveStorePath(raw.storePath ?? DEFAULT_STORE_PATH)
   const contextWindow = raw.contextWindow ?? DEFAULT_CONTEXT_WINDOW
   const headroomRatio = raw.headroomRatio ?? DEFAULT_HEADROOM_RATIO
   const modelProbe: ResolvedModelProbeConfig = {

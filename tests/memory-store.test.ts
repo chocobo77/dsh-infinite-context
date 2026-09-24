@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -185,5 +185,15 @@ describe('MemoryStore', () => {
     const store = new MemoryStore(':memory:')
     store.close()
     expect(() => store.count()).toThrow()
+  })
+
+  it('creates missing parent directories for a file-backed store', () => {
+    const nested = join(tempDir(), 'storages', 'deeper')
+    const file = join(nested, 'memories.db')
+    const store = new MemoryStore(file)
+    store.insert(makeDoc({ id: 'nested-1' }))
+    expect(store.count()).toBe(1)
+    store.close()
+    expect(existsSync(file)).toBe(true)
   })
 })

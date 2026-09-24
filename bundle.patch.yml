@@ -14,6 +14,8 @@
     - id: memory-context
       name: dsh-infinite-context/memory-context
       config:
+        # Relative resolves below <DSH_HOME>/storages (NOT the process cwd, which
+        # is just wherever `dsh` was launched). Absolute paths and `~` also work.
         storePath: dsh-infinite-context.db
         contextWindow: 94000
         headroomRatio: 0.25

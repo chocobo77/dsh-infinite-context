@@ -87,7 +87,7 @@ tests/                    178 个单元测试
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
-| `storePath` | `dsh-infinite-context.db` | SQLite 路径；`:memory:` 禁用持久化 |
+| `storePath` | `dsh-infinite-context.db` | SQLite 路径；`:memory:` 禁用持久化。**相对路径解析到 `<DSH_HOME>/storages/`**（不是进程 cwd），绝对路径与 `~` 原样/按用户目录展开 |
 | `contextWindow` | `94000` | 模型上下文窗口（**回退值**；插件自动采纳 DSH 解析的真实窗口，并会以实时探测结果为上限） |
 | `headroomRatio` | `0.25` | 系统/工具/输入/输出预留比例 |
 | `modelWindows` | `[]` | 逐模型显式窗口表（`[{model, contextWindow}]`）——声名值缺失或虚高/虚低时的**权威真值**；探测结果仍可进一步收窄 |
@@ -96,6 +96,13 @@ tests/                    178 个单元测试
 | `budget.short/mid/long/retrieved` | `10000/20000/5000/15000` | 分层 token 预算 |
 | `forgetting.minScore` | `0.25` | 低于此分数的记忆被遗忘 |
 | `forgetting.maxMemories` | `500` | 记忆总数上限 |
+
+> **记忆库位置（`storePath`）**：相对路径**解析到 `<DSH_HOME>/storages/`**，而不是
+> DSH 进程的 cwd。cwd 只是「`dsh` 从哪里被启动」的偶然结果（源码 checkout / 安装目录 /
+> 临时目录），用它解析插件数据会让记忆库在换目录后「看起来全部丢失」，并把库留在
+> 一个重装即删的目录里。绝对路径与 `~` 按原意处理，`:memory:` 仍为纯内存。
+> `$DSH_HOME` 的判定与 DSH 一致（非空白环境变量优先，否则 `~/.dsh`）。若解析后的路径
+> 尚不存在、但 cwd 下存在旧库，启动时会 `warn` 打印两个路径而不是静默从空库开始。
 
 > **本地模型（LM Studio / llama-server / Ollama）**：`settings.yaml` 里声明的
 > `contextWindow` 可能远大于服务器实际运行的上下文（例如声明 100000、实际只有 8k）。

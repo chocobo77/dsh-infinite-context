@@ -300,7 +300,22 @@ CREATE INDEX idx_memories_created ON memories (created_at);
 ```
 
 Uses Node's built-in `node:sqlite` (`DatabaseSync`), the same medium DSH's own
-`storage-sqlite` backend uses — no native `sqlite3` dependency.
+`storage-sqlite` backend uses — no native `sqlite3` dependency. Missing parent
+directories are created on open, so an absolute `storePath` into a not-yet-existing
+directory works on first run.
+
+### Where the file lives
+
+A configured `storePath` is resolved by `resolveStorePath()`
+(src/config.ts): `:memory:` passes through, an absolute path is used as given,
+`~` expands against the user home, and a **relative** path resolves below
+`<DSH_HOME>/storages` — never against the process cwd. The cwd is wherever `dsh`
+was launched (a source checkout, an install dir, a temp dir), so a cwd-relative
+store moves whenever that changes: every memory appears lost, and the orphaned
+file sits in a directory a reinstall/re-clone deletes. `$DSH_HOME` follows DSH's
+own precedence (non-blank env var, else `~/.dsh`). When a legacy cwd-relative
+store is found and the resolved one does not exist yet, `memoryContext` logs a
+warning naming both paths rather than starting silently empty.
 
 ---
 
@@ -472,3 +487,9 @@ generation. Input metering counts nested tool-result/tool-call payloads
   copy every step. The conciseness directive is therefore re-injected only when
   its marker is absent from the current surface — a check that also survives
   restarts, replays, and compaction-driven re-arming.
+- **Persistent state never resolves against the cwd.** `storePath` is a
+  user-facing path, but the Harness process cwd is an accident of how `dsh` was
+  launched; resolving plugin data against it silently relocates the memory store
+  (and puts it inside a source checkout that reinstalls delete). Relative paths
+  therefore resolve below `<DSH_HOME>/storages`, and the store creates its own
+  parent directory instead of trusting the caller.
