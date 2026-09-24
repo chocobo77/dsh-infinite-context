@@ -45,13 +45,16 @@ interface MemoryRow {
 
 /**
  * Normalize text for fuzzy-exact dedup: lowercases, collapses whitespace, and
- * replaces digit runs with a placeholder so timestamps, counters, and other
- * volatile numbers do not defeat the exact-text match. Used by ingest dedup.
+ * replaces LONG digit runs (4+ digits — timestamps, counters, ids) with a
+ * placeholder so volatile numbers do not defeat the exact-text match. Short
+ * digit runs (1–3) are kept intact: values like ports or small counts are
+ * semantically meaningful, and masking them would collapse genuinely different
+ * facts ("port 3000" vs "port 8080") into one dedup key. Used by ingest dedup.
  */
 export function normalizeForDedup(text: string): string {
   return text
     .toLowerCase()
-    .replace(/\d+/g, '#')
+    .replace(/\d{4,}/g, '#')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -281,9 +284,9 @@ export class MemoryStore {
 
   /**
    * Whether any stored memory has this text after fuzzy normalization
-   * (lowercase, whitespace-collapsed, digit-runs masked). Catches repeats that
-   * differ only by timestamps/counters — too costly as an indexed query, so it
-   * scans the (bounded) store; fine for hundreds of memories.
+   * (lowercase, whitespace-collapsed, digit runs of 4+ masked). Catches repeats
+   * that differ only by timestamps/counters — too costly as an indexed query,
+   * so it scans the (bounded) store; fine for hundreds of memories.
    * @param text - the raw text to normalize and look up.
    * @returns true when a memory with the same normalized text exists.
    */

@@ -83,7 +83,14 @@ function chunkText(text: string, size: number): string[] {
     }
     let cut = remaining.lastIndexOf('. ', size)
     if (cut < size * 0.3) cut = remaining.lastIndexOf('\n', size)
-    if (cut < size * 0.3) cut = size
+    if (cut < size * 0.3) {
+      // Hard cut: exactly `size` chars — there is no separator to keep, and
+      // including one extra char (slice(cut + 1) with cut = size) would
+      // overshoot the requested chunk size.
+      chunks.push(remaining.slice(0, size).trim())
+      remaining = remaining.slice(size).trim()
+      continue
+    }
     chunks.push(remaining.slice(0, cut + 1).trim())
     remaining = remaining.slice(cut + 1).trim()
   }
@@ -111,8 +118,9 @@ export class VectorRetriever {
    *   - source filtering: low-value tools (denylist / non-allowlist) are skipped;
    *   - total-size bound: results are capped at MAX_INGEST_CHARS before chunking;
    *   - exact dedup: a chunk whose full text already exists is skipped;
-   *   - fuzzy dedup: a chunk identical up to timestamps/counters/case is skipped
-   *     (always on — a cosine threshold cannot catch time-only diffs);
+   *   - fuzzy dedup: a chunk identical up to long digit runs (4+: timestamps,
+   *     counters) or case is skipped (always on — a cosine threshold cannot
+   *     catch time-only diffs);
    *   - semantic dedup: a chunk whose nearest memory scores >= dedupeMinScore
    *     is skipped (near-duplicate content);
    *   - importance: ingested tool results get a low importance (default 0.3)
@@ -161,11 +169,11 @@ export class VectorRetriever {
           skipped++
           continue
         }
-        // Fuzzy dedup: memory identical up to timestamps/counters/case?
-        // The lightweight embedder scores such near-identical texts low
-        // (time-only diffs land ~0.6), so a cosine threshold cannot catch
-        // them — normalize and compare instead. Runs independently of
-        // `dedupeExact`, which governs the exact layer only.
+        // Fuzzy dedup: memory identical up to long digit runs (4+, e.g.
+        // timestamps/counters) or case? The lightweight embedder scores such
+        // near-identical texts low (time-only diffs land ~0.6), so a cosine
+        // threshold cannot catch them — normalize and compare instead. Runs
+        // independently of `dedupeExact`, which governs the exact layer only.
         if (this.ctx.memoryContext.hasTextNormalized(full)) {
           skipped++
           continue
@@ -238,12 +246,15 @@ export class VectorRetriever {
     tokenBudget?: number,
   ): Promise<{ message: UserMessage; hitCount: number; ids: string[] } | null> {
     try {
+      let timer: NodeJS.Timeout | undefined
       const hits = await Promise.race([
         this.ctx.memoryContext.retrieve(query, this.config.topK, this.config.minScore),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('memory retrieval timeout')), MEMORY_STORE_TIMEOUT_MS),
-        ),
-      ])
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('memory retrieval timeout')), MEMORY_STORE_TIMEOUT_MS)
+          // Never hold the event loop open for a lost race (process shutdown).
+          timer.unref()
+        }),
+      ]).finally(() => clearTimeout(timer))
       // Skip memories already injected in recent turns (cross-turn de-dup).
       const fresh = excludeIds === undefined || excludeIds.size === 0
         ? hits
@@ -251,9 +262,10 @@ export class VectorRetriever {
       if (fresh.length === 0) return null
 
       const now = Date.now()
-      const parts = fresh.map(({ doc, score }) =>
-        `[tier=${doc.tier}, ${relativeAge(doc.createdAt, now)}, score=${score.toFixed(3)}]\n${doc.text}`,
-      )
+      const entries = fresh.map(({ doc, score }) => ({
+        id: doc.id,
+        text: `[tier=${doc.tier}, ${relativeAge(doc.createdAt, now)}, score=${score.toFixed(3)}]\n${doc.text}`,
+      }))
 
       // Budget-aware selection: keep whole memories (never slice mid-entry)
       // until the estimated token budget is exhausted, using the same
@@ -261,20 +273,27 @@ export class VectorRetriever {
       // an explicit per-call budget (e.g. capped to a share of a short-window
       // model) the cap is strict: an oversized first memory is skipped rather
       // than force-injected, and nothing is injected when nothing fits.
+      // Only ids of memories ACTUALLY injected are returned — a budget-skipped
+      // memory must stay eligible for the next turn, not get excluded by it.
       let context = ''
       let contextTokens = 0
+      const injectedIds: string[] = []
       const strict = tokenBudget !== undefined
       const budget = Math.max(0, tokenBudget ?? this.config.tokenBudget)
-      for (const part of parts) {
-        const cost = estimateTokens(part) + 2 // +2 for the '\n\n' separator
+      for (const entry of entries) {
+        const cost = estimateTokens(entry.text) + 2 // +2 for the '\n\n' separator
         if (context.length > 0 && contextTokens + cost > budget) break
         if (strict && context.length === 0 && cost > budget) continue
-        context = context.length === 0 ? part : `${context}\n\n${part}`
+        context = context.length === 0 ? entry.text : `${context}\n\n${entry.text}`
         contextTokens += cost
+        injectedIds.push(entry.id)
       }
       if (context.length === 0) {
         if (strict) return null
-        context = parts[0] ?? ''
+        const first = entries[0]
+        if (first === undefined) return null
+        context = first.text
+        injectedIds.push(first.id)
       }
 
       const text =
@@ -290,10 +309,10 @@ export class VectorRetriever {
       return {
         message: createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: 'dsh-infinite-context' },
+          source: { kind: 'plugin:dsh-infinite-context' } as any,
         }),
-        hitCount: fresh.length,
-        ids: fresh.map(({ doc }) => doc.id),
+        hitCount: injectedIds.length,
+        ids: injectedIds,
       }
     } catch (err) {
       this.ctx.logger.warn(

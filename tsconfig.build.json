@@ -5,7 +5,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "rewriteRelativeImportExtensions": true,
-    "declaration": false,
+    "declaration": true,
     "sourceMap": false
   },
   "include": ["src/**/*.ts"],

@@ -172,5 +172,11 @@ export interface ForgettingResult {
 /** Result of a pyramid consolidation. */
 export interface PyramidResult {
   readonly merged: MemoryDoc | null
-  readonly droppedMids: readonly string[]
+  /**
+   * Ids of the `mid` memories folded into the merged `long` memory. These are
+   * DEMOTED to the short tier (low importance) rather than deleted — the merge
+   * is lossy, so the originals stay retrievable until the forgetting policy
+   * retires them.
+   */
+  readonly demotedMids: readonly string[]
 }

@@ -83,6 +83,15 @@ export class ModelContextTracker {
     return this.windowsByModel.get(model)?.contextWindow
   }
 
+  /**
+   * The provider recorded for one specific model (from its per-model registry
+   * entry), or undefined when unknown. Lets per-model operations (e.g. a live
+   * probe) resolve the RIGHT provider instead of the globally last-observed one.
+   */
+  providerFor(model: string): string | undefined {
+    return this.windowsByModel.get(model)?.provider
+  }
+
   /** All per-model windows currently known, in insertion order. */
   perModel(): readonly ModelContextInfo[] {
     return [...this.windowsByModel.values()]

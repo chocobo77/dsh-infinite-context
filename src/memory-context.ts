@@ -26,6 +26,7 @@ import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type Summariza
 import type { Session } from '@deepseek-ai/dsh-session'
 import { isLocalBaseURL, probeModelContext } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
+import type { SanitizerConfig } from './OutputSanitizer.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
 
 /** Register `ctx.memoryContext` for typed access elsewhere. */
@@ -207,10 +208,15 @@ export class MemoryContext extends Service {
       if (window !== undefined) {
         // A live probe reflects the server's REAL runtime context, which can
         // be far smaller than the declared catalog window. Cap the adoption at
-        // the PROBED model's own declared window (per-model registry) — never
-        // the global "last observed" slot, which may belong to a different
-        // model in a multi-model runtime. A probe can only LOWER the window,
-        // never inflate it.
+        // the PROBED model's own declared window (per-model registry) — a probe
+        // can only LOWER that model's window, never inflate it.
+        //
+        // Note: `adopt` also moves the global "last observed" slot to the
+        // probed model, so the config-fallback window follows the most
+        // recently probed model. That is intentional for single-model local
+        // deployments (the fallback then reflects the REAL window, not a wrong
+        // declaration); multi-model runtimes always read the per-model
+        // registry via windowForModel, which this call also maintains.
         const ceiling = this.modelTracker.windowFor(model)
           ?? this.modelTracker.info?.contextWindow
           ?? this.resolved.contextWindow
@@ -263,7 +269,11 @@ export class MemoryContext extends Service {
   async probeModel(model?: string): Promise<ModelContextInfo | null> {
     const target = model ?? this.modelTracker.info?.model
     if (target === undefined) return this.modelInfo
-    await this.runProbe(target, this.modelTracker.info?.provider)
+    // Resolve the provider PER MODEL first: the global "last observed" slot may
+    // belong to a different model, and probing through the wrong provider's
+    // baseURL would query the wrong server.
+    const provider = this.modelTracker.providerFor(target) ?? this.modelTracker.info?.provider
+    await this.runProbe(target, provider)
     return this.modelInfo
   }
 
@@ -378,6 +388,8 @@ export class MemoryContext extends Service {
         options?: { session?: Session },
       ) => Promise<{ messages: readonly any[]; tokensSaved: number }>
     }
+    /** The compaction engine's sanitizer cap, reused by the memory_ingest tool. */
+    sanitizerConfig: SanitizerConfig | null
   } | null = null
 
   /**

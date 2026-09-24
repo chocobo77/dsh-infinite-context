@@ -25,12 +25,28 @@
     "README.md",
     "ARCHITECTURE.md"
   ],
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js",
-    "./memory-context": "./dist/memory-context.js",
-    "./memory-compaction": "./dist/memory-compaction.js",
-    "./tools": "./dist/tools.js",
-    "./core": "./dist/core.js",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./memory-context": {
+      "types": "./dist/memory-context.d.ts",
+      "default": "./dist/memory-context.js"
+    },
+    "./memory-compaction": {
+      "types": "./dist/memory-compaction.d.ts",
+      "default": "./dist/memory-compaction.js"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.ts",
+      "default": "./dist/tools.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "default": "./dist/core.js"
+    },
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -55,7 +71,8 @@
     "@deepseek-ai/dsh-session": ">=0.1.2-0 <0.2.0-0",
     "@deepseek-ai/dsh-token-meter": ">=0.1.2-0 <0.2.0-0",
     "@deepseek-ai/dsh-tools": ">=0.1.2-0 <0.2.0-0",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@huggingface/transformers": "*"
   },
   "peerDependenciesMeta": {
     "@huggingface/transformers": {
