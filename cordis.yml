@@ -167,6 +167,26 @@
     tool_archive_tail_chars: 1024
     tool_archive_max_entries: 500
     tool_archive_retention_days: 30
+    # --- immediate distillation (absorb), complementary to the archive ---
+    # The oversized result is reduced to its signal lines (errors, exit codes, test
+    # counts, diff stats, paths + head/tail) and that digest becomes the stub body;
+    # the exact text stays in the archive for memory_expand. min_chars is below the
+    # archive threshold on purpose (small but noisy results are worth distilling).
+    tool_absorb: true
+    tool_absorb_min_chars: 4000
+    tool_absorb_max_digest_chars: 1200
+    # --- compression scheduling nudge ---
+    # The growth EMA predicts whether the NEXT request crosses the trigger and
+    # compresses one step early when it would; this costs a slightly earlier (and
+    # slightly more frequent) compression instead of one oversized request.
+    compress_nudge: true
+    # --- context accounting ledger ---
+    # Records injections, surface skips, archived/absorbed chars, nudges, compaction
+    # savings and the provider's disjoint input/output/cacheRead/cacheWrite (stored
+    # per field: pre-summing them would erase the cache hit rate). memory_status
+    # prints the last 7 days.
+    usage_ledger: true
+    usage_retention_days: 30
     rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
     # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).

@@ -21,6 +21,10 @@ import type {
 } from './types.ts'
 import { DEFAULT_TOOL_ARCHIVE_OPTIONS } from './tool-archive.ts'
 import type { ToolArchiveOptions } from './tool-archive.ts'
+import { DEFAULT_ABSORB_OPTIONS } from './absorb.ts'
+import type { AbsorbOptions } from './absorb.ts'
+import { DEFAULT_USAGE_OPTIONS } from './usage-ledger.ts'
+import type { UsageOptions } from './usage-ledger.ts'
 
 /** Default per-tier token budgets (matches the design goal: total <= window). */
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -452,6 +456,25 @@ export interface MemoryCompactionConfig {
   tool_archive_max_entries?: number
   /** Tool-result archiving: days to retain an archived entry (0 disables). Default 30. */
   tool_archive_retention_days?: number
+  /**
+   * Absorb-style distillation of oversized tool results (see absorb.ts): the
+   * recoverable stub keeps the error lines, counts, and paths instead of a
+   * blind head+tail slice, and the digest is ingested as a memory. Default true.
+   */
+  tool_absorb?: boolean
+  /** Absorb: results at or below this size are left alone. Default 4000. */
+  tool_absorb_min_chars?: number
+  /** Absorb: hard cap on the digest size. Default 1200. */
+  tool_absorb_max_digest_chars?: number
+  /**
+   * Compress one step EARLY when the measured per-step growth is predicted to
+   * cross the trigger water level (see shouldNudgeCompaction). Default true.
+   */
+  compress_nudge?: boolean
+  /** Context-accounting ledger (see usage-ledger.ts). Default true. */
+  usage_ledger?: boolean
+  /** Ledger: days of events to keep (0 disables pruning). Default 30. */
+  usage_retention_days?: number
 }
 
 /** Schemastery schema for {@link MemoryCompactionConfig} (validates types only). */
@@ -502,6 +525,12 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   tool_archive_tail_chars: z.number().step(1).min(0),
   tool_archive_max_entries: z.number().step(1).min(1),
   tool_archive_retention_days: z.number().min(0),
+  tool_absorb: z.boolean(),
+  tool_absorb_min_chars: z.number().step(1).min(100),
+  tool_absorb_max_digest_chars: z.number().step(1).min(100),
+  compress_nudge: z.boolean(),
+  usage_ledger: z.boolean(),
+  usage_retention_days: z.number().min(0),
 })
 
 /** Default low-value tool sources excluded from ingestion. */
@@ -590,5 +619,47 @@ export function resolveToolArchiveOptions(raw: MemoryCompactionConfig): ToolArch
     tailChars,
     maxEntries: raw.tool_archive_max_entries ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.maxEntries,
     retentionDays: raw.tool_archive_retention_days ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.retentionDays,
+  }
+}
+
+/** Code points reserved for the stub footer (ref hint + whitespace). */
+const ABSORB_STUB_RESERVE_CHARS = 600
+
+/**
+ * Resolve the absorb-style distillation policy.
+ *
+ * The digest replaces the whole middle of a result, so it must stay well under
+ * the archive threshold: a stub that is itself oversized would be rewritten by
+ * the built-in pruner, which knows nothing about the ref and would destroy the
+ * read-back path. The cap is therefore clamped against the threshold.
+ * @param raw - the config from cordis.yml.
+ * @param thresholdChars - the resolved archive threshold (see
+ *   {@link resolveToolArchiveOptions}).
+ * @returns the resolved policy with defaults applied.
+ */
+export function resolveAbsorbOptions(
+  raw: MemoryCompactionConfig,
+  thresholdChars: number = DEFAULT_TOOL_ARCHIVE_OPTIONS.thresholdChars,
+): AbsorbOptions {
+  const ceiling = Math.max(200, thresholdChars - ABSORB_STUB_RESERVE_CHARS)
+  return {
+    enabled: raw.tool_absorb ?? DEFAULT_ABSORB_OPTIONS.enabled,
+    minChars: raw.tool_absorb_min_chars ?? DEFAULT_ABSORB_OPTIONS.minChars,
+    maxDigestChars: Math.min(
+      raw.tool_absorb_max_digest_chars ?? DEFAULT_ABSORB_OPTIONS.maxDigestChars,
+      ceiling,
+    ),
+  }
+}
+
+/**
+ * Resolve the context-accounting ledger policy.
+ * @param raw - the config from cordis.yml.
+ * @returns the resolved policy with defaults applied.
+ */
+export function resolveUsageOptions(raw: MemoryCompactionConfig): UsageOptions {
+  return {
+    enabled: raw.usage_ledger ?? DEFAULT_USAGE_OPTIONS.enabled,
+    retentionDays: raw.usage_retention_days ?? DEFAULT_USAGE_OPTIONS.retentionDays,
   }
 }

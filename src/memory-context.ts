@@ -22,7 +22,13 @@ import {
 } from './config.ts'
 import { createEmbedder, type Embedder } from './embedder.ts'
 import { VectorIndex } from './vector-index.ts'
-import { MemoryStore, type ToolResultMeta, type ToolResultRecord } from './memory-store.ts'
+import {
+  MemoryStore,
+  type ToolResultMeta,
+  type ToolResultRecord,
+  type UsageEventRecord,
+  type UsageTotal,
+} from './memory-store.ts'
 import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
 import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type SummarizationTarget } from './memory-engine.ts'
@@ -31,6 +37,7 @@ import { isLocalBaseURL, probeModelContext } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { SanitizerConfig } from './OutputSanitizer.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
+import type { UsageSummary } from './usage-ledger.ts'
 
 /** Register `ctx.memoryContext` for typed access elsewhere. */
 declare module '@deepseek-ai/cordis' {
@@ -439,6 +446,45 @@ export class MemoryContext extends Service {
     return this.store?.trimToolResults(maxEntries) ?? 0
   }
 
+  /**
+   * Append one context-accounting event (see usage-ledger.ts).
+   * @param record - the event to store.
+   */
+  recordUsageEvent(record: UsageEventRecord): void {
+    this.requireEngine()
+    this.store?.recordUsageEvent(record)
+  }
+
+  /**
+   * Sum context-accounting events per kind.
+   * @param sinceTs - epoch-millisecond lower bound (inclusive); omit for all time.
+   * @returns the per-kind totals.
+   */
+  usageTotals(sinceTs?: number): UsageTotal[] {
+    this.requireEngine()
+    return this.store?.usageTotals(sinceTs) ?? []
+  }
+
+  /**
+   * Read the newest context-accounting events.
+   * @param limit - maximum rows.
+   * @returns the events, newest first.
+   */
+  listUsageEvents(limit?: number): UsageEventRecord[] {
+    this.requireEngine()
+    return this.store?.listUsageEvents(limit) ?? []
+  }
+
+  /**
+   * Delete context-accounting events older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneUsageEvents(beforeTs: number): number {
+    this.requireEngine()
+    return this.store?.pruneUsageEvents(beforeTs) ?? 0
+  }
+
   /** Run a forgetting sweep. */
   forget() {
     return this.requireEngine().forget()
@@ -501,6 +547,26 @@ export class MemoryContext extends Service {
    * (rag_* config) instead of constructing a hard-coded one.
    */
   retriever: { ingest: (text: string, source: string) => Promise<void> } | null = null
+
+  /**
+   * Back-reference to the plugin context-accounting ledger, set by
+   * MemoryCompactionEngine after construction. Lets `memory_status` report what
+   * the plugin did to the context and how the provider billed it.
+   */
+  usage: {
+    summary: (days?: number) => UsageSummary
+    totals: (sinceTs?: number) => UsageTotal[]
+    recent: (limit?: number) => UsageEventRecord[]
+  } | null = null
+
+  /**
+   * Context-accounting summary over the last N days.
+   * @param days - the window in days (default 7).
+   * @returns the summary, or `undefined` when the ledger is not loaded.
+   */
+  usageSummary(days = 7): UsageSummary | undefined {
+    return this.usage?.summary(days)
+  }
 
   /** Hard reset: clear all memories and the index. */
   reset(): void {

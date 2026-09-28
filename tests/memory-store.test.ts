@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterAll, describe, expect, it } from 'vitest'
 import { MemoryStore } from '../src/core.ts'
 import type { MemoryDoc } from '../src/core.ts'
-import type { ToolResultRecord } from '../src/memory-store.ts'
+import type { ToolResultRecord, UsageEventRecord } from '../src/memory-store.ts'
 
 const dirs: string[] = []
 function tempDir(): string {
@@ -304,5 +304,60 @@ describe('MemoryStore tool results', () => {
     store.close()
     expect(() => store.countToolResults()).toThrow()
     expect(() => store.getToolResult('tr_any00000000')).toThrow()
+  })
+
+  it('keeps the absorb digest and backfills it on a duplicate ref', () => {
+    const store = new MemoryStore(':memory:')
+    expect(store.archiveToolResult(record({}))).toBe(true)
+    expect(store.getToolResult('tr_aaaaaaaaaaaa')?.digest).toBeUndefined()
+    // A later capture of the same bytes only fills the missing digest.
+    expect(store.archiveToolResult(record({ digest: 'ERROR: boom' }))).toBe(false)
+    expect(store.getToolResult('tr_aaaaaaaaaaaa')?.digest).toBe('ERROR: boom')
+    expect(store.listToolResults()[0]?.digest).toBe('ERROR: boom')
+    expect(store.searchToolResults('hello')[0]?.digest).toBe('ERROR: boom')
+    // An existing digest is never overwritten by a re-capture.
+    store.archiveToolResult(record({ digest: 'other' }))
+    expect(store.getToolResult('tr_aaaaaaaaaaaa')?.digest).toBe('ERROR: boom')
+    store.close()
+  })
+
+  it('records, totals, lists, and prunes usage events', () => {
+    const store = new MemoryStore(':memory:')
+    store.recordUsageEvent({ ts: 100, kind: 'inject_tokens', value: 10, sessionId: 's1' })
+    store.recordUsageEvent({ ts: 200, kind: 'inject_tokens', value: 5 })
+    store.recordUsageEvent({ ts: 150, kind: 'nudge_forced', value: 1, detail: 'early' })
+    expect(store.usageTotals()).toEqual([
+      { kind: 'inject_tokens', events: 2, value: 15 },
+      { kind: 'nudge_forced', events: 1, value: 1 },
+    ])
+    // The window bound is inclusive.
+    expect(store.usageTotals(150)).toEqual([
+      { kind: 'inject_tokens', events: 1, value: 5 },
+      { kind: 'nudge_forced', events: 1, value: 1 },
+    ])
+    // Newest insertion first (the ledger appends in time order).
+    const recent: UsageEventRecord[] = store.listUsageEvents(2)
+    expect(recent.map(event => event.ts)).toEqual([150, 200])
+    expect(recent[0]?.detail).toBe('early')
+    expect(recent[0]?.sessionId).toBeUndefined()
+    expect(recent[1]?.sessionId).toBeUndefined()
+    expect(store.listUsageEvents()[0]?.ts).toBe(150)
+    // Strictly older rows are dropped.
+    expect(store.pruneUsageEvents(150)).toBe(1)
+    expect(store.listUsageEvents().map(event => event.ts)).toEqual([150, 200])
+    store.close()
+  })
+
+  it('persists usage events across reopen and refuses them after close', () => {
+    const file = join(tempDir(), 'usage.db')
+    const store = new MemoryStore(file)
+    store.recordUsageEvent({ ts: 7, kind: 'archive_stub_chars', value: 900, sessionId: 's2' })
+    store.close()
+    const reopened = new MemoryStore(file)
+    expect(reopened.listUsageEvents()[0]?.sessionId).toBe('s2')
+    expect(reopened.usageTotals()[0]?.value).toBe(900)
+    reopened.close()
+    expect(() => reopened.listUsageEvents()).toThrow()
+    expect(() => reopened.recordUsageEvent({ ts: 1, kind: 'x', value: 1 })).toThrow()
   })
 })

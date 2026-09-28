@@ -195,3 +195,70 @@ export function shouldCompressHistory(input: HistoryTriggerInput): HistoryTrigge
   }
   return { compress: false, reason: 'rate-limited' }
 }
+
+/**
+ * Exponentially weighted per-step growth of the projected request size.
+ *
+ * The RAW delta is fed in (not a ratio), so a post-compaction shrink decays the
+ * estimate instead of pinning it; the result is floored at zero because a
+ * shrinking context has no "negative growth" to reserve for. First observation
+ * adopts the raw delta, so a session that starts already large is not treated as
+ * having grown.
+ * @param previous - the previous estimate, or `undefined` on first observation.
+ * @param delta - tokens gained since the previous observation.
+ * @returns the new estimate.
+ */
+export function nextGrowthEma(previous: number | undefined, delta: number): number {
+  if (!Number.isFinite(delta)) return previous === undefined ? 0 : previous
+  if (previous === undefined) return Math.max(0, delta)
+  return Math.max(0, previous * 0.5 + delta * 0.5)
+}
+
+/** Input for {@link shouldNudgeCompaction}. */
+export interface NudgeInput {
+  /** Whether scheduled (nudged) compression is enabled. */
+  readonly enabled: boolean
+  /** The estimated request size right now. */
+  readonly tokens: number
+  /** The predicted growth of the NEXT step (see {@link nextGrowthEma}). */
+  readonly growthTokens: number
+  /** Trigger water level in tokens. */
+  readonly triggerTokens: number
+  /** Current check index for the session. */
+  readonly turn: number
+  /** Index of the last successful compression (undefined = never). */
+  readonly lastCompressedTurn?: number | undefined
+  /** Remaining failure-cooldown rounds; a nudge must never bypass it. */
+  readonly failureCooldown: number
+}
+
+/**
+ * Decide whether to compress NOW because the NEXT step is predicted to cross the
+ * trigger water level.
+ *
+ * The point is scheduling, not thresholding. The ordinary trigger only looks at
+ * the size that already exists and is further gated by the round rate limit, so
+ * a step that adds one large tool result can cross the line between two checks
+ * and be compacted one step late — after the oversized request was already sent
+ * and paid for. A nudge forces the compression at the step boundary BEFORE that
+ * request, using the measured per-step growth as the reserve.
+ *
+ * Deliberately narrow: it never fires without measured growth, and never while
+ * already over the line (the ordinary pressure path owns that case, together
+ * with its rate limit and failure cooldown — bypassing both from here would
+ * compress every single step of a session that cannot shrink below the line).
+ * @param input - sizes, growth, and session state.
+ * @returns true when the compressor should treat this step as forced.
+ */
+export function shouldNudgeCompaction(input: NudgeInput): boolean {
+  const {
+    enabled, tokens, growthTokens, triggerTokens, turn, lastCompressedTurn, failureCooldown,
+  } = input
+  if (!enabled) return false
+  if (!Number.isFinite(growthTokens) || growthTokens <= 0) return false
+  if (tokens >= triggerTokens) return false
+  if (tokens + growthTokens < triggerTokens) return false
+  if (failureCooldown > 0) return false
+  if (lastCompressedTurn !== undefined && turn - lastCompressedTurn < 1) return false
+  return true
+}

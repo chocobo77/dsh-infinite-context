@@ -183,6 +183,22 @@
         tool_archive_tail_chars: 1024
         tool_archive_max_entries: 500
         tool_archive_retention_days: 30
+        # Immediate distillation: an oversized result is reduced to signal lines
+        # (errors/counts/diff stats/paths + head/tail) and that digest IS the stub.
+        # min_chars sits below the archive threshold on purpose: a result can be too
+        # small to archive and still worth distilling. The digest is also ingested as
+        # a memory, so "what error did that command report" survives compaction.
+        tool_absorb: true
+        tool_absorb_min_chars: 4000
+        tool_absorb_max_digest_chars: 1200
+        # Predictive compression: a surface-growth EMA fires the compression one step
+        # early when the NEXT request would cross the trigger anyway.
+        compress_nudge: true
+        # Context accounting: injections/skips/archive/absorb/nudge/savings plus the
+        # provider's disjoint input/output/cacheRead/cacheWrite, summarised in
+        # memory_status. Never pre-summed (that would erase the cache hit rate).
+        usage_ledger: true
+        usage_retention_days: 30
         rag_ingest_importance: 0.3
         rag_ingest_denylist:
           - memory_search

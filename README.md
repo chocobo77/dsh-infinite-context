@@ -33,6 +33,9 @@
 | 表面去重检索 | `rag_surface_dedupe: true` — 注入前把 Top-K 记忆与**当前活动上下文的文本**比对（归一化小写 + 折叠空白，按段落 70% 覆盖判定），已在表面上的记忆本轮跳过；抑制**不写入**任何排除集，压缩把文本移出表面后即可再次注入 |
 | 本地简洁模式 | `concise_local_mode: true` — `isLocalRoute(provider)` 为真时，在 `agent/pre-step` 决策消息里、最新用户消息**之前**注入 `<runtime_directive scope="dsh-infinite-context:concise">`；每个表面至多一份（检测到即不再注入），压缩丢弃后自动补回 |
 | 工具结果归档（CCR） | `tool_archive: true` — 超过 6000 字符的工具结果先按内容寻址入库（`tr_<sha256 前 12 位>`），表面节点换成带 ref 的短桩；新节点入库后与压缩前各改写一次，把内置 pruner 的「有损中段剪枝」变成「可按 ref 取回」（`memory_expand`）；只改写**尚未发送过**的节点，绝不失效已建立的前缀缓存 |
+| 即时蒸馏（absorb） | `tool_absorb: true` — 超长工具结果先蒸馏出「信号行」（错误/失败/退出码/测试计数/diff stat/文件路径 + 首尾各 3 行，≤1200 字符）作为桩的主体；全文仍按 ref 入库、可 `memory_expand` 取回，蒸馏结果同时作为记忆入库（importance 低，遗忘优先退休） |
+| 压缩调度 nudge | `compress_nudge: true` — 用表面增长的 EMA 预判下一轮是否越线，会越线就把压缩提前一步执行（同一轮不重复、冷却期内不触发），避免「压缩跑起来时已经付过一轮超量输入」 |
+| 上下文计量账本 | `usage_ledger: true` — 逐请求记录注入 tokens/条数、表面跳过、归档/蒸馏字符、nudge 次数、压缩节省 tokens 与 LLM 的 input/output/cacheRead/cacheWrite（DSH 计数互斥，不预先求和），`memory_status` 输出最近 7 天汇总与缓存命中率 |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；本地模型主动探测真实运行窗口（llama/ollama/openai，含 llama-server `meta.n_ctx`）；per-model 注册表按模型隔离 |
 | 高价值过滤 | denylist 过滤 24 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
@@ -64,8 +67,10 @@ src/
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
 ├── tool-archive.ts       超长工具结果外置归档（CCR 式桩 + ref 取回）
+├── absorb.ts             工具结果即时蒸馏（信号行提取，无依赖）
+├── usage-ledger.ts       上下文计量账本（注入/归档/压缩/缓存命中，无依赖）
 └── tools.ts              11 个手动工具
-tests/                    209 个单元测试
+tests/                    235 个单元测试
 ```
 
 ### 手动工具
@@ -73,7 +78,7 @@ tests/                    209 个单元测试
 | 工具 | 说明 |
 |------|------|
 | `memory_search(query?, k?)` | 语义检索持久化记忆 |
-| `memory_status` | 报告分层计数、预算、嵌入器、遗忘策略、模型 CTX |
+| `memory_status` | 报告分层计数、预算、嵌入器、遗忘策略、模型 CTX + per-model 窗口，以及最近 7 天上下文计量（注入/跳过/归档/蒸馏/压缩节省/缓存命中率） |
 | `memory_index(limit?)` | MEMORY.md 风格结构化索引 |
 | `memory_maintain` | 只读审计：重复/冲突/过时 |
 | `memory_model_probe(forceProbe?, model?)` | 报告模型 CTX 来源，可强制探测 |
@@ -165,6 +170,12 @@ tests/                    209 个单元测试
 | `tool_archive_tail_chars` | `1024` | 桩保留的尾部字符数（错误信息通常在这里） |
 | `tool_archive_max_entries` | `500` | 归档表最大条数，超出的按 `created_at` 最旧裁剪 |
 | `tool_archive_retention_days` | `30` | 归档保留天数，更旧的条目在下一次写入时删除（`0` = 不按时间淘汰） |
+| `tool_absorb` | `true` | **工具结果即时蒸馏**：归档前先把超长结果蒸馏成信号行（错误/失败/退出码/测试通过-失败计数/diff stat/文件路径，加首尾各 3 行，每行截到 240 字符，总量 ≤1200 字符）作为桩的主体，全文仍按 ref 入库、`memory_expand` 原样取回。蒸馏结果同时作为一条记忆入库（importance 低，遗忘优先退休），所以「这一轮报了什么错」在表面桩和记忆都被压缩后仍然可检索。蒸馏不出信息（纯空白、空心结果）时回退头+尾桩 |
+| `tool_absorb_min_chars` | `4000` | 触发蒸馏的最小字符数。刻意低于归档阈值 6000：不大但很吵的结果也值得蒸馏 |
+| `tool_absorb_max_digest_chars` | `1200` | 蒸馏摘要的字符上限（同时被归档阈值兜底，保证桩一定比原文小） |
+| `compress_nudge` | `true` | **压缩调度 nudge**：用表面增长的 EMA（`nextGrowthEma`，权重 0.5）预判「下一个请求会不会越线」，会越线就把这一轮压缩提前执行（`shouldNudgeCompaction`：同轮不重复、失败冷却期内不触发、增长未知不触发）。压缩原本每 N 轮才评估一次，等触发时往往已经付过一轮超量输入 |
+| `usage_ledger` | `true` | **上下文计量账本**：逐请求记录注入 tokens/条数、表面跳过数、归档与蒸馏字符数、nudge 次数、压缩节省 tokens，以及 LLM 的 `input/output/cacheRead/cacheWrite`（DSH 的计数是**互斥**的：`inputTokens` 只是未缓存部分，合并求和会抹掉缓存命中率）。`memory_status` 输出最近 7 天汇总与缓存命中率 |
+| `usage_retention_days` | `30` | 计量事件保留天数（`0` = 不淘汰）；每 256 次写入顺带清理一次 |
 
 ### 部署
 
@@ -262,6 +273,9 @@ feel via **multi-tier memory management**:
 | Surface-aware retrieval dedup | `rag_surface_dedupe: true` — before injecting, Top-K memories are compared against the text of the ACTIVE context (lowercased + whitespace-collapsed, 70% segment coverage); memories already visible are skipped this turn. Suppression is recorded nowhere, so a memory returns as soon as compaction moves its text off the surface |
 | Local conciseness mode | `concise_local_mode: true` — when `isLocalRoute(provider)` holds, a `<runtime_directive scope="dsh-infinite-context:concise">` message is spliced into the `agent/pre-step` decision right before the latest user message; at most one copy per surface (detected, never duplicated), re-injected after compaction drops it |
 | Tool-result archive (CCR) | `tool_archive: true` — a tool result above the threshold is archived by content hash (`tr_<sha256 12>`), and the surface node becomes a short stub carrying that ref. Rewritten once when a node is appended and once before compaction, so the lossy middle-cut performed by the built-in pruner becomes recoverable via `memory_expand`. Only nodes that were never sent are rewritten, so an established prefix cache is never invalidated |
+| Immediate distillation (absorb) | `tool_absorb: true` — an oversized result is distilled into signal lines first (errors/failures/exit codes/test counts/diff stats/paths plus 3 head and 3 tail lines, ≤1200 chars) and that digest becomes the stub body; the full text still archives under its ref for `memory_expand`, and the digest is also ingested as a memory (low importance, retired first) |
+| Compression scheduling nudge | `compress_nudge: true` — a surface-growth EMA predicts whether the NEXT request crosses the trigger and compresses one step early when it would (`shouldNudgeCompaction`; never twice in a turn, never during a cooldown) |
+| Context accounting ledger | `usage_ledger: true` — per-request accounting of injected tokens/memories, surface skips, archived/distilled chars, nudges, compaction tokens saved, and the LLM's input/output/cacheRead/cacheWrite (DSH counts are DISJOINT, so they are stored separately and never pre-summed); `memory_status` reports the last 7 days plus the cache hit rate |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; local models are actively probed for their REAL runtime window (llama/ollama/openai incl. llama-server `meta.n_ctx`); per-model registry isolates concurrent sessions |
 | High-value filtering | denylist filters 24 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
@@ -271,7 +285,7 @@ feel via **multi-tier memory management**:
 | Tool | Description |
 |------|-------------|
 | `memory_search(query?, k?)` | Semantic search over persisted memories |
-| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX + per-model windows |
+| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX + per-model windows, and the last 7 days of context accounting (injection, surface skips, archived/distilled chars, compaction tokens saved, cache hit rate) |
 | `memory_index(limit?)` | MEMORY.md-style structured index |
 | `memory_maintain` | Read-only audit: duplicates/conflicts/stale |
 | `memory_model_probe(forceProbe?, model?)` | Report model CTX source, force probe, list per-model windows |
@@ -315,7 +329,7 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (209, no DSH dependency)
+# Unit tests (235, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check

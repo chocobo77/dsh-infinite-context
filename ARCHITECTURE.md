@@ -284,6 +284,73 @@ exact text for retrieval, not memory: `tool_results` is never embedded, never
 injected, and `memory_expand` sits on the ingest denylist so reading a 20K result
 back does not re-ingest it.
 
+### 7.4 Immediate distillation (`tool_absorb`)
+
+7.3 shrinks an oversized result but still pays for its full head and tail on the
+surface. The absorb pass is the complementary step: it runs on the RAW payload the
+moment the result lands and extracts the lines that actually carry the signal.
+`buildDigest(tool, text, options)` (src/absorb.ts) emits a header
+(`[<tool> result absorbed: <chars> chars / <lines> lines]`), then the first three
+lines, then every line matching one of ten signal patterns (error/failed/fatal/
+exception/traceback, denied/refused/timeout/not found, warn/deprecated/retry,
+`exit code N`, `N passed|failed|skipped`, test pass/fail summaries,
+insertions/deletions and files-changed diff stats, extension-bearing file paths,
+and `✗✘×`/`FAIL`/`ERROR`/`WARN`/`Traceback` line prefixes), and finally the last
+three lines. Signal lines are capped at `maxDigestChars / 120`. Every line is
+trimmed and clipped to 240 code points, blank and duplicate lines are dropped, and
+the whole digest is hard-capped at `tool_absorb_max_digest_chars` (default 1200,
+itself floored under the archive threshold so the stub is always smaller than the
+text it replaces). A payload that yields nothing but its header (`kept.length <= 1`
+— a whitespace-only blob) returns `null`, and the head+tail stub of 7.3 is used
+instead: the digest has to earn its place.
+
+The digest is stored in `tool_results.digest` next to the archived text and is ALSO
+ingested into the memory pyramid under the producing tool name, so "which error did
+that command report" is still retrievable after both the surface stub and the memory
+have been compacted. `tool_absorb_min_chars` (4000) is deliberately below the
+archive threshold (6000): a result can be too small to archive and still worth
+distilling. `replaceTextWithStub` replaces the whole result with the digest text
+plus a ref-bearing footer, dropping the remaining text blocks but keeping non-text
+blocks in place; it refuses (returns `null`) when the stub would not shrink the
+message, in which case the 7.3 path runs.
+
+### 7.5 Compression scheduling nudge (`compress_nudge`)
+
+`shouldCompressHistory` decides on ARRIVAL: it only sees the request that is
+already built, so the first oversized request has already been paid for by the time
+it fires. The nudge adds a predictive second check. `nextGrowthEma(previous, delta)`
+keeps a per-session exponential moving average (weight 0.5) of how much the surface
+grew between requests, updated in `HistoryCompressor.compress()` from
+`lastSizeTokens`; `shouldNudgeCompaction` then fires when the current size is still
+below the trigger but `tokens + growthTokens` is not — i.e. the next request would
+cross it anyway. Six guards keep it honest: disabled, unknown or non-positive
+growth, already over the trigger, growth not enough to reach it, a failure cooldown
+in progress, and `turn - lastCompressedTurn < 1` all return false, so it never fires
+twice in a turn. A nudged run sets `force: force || nudged` for the trigger and
+returns `{ nudged: true }`, which the ledger records as its own kind so the two
+paths can be told apart. The trade is a slightly earlier — and therefore slightly
+more frequent — compression in exchange for not paying one oversized request.
+
+### 7.6 Context accounting (`usage_ledger`)
+
+Everything the plugin does to the context is measurable, and unmeasured it is easy
+to tune blind. `UsageLedger` (src/usage-ledger.ts) appends one `usage_events` row
+per measurement: injected tokens and memory count, surface skips, code points
+removed by the archive, code points of the digests, nudged compressions, tokens
+saved by compression, and the provider's own usage. Provider numbers are recorded
+FIELD BY FIELD on purpose: DSH reports disjoint counts (`inputTokens` is the
+UNCACHED input; the billed input is `input + cacheRead + cacheWrite`), so
+pre-summing them would destroy the cache hit rate — the single most useful signal
+for judging whether injection and prefix-preserving rewrites pay off. The ledger is
+fed from three places: the `tools/result` observer (absorb/archive), the pre-step
+governance path (injection, skips, compaction savings, nudge), and a `session/event`
+subscription that reads `assistant/message`'s `usage`. `summary(days = 7)` folds
+rows per kind and computes `cacheRead / (input + cacheRead + cacheWrite)`
+(`memory_status` prints it); `record` silently ignores disabled, non-finite and
+zero values, every store failure is logged and swallowed (metering never breaks a
+turn), retention (`usage_retention_days`, default 30, 0 disables) is enforced every
+256 writes, and `usage_events` is drained oldest-first.
+
 ---
 
 ## 8. Component / module map
@@ -295,22 +362,24 @@ back does not re-ingest it.
 | `src/embedder.ts` | no | `Embedder` interface, `LightweightEmbedder`, cosine/normalize helpers. |
 | `src/transformers-embedder.ts` | no | Optional `TransformersEmbedder` (all-MiniLM-L6-v2). |
 | `src/vector-index.ts` | no | `VectorIndex` (top-K cosine search). |
-| `src/memory-store.ts` | no | SQLite (`node:sqlite`) persistence of `MemoryDoc`. |
+| `src/memory-store.ts` | no | SQLite (`node:sqlite`) persistence of `MemoryDoc`, the `tool_results` archive (+`digest`) and the `usage_events` ledger. |
+| `src/absorb.ts` | no | Immediate distillation: `buildDigest` signal-line extraction (errors/counts/diff stats/paths + head/tail), line clipping, digest cap. |
+| `src/usage-ledger.ts` | no | Context accounting: `UsageLedger.record`/`totals`/`recent`/`prune`/`summary`, disjoint provider-usage folding, cache-hit rate. |
 | `src/token-budget.ts` | no | `TokenBudget`, CJK-aware `estimateTokens` + content-block metering (`estimateContentTokens`: nested tool-result/tool-call payloads, capped). |
 | `src/forgetting.ts` | no | `ForgettingPolicy`, scoring. |
 | `src/memory-engine.ts` | no | Orchestration: store/embed/retrieve/consolidate/forget/status. |
 | `src/model-context.ts` | no | `ModelContextTracker`: probe-once-per-model + retry cooldown, per-model window registry, probe-only-narrows. |
 | `src/model-probe.ts` | no | Live context probes (llama `/props`, ollama `/api/show`, openai `/models` incl. LM Studio native) + `isLocalHostname`/`isLocalBaseURL` locality gate. |
-| `src/compaction-policy.ts` | no | Pure trigger decisions: `decidePressureCompaction` (skip/force/delegate), `dynamicCompactionRatio` curve, `shouldCompressHistory` (surge/pressure/rate-limit). |
+| `src/compaction-policy.ts` | no | Pure trigger decisions: `decidePressureCompaction` (skip/force/delegate), `dynamicCompactionRatio` curve, `shouldCompressHistory` (surge/pressure/rate-limit), plus the growth nudge (`nextGrowthEma`, `shouldNudgeCompaction`). |
 | `src/thinking-guard.ts` | yes | Mid-thinking guard: `llm/stream` wrapper, dynamic trigger line, overflow injection. |
 | `src/summarization-target.ts` | yes | Summarizer routing: `configured ?? session model`. |
 | `src/config.ts` | yes | Schemastery schemas + default resolution. |
 | `src/memory-context.ts` | yes | `MemoryContext` service (`ctx.memoryContext`): probe wiring + locality gate + per-model adoption. |
-| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance (compression → RAG injection → conciseness directive → truncation) + narrowed-window force + thinking-guard wiring. |
+| `src/memory-compaction.ts` | yes | `MemoryCompactionEngine` (extends `BasicCompactionEngine`): pre-step governance (compression → RAG injection → conciseness directive → truncation) + narrowed-window force + thinking-guard wiring + archive/absorb/nudge/usage-ledger wiring. |
 | `src/OutputSanitizer.ts` | no | Tool-result sanitization: per-source strategies for rendered text and `ContentBlock[]` (the automatic `tools/result` path) plus structured JSON objects (web_search/code_exec/generic truncation, the manual ingest path). |
-| `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval + surface-aware de-dup (`normalizeSurfaceText`/`surfaceSegments`/`isMemoryOnSurface`/`buildSurfaceBlob`). |
+| `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval + surface-aware de-dup (`normalizeSurfaceText`/`surfaceSegments`/`isMemoryOnSurface`/`buildSurfaceBlob`, reporting a `skipped` count for the ledger). |
 | `src/conciseness-mode.ts` | yes | Local-model conciseness directive: marker, default text, `createConciseMessage`, idempotence check `hasConciseDirective`. |
-| `src/tool-archive.ts` | yes | Tool-result archive (CCR): content-addressed `tr_` refs, stub rewriting (`replaceTextMiddle`, append-time + pre-compaction passes with a per-session barrier), retention/cap. |
+| `src/tool-archive.ts` | yes | Tool-result archive (CCR): content-addressed `tr_` refs, stub rewriting (`replaceTextWithStub` for absorbed digests, `replaceTextMiddle` otherwise; append-time + pre-compaction passes with a per-session barrier), retention/cap. |
 | `src/tools.ts` | yes | Manual model-callable tools (incl. `memory_expand`, the archive read path). |
 | `src/core.ts` | no | Barrel re-exporting the dependency-free core. |
 | `src/index.ts` | yes | Package barrel. |
@@ -345,14 +414,28 @@ CREATE TABLE tool_results (
   session_id TEXT,
   created_at INTEGER NOT NULL,          -- epoch ms
   chars      INTEGER NOT NULL,          -- code-point length of text
-  text       TEXT NOT NULL              -- the exact archived payload
+  text       TEXT NOT NULL,             -- the exact archived payload
+  digest     TEXT                       -- absorbed signal-line digest (7.4), or NULL
 );
 CREATE INDEX idx_tool_results_created ON tool_results (created_at);
 CREATE INDEX idx_tool_results_session ON tool_results (session_id, created_at);
+
+CREATE TABLE usage_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,          -- epoch ms
+  kind       TEXT NOT NULL,             -- see USAGE_KIND (src/usage-ledger.ts)
+  value      INTEGER NOT NULL,          -- round(); 0 is never written
+  session_id TEXT,
+  detail     TEXT
+);
+CREATE INDEX idx_usage_events_ts   ON usage_events (ts);
+CREATE INDEX idx_usage_events_kind ON usage_events (kind, ts);
 ```
 
 `memories` is the retrieval corpus; `tool_results` is an exact-text archive (7.3)
-that is never embedded and never retrieved as memory.
+that is never embedded and never retrieved as memory; `usage_events` is the
+append-only ledger behind `memory_status`'s context accounting (7.6) and is pruned
+by time rather than capped by entry count.
 
 Uses Node's built-in `node:sqlite` (`DatabaseSync`), the same medium DSH's own
 `storage-sqlite` backend uses — no native `sqlite3` dependency. Missing parent
@@ -560,3 +643,21 @@ generation. Input metering counts nested tool-result/tool-call payloads
   first pass records the barrier and rewrites nothing. The single deliberate
   exception is compaction, which rebuilds the prefix anyway: that is where
   deferred stubs are flushed, ahead of the built-in pruner.
+- **Distillation is a stub strategy, not a second summarizer.** `tool_absorb` runs on
+  the RAW result the moment it lands, extracts the lines that carry the signal
+  (errors, exit codes, counts, diff stats) and lets that digest BE the stub: no extra
+  model call, and no loss of the exact text (the archive keeps it and `memory_expand`
+  returns it). A payload that yields nothing but a header falls back to the head+tail
+  stub, and `replaceTextWithStub` refuses to write a stub no smaller than the original
+  — so the strategy can only help, never inflate.
+- **Compression is scheduled on a prediction, not only on arrival.** The growth EMA
+  answers a question the trigger cannot ("do I still fit after the NEXT tool
+  result?") and compresses one step early when the answer is no. The trade is a
+  slightly earlier and slightly more frequent compression in exchange for not paying
+  one oversized request; the nudge never fires twice in a turn or during a cooldown,
+  and it is recorded as its own kind so its cost stays visible.
+- **Provider usage is stored per field, never pre-summed.** DSH's counts are
+  disjoint: `inputTokens` is the uncached input and the billed input is
+  `input + cacheRead + cacheWrite`. Collapsing them into one number would erase the
+  cache hit rate — the most useful single signal for judging whether injection and
+  prefix-preserving rewrites are actually paying off.

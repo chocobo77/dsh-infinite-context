@@ -6,13 +6,16 @@ import {
   ToolResultArchive,
   archiveMarker,
   archiveRef,
+  digestStub,
   measureChars,
   measureContent,
   replaceTextMiddle,
+  replaceTextWithStub,
   textOfBlocks,
   type ToolArchiveOptions,
   type ToolArchiveStore,
 } from '../src/tool-archive.ts'
+import type { AbsorbOptions } from '../src/absorb.ts'
 import type { ToolResultMeta, ToolResultRecord } from '../src/memory-store.ts'
 
 const OPTIONS: ToolArchiveOptions = {
@@ -131,7 +134,12 @@ function makeSession() {
   return { session, nodes, events, addToolResult }
 }
 
-function makeArchive(store: ToolArchiveStore, options: ToolArchiveOptions, now?: () => number) {
+function makeArchive(
+  store: ToolArchiveStore,
+  options: ToolArchiveOptions,
+  now?: () => number,
+  absorb?: AbsorbOptions,
+) {
   const warnings: string[] = []
   const infos: string[] = []
   const archive = new ToolResultArchive({
@@ -140,6 +148,7 @@ function makeArchive(store: ToolArchiveStore, options: ToolArchiveOptions, now?:
     logger: { info: message => infos.push(message), warn: message => warnings.push(message) },
     estimateMessage: () => 1,
     ...(now === undefined ? {} : { now }),
+    ...(absorb === undefined ? {} : { absorb }),
   })
   return { archive, warnings, infos }
 }
@@ -294,5 +303,82 @@ describe('ToolResultArchive', () => {
     archive.capture('pwsh', 'c3', 's1', longText(100) + 'C')
     expect(rows.size).toBe(2)
     expect(archive.status().entries).toBe(2)
+  })
+})
+
+const ABSORB: AbsorbOptions = { enabled: true, minChars: 100, maxDigestChars: 600 }
+
+describe('tool-archive absorb stubs', () => {
+  it('distils a sub-threshold payload without archiving it', () => {
+    const { rows, store } = makeStore()
+    const { archive } = makeArchive(store, OPTIONS, undefined, ABSORB)
+    const text = ['line one', 'line two', 'ERROR: small failure', 'line four'].join('\n')
+      + '\n' + 'x'.repeat(200)
+    const captured = archive.capture('pwsh', 'c1', 's1', text)
+    expect(captured?.ref).toBeUndefined()
+    expect(captured?.inserted).toBe(false)
+    expect(captured?.digest).toContain('ERROR: small failure')
+    expect(rows.size).toBe(0)
+  })
+
+  it('archives the digest of an oversized payload', () => {
+    const { rows, store } = makeStore()
+    const { archive } = makeArchive(store, OPTIONS, undefined, ABSORB)
+    const text = ['setup ok', 'ERROR: big failure', 'noise ' + 'x'.repeat(400)].join('\n')
+      + '\n' + longText()
+    const captured = archive.capture('pwsh', 'c1', 's1', text)
+    expect(captured?.inserted).toBe(true)
+    expect(captured?.digest).toContain('ERROR: big failure')
+    expect(rows.get(captured?.ref as string)?.digest).toBe(captured?.digest)
+  })
+
+  it('replaces a result with the stored digest stub', () => {
+    const { rows, store } = makeStore()
+    const { archive, infos } = makeArchive(store, OPTIONS, undefined, ABSORB)
+    const { session, nodes, events, addToolResult } = makeSession()
+    // The tools/result hook archives first, so the call on the surface is known.
+    const captured = archive.capture('pwsh', 'c1', 's1', longText())
+    // The first pass only records the prefix barrier; it rewrites nothing.
+    expect(archive.rewriteNewResults(session as unknown as Session).replaced).toBe(0)
+    addToolResult('c1', longText())
+    const result = archive.rewriteNewResults(session as unknown as Session)
+    expect(result.replaced).toBe(1)
+    expect(result.refs[0]).toBe(captured?.ref)
+    const stub = textOfBlocks(events.get(nodes[nodes.length - 1] as number)?.data.message.content ?? [])
+    expect(stub.startsWith('[pwsh result absorbed: ')).toBe(true)
+    expect(stub).toContain('chars absorbed and archived as ' + (captured?.ref as string))
+    expect(stub).toContain('memory_expand {"ref":"' + (captured?.ref as string) + '"}')
+    expect(rows.get(captured?.ref as string)?.digest).toBe(captured?.digest)
+    expect(infos.some(message => message.includes('stubbed 1'))).toBe(true)
+  })
+
+  it('falls back to the head+tail marker when absorb is off', () => {
+    const { store } = makeStore()
+    const { archive } = makeArchive(
+      store,
+      OPTIONS,
+      undefined,
+      { enabled: false, minChars: 100, maxDigestChars: 600 },
+    )
+    const { session, nodes, events, addToolResult } = makeSession()
+    addToolResult('c1', longText())
+    archive.rewriteAllResults(session as unknown as Session)
+    const stub = textOfBlocks(events.get(nodes[0] as number)?.data.message.content ?? [])
+    expect(stub).toContain('chars archived as')
+    expect(stub).not.toContain('result absorbed')
+  })
+
+  it('renders the stub hint and keeps one stub per result', () => {
+    const stub = digestStub('tr_abcdef012345', 'body line', 4_321)
+    expect(stub.startsWith('body line\n\n')).toBe(true)
+    expect(stub).toContain('4321 chars absorbed and archived as tr_abcdef012345')
+    expect(stub).toContain('memory_expand {"ref":"tr_abcdef012345"}')
+    const blocks: ContentBlock[] = [
+      { type: 'text', text: 'a'.repeat(1_000) },
+      { type: 'text', text: 'b'.repeat(1_000) },
+    ]
+    expect(measureContent(replaceTextWithStub(blocks, 'stub') ?? [])).toBe(4)
+    expect(textOfBlocks(replaceTextWithStub(blocks, 'stub') ?? [])).toBe('stub')
+    expect(replaceTextWithStub([{ type: 'text', text: 'short' }], 'a much longer stub')).toBeNull()
   })
 })

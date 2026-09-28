@@ -4,7 +4,10 @@ import {
   SURGE_RATIO,
   decidePressureCompaction,
   dynamicCompactionRatio,
+  nextGrowthEma,
   shouldCompressHistory,
+  shouldNudgeCompaction,
+  type NudgeInput,
 } from '../src/core.ts'
 
 describe('decidePressureCompaction', () => {
@@ -261,5 +264,58 @@ describe('shouldCompressHistory', () => {
       ...base, tokens: 800, lastTokens: undefined, lastCompressedTurn: undefined,
     })
     expect(first).toEqual({ compress: true, reason: 'pressure' })
+  })
+})
+
+describe('nextGrowthEma', () => {
+  it('seeds on the first delta, then halves the weight of each new one', () => {
+    expect(nextGrowthEma(undefined, 1_000)).toBe(1_000)
+    expect(nextGrowthEma(1_000, 2_000)).toBe(1_500)
+    expect(nextGrowthEma(1_500, 0)).toBe(750)
+  })
+
+  it('never goes negative and ignores a non-finite delta', () => {
+    expect(nextGrowthEma(1_000, -500)).toBe(250)
+    expect(nextGrowthEma(100, -1_000)).toBe(0)
+    expect(nextGrowthEma(1_000, Number.NaN)).toBe(1_000)
+    expect(nextGrowthEma(undefined, Number.NaN)).toBe(0)
+  })
+})
+
+describe('shouldNudgeCompaction', () => {
+  const base: NudgeInput = {
+    enabled: true,
+    tokens: 700,
+    growthTokens: 200,
+    triggerTokens: 800,
+    turn: 10,
+    failureCooldown: 0,
+  }
+
+  it('fires when the next step would cross the trigger anyway', () => {
+    expect(shouldNudgeCompaction(base)).toBe(true)
+    // Exactly reaching the trigger counts; the regular check stays authoritative.
+    expect(shouldNudgeCompaction({ ...base, tokens: 600, growthTokens: 200 })).toBe(true)
+  })
+
+  it('stays quiet when growth cannot reach the trigger', () => {
+    expect(shouldNudgeCompaction({ ...base, tokens: 100, growthTokens: 100 })).toBe(false)
+  })
+
+  it('defers to the regular trigger once over it', () => {
+    expect(shouldNudgeCompaction({ ...base, tokens: 800 })).toBe(false)
+    expect(shouldNudgeCompaction({ ...base, tokens: 900, growthTokens: 50 })).toBe(false)
+  })
+
+  it('is off when disabled, when growth is unknown, or during a cooldown', () => {
+    expect(shouldNudgeCompaction({ ...base, enabled: false })).toBe(false)
+    expect(shouldNudgeCompaction({ ...base, growthTokens: 0 })).toBe(false)
+    expect(shouldNudgeCompaction({ ...base, growthTokens: Number.NaN })).toBe(false)
+    expect(shouldNudgeCompaction({ ...base, failureCooldown: COMPRESS_FAILURE_COOLDOWN })).toBe(false)
+  })
+
+  it('never asks twice in the same turn', () => {
+    expect(shouldNudgeCompaction({ ...base, lastCompressedTurn: 10 })).toBe(false)
+    expect(shouldNudgeCompaction({ ...base, lastCompressedTurn: 9 })).toBe(true)
   })
 })
