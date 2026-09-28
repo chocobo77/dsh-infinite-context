@@ -32,9 +32,10 @@
 | 三层去重 | 精确（hasText）+ 归一化（normalizeForDedup）+ 语义（cosine ≥ 0.92） |
 | 表面去重检索 | `rag_surface_dedupe: true` — 注入前把 Top-K 记忆与**当前活动上下文的文本**比对（归一化小写 + 折叠空白，按段落 70% 覆盖判定），已在表面上的记忆本轮跳过；抑制**不写入**任何排除集，压缩把文本移出表面后即可再次注入 |
 | 本地简洁模式 | `concise_local_mode: true` — `isLocalRoute(provider)` 为真时，在 `agent/pre-step` 决策消息里、最新用户消息**之前**注入 `<runtime_directive scope="dsh-infinite-context:concise">`；每个表面至多一份（检测到即不再注入），压缩丢弃后自动补回 |
+| 工具结果归档（CCR） | `tool_archive: true` — 超过 6000 字符的工具结果先按内容寻址入库（`tr_<sha256 前 12 位>`），表面节点换成带 ref 的短桩；新节点入库后与压缩前各改写一次，把内置 pruner 的「有损中段剪枝」变成「可按 ref 取回」（`memory_expand`）；只改写**尚未发送过**的节点，绝不失效已建立的前缀缓存 |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；本地模型主动探测真实运行窗口（llama/ollama/openai，含 llama-server `meta.n_ctx`）；per-model 注册表按模型隔离 |
-| 高价值过滤 | denylist 过滤 23 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
+| 高价值过滤 | denylist 过滤 24 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
 
 ### 架构
 
@@ -62,8 +63,9 @@ src/
 ├── strings.ts            共享字符串工具
 ├── core.ts               公共导出桶
 ├── index.ts              完整导出桶
-└── tools.ts              10 个手动工具
-tests/                    178 个单元测试
+├── tool-archive.ts       超长工具结果外置归档（CCR 式桩 + ref 取回）
+└── tools.ts              11 个手动工具
+tests/                    209 个单元测试
 ```
 
 ### 手动工具
@@ -80,6 +82,7 @@ tests/                    178 个单元测试
 | `memory_reset` | 清空所有记忆 |
 | `memory_force_compress(sessionId?)` | 强制压缩指定会话 |
 | `memory_ingest(text, source)` | 手动入库一条文本（自动触发见 `tools/result` 回调） |
+| `memory_expand(ref?, query?, offset?, limit?)` | 取回被归档的工具结果全文：不带 ref 列出/搜索归档；带 ref 可整段分页读取，或按 query 定位命中窗口（内置 pruner 剪掉的中段也能取回） |
 
 ### 配置参考
 
@@ -151,11 +154,17 @@ tests/                    178 个单元测试
 | `retain_recent_messages` | `4` | 最近 N 条消息永不压缩 |
 | `rag_top_k` | `3` | 每轮注入的记忆数 |
 | `rag_min_score` | `0.3` | 注入的最低相似度 |
-| `rag_ingest_denylist` | 内置 21 个 | 低价值工具过滤列表 |
+| `rag_ingest_denylist` | 内置 24 个 | 低价值工具过滤列表 |
 | `rag_ingest_importance` | `0.3` | 工具结果重要性（遗忘优先淘汰） |
 | `rag_surface_dedupe` | `true` | **表面去重检索**：命中记忆的文本若已存在于**当前活动上下文**（典型：刚入库、尚未被压缩掉的工具结果），则本轮不注入——避免把模型已经能读到的文本再花 token 送一遍。抑制是**状态相关**的：一旦压缩把该文本移出表面，记忆立刻恢复可注入（旧的 `lastInjectedIds` 排除语义不变，只记录真正注入过的 id） |
 | `concise_local_mode` | `true` | **本地模型简洁模式**：会话路由到**本地**（loopback/私网 baseURL）provider 时，注入一条短运行时指令，禁止工具调用之间的叙述文字、要求独立调用合并到同一步、把解释集中到最终答复。本地模型的叙述会作为后续每个请求的输入反复重发（并在缓存过期后重新付费），一条指令通常在同一轮内回本。**每个表面至多注入一次**（`agent/pre-step` 决策消息，与 RAG 注入同一机制；`llm/stream` 的请求是深度冻结的，监听器只能读不能改） |
 | `concise_local_directive` | 内置文本 | 简洁模式的指令正文（可覆盖为自定义措辞） |
+| `tool_archive` | `true` | **工具结果归档（CCR 式）**：超过阈值的工具结果原文按内容哈希入库，表面只留「头部 + 带 ref 的标记 + 尾部」的桩。内置 `tool-result-pruner` 只会把中段永久替换成固定 marker（有损、且只在压缩时运行）；本插件在**压缩前**与**新节点写入后**各改写一次，于是被剪掉的中段随时能用 `memory_expand` 原样取回 |
+| `tool_archive_threshold_chars` | `6000` | 超过此字符数的工具结果才归档。默认刻意低于内置 pruner 的 8192 阈值，保证桩先于 pruner 生效 |
+| `tool_archive_head_chars` | `2048` | 桩保留的头部字符数（含工具名、callId 与 ref） |
+| `tool_archive_tail_chars` | `1024` | 桩保留的尾部字符数（错误信息通常在这里） |
+| `tool_archive_max_entries` | `500` | 归档表最大条数，超出的按 `created_at` 最旧裁剪 |
+| `tool_archive_retention_days` | `30` | 归档保留天数，更旧的条目在下一次写入时删除（`0` = 不按时间淘汰） |
 
 ### 部署
 
@@ -214,7 +223,7 @@ scripts\install-dsh-plugin.ps1 -DetectOnly
 ### 测试
 
 ```sh
-# 单元测试（178 个，无 DSH 依赖）
+# 单元测试（209 个，无 DSH 依赖）
 vitest run --config vitest.config.ts
 
 # 类型检查
@@ -252,9 +261,10 @@ feel via **multi-tier memory management**:
 | Three-layer dedup | Exact (hasText) + normalized (normalizeForDedup) + semantic (cosine ≥ 0.92) |
 | Surface-aware retrieval dedup | `rag_surface_dedupe: true` — before injecting, Top-K memories are compared against the text of the ACTIVE context (lowercased + whitespace-collapsed, 70% segment coverage); memories already visible are skipped this turn. Suppression is recorded nowhere, so a memory returns as soon as compaction moves its text off the surface |
 | Local conciseness mode | `concise_local_mode: true` — when `isLocalRoute(provider)` holds, a `<runtime_directive scope="dsh-infinite-context:concise">` message is spliced into the `agent/pre-step` decision right before the latest user message; at most one copy per surface (detected, never duplicated), re-injected after compaction drops it |
+| Tool-result archive (CCR) | `tool_archive: true` — a tool result above the threshold is archived by content hash (`tr_<sha256 12>`), and the surface node becomes a short stub carrying that ref. Rewritten once when a node is appended and once before compaction, so the lossy middle-cut performed by the built-in pruner becomes recoverable via `memory_expand`. Only nodes that were never sent are rewritten, so an established prefix cache is never invalidated |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; local models are actively probed for their REAL runtime window (llama/ollama/openai incl. llama-server `meta.n_ctx`); per-model registry isolates concurrent sessions |
-| High-value filtering | denylist filters 23 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
+| High-value filtering | denylist filters 24 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
 
 ### Manual Tools
 
@@ -270,6 +280,7 @@ feel via **multi-tier memory management**:
 | `memory_reset` | Erase all memories |
 | `memory_force_compress(sessionId?)` | Force compress a session |
 | `memory_ingest(text, source)` | Manually ingest a text (auto-triggered via the `tools/result` callback) |
+| `memory_expand(ref?, query?, offset?, limit?)` | Read back an archived tool result: without `ref` it lists or searches the archive; with `ref` it pages through the full text, or returns match windows for `query` (the middle cut by the built-in pruner included) |
 
 ### Deployment
 
@@ -304,7 +315,7 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (178, no DSH dependency)
+# Unit tests (209, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check

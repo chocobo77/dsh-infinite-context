@@ -156,6 +156,17 @@
     # At most one copy per surface; re-injected after compaction drops it.
     concise_local_mode: true
     # concise_local_directive: '自定义指令正文'
+    # --- tool-result archive (CCR) ---
+    # An oversized tool result keeps its full text in the store under a ref and
+    # leaves a head+ref+tail stub on the surface, so the built-in lossy pruner
+    # never has to drop it: memory_expand reads it back. Only nodes appended
+    # since the previous pass are rewritten (a rebuilt prefix is a cache miss).
+    tool_archive: true
+    tool_archive_threshold_chars: 6000   # below the built-in pruner's 8192
+    tool_archive_head_chars: 2048
+    tool_archive_tail_chars: 1024
+    tool_archive_max_entries: 500
+    tool_archive_retention_days: 30
     rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
     # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
@@ -163,6 +174,6 @@
 
 # 3) Manual tools (memory_search, memory_status, memory_index, memory_maintain,
 #    memory_model_probe, memory_forget, memory_consolidate, memory_reset,
-#    memory_force_compress, memory_ingest).
+#    memory_force_compress, memory_expand, memory_ingest).
 - id: memory-tools
   name: ./src/tools.ts

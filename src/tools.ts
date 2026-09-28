@@ -1,6 +1,6 @@
 /**
  * Manual model-callable tools for the memory system: search, status, forget,
- * consolidate, reset, and (new) ingest + compress. Loaded as a separate
+ * consolidate, reset, ingest + compress, and tool-result expand. Loaded as a
  * `cordis.yml` entry that injects `tools` and `memoryContext`.
  *
  * @module dsh-infinite-context/tools
@@ -258,5 +258,69 @@ export function apply(ctx: Context) {
       }
     },
     presentCall: args => ({ card: 'generic', title: 'Memory force compress', kind: 'other', rawInput: args }),
+  }))
+  ctx.tools.register(defineTool({
+    name: 'memory_expand',
+    description: 'Read back a tool result that was archived off the context (tool-result CCR). Pass a ref to get its exact text back, optionally paginated with offset/limit or searched with query; omit ref to list the most recent archived results.',
+    parameters: {
+      ref: { type: 'string', description: 'Archive ref (for example tr_ab12cd34ef56) from an archived tool-result stub.' },
+      query: { type: 'string', description: 'Substring to search: inside one archived result when ref is given, otherwise across every archived result.' },
+      offset: { type: 'number', description: 'Code-point offset to start reading from (default 0).' },
+      limit: { type: 'number', description: 'Code points to return (default 4000, max 20000); with ref+query, the number of match windows (default 5).' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value: string) => [{ type: 'text', text: value }],
+    },
+    async execute(args: { ref?: string; query?: string; offset?: number; limit?: number }) {
+      const query = args.query?.trim()
+      const ref = args.ref?.trim()
+      if (ref === undefined || ref.length === 0) {
+        const listLimit = Math.max(1, Math.min(50, Math.floor(args.limit ?? 10)))
+        const rows = query === undefined || query.length === 0
+          ? ctx.memoryContext.listToolResults(listLimit)
+          : ctx.memoryContext.searchToolResults(query, listLimit)
+        if (rows.length === 0) return 'No archived tool results match.'
+        return rows.map(row => (
+          '[' + row.ref + '] ' + row.tool + ' · ' + row.chars + ' chars · ' + new Date(row.createdAt).toISOString()
+          + '\n  ' + row.preview
+        )).join('\n\n')
+      }
+      const record = ctx.memoryContext.getToolResult(ref)
+      if (record === undefined) {
+        return 'Unknown archive ref: ' + ref + '. Call memory_expand without a ref to list recent entries.'
+      }
+      const points = Array.from(record.text)
+      const header = 'Archived tool result ' + record.ref + ' (tool ' + record.tool + ', ' + points.length
+        + ' code points' + (record.callId === undefined ? '' : ', callId ' + record.callId) + ').'
+      if (query !== undefined && query.length > 0) {
+        const label = JSON.stringify(query)
+        const haystack = record.text.toLowerCase()
+        const needle = query.toLowerCase()
+        const maxWindows = Math.max(1, Math.min(20, Math.floor(args.limit ?? 5)))
+        const windows: string[] = []
+        let from = 0
+        while (windows.length < maxWindows) {
+          const at = haystack.indexOf(needle, from)
+          if (at < 0) break
+          const start = Math.max(0, at - 200)
+          const end = Math.min(points.length, at + needle.length + 200)
+          windows.push('...' + points.slice(start, end).join('') + '...')
+          from = at + needle.length
+        }
+        if (windows.length === 0) return header + '\nNo match for ' + label + '.'
+        return header + '\n' + windows.length + ' match window(s) for ' + label + ':\n\n' + windows.join('\n\n')
+      }
+      const offset = Math.max(0, Math.floor(args.offset ?? 0))
+      const want = Math.max(1, Math.min(20000, Math.floor(args.limit ?? 4000)))
+      const slice = points.slice(offset, offset + want)
+      if (slice.length === 0) return header + '\nOffset ' + offset + ' is past the end of the archived text.'
+      const readTo = offset + slice.length
+      const tail = readTo < points.length
+        ? '\n\n[read up to code point ' + readTo + ' of ' + points.length + '; call again with offset ' + readTo + ']'
+        : '\n\n[end of archived text]'
+      return header + '\n\n' + slice.join('') + tail
+    },
+    presentCall: args => ({ card: 'generic', title: 'Tool result expand', kind: 'other', rawInput: args }),
   }))
 }

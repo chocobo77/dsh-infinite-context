@@ -32,6 +32,31 @@ function blobToVector(blob: Buffer | null | undefined): number[] | undefined {
   return out
 }
 
+/**
+ * An archived oversized tool result: the exact text of a tool result that was
+ * replaced in the transcript by a short stub carrying `ref`.
+ */
+export interface ToolResultRecord {
+  readonly ref: string
+  readonly tool: string
+  readonly callId?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly chars: number
+  readonly text: string
+}
+
+/** A listing view of an archived result: everything but the full text. */
+export interface ToolResultMeta {
+  readonly ref: string
+  readonly tool: string
+  readonly callId?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly chars: number
+  readonly preview: string
+}
+
 interface MemoryRow {
   id: string
   tier: string
@@ -44,6 +69,55 @@ interface MemoryRow {
   embedding: Buffer | null
   merged_from: string | null
   kind: string | null
+}
+
+interface ToolResultRow {
+  ref: string
+  tool: string
+  call_id: string | null
+  session_id: string | null
+  created_at: number
+  chars: number
+  text: string
+}
+
+interface ToolResultMetaRow {
+  ref: string
+  tool: string
+  call_id: string | null
+  session_id: string | null
+  created_at: number
+  chars: number
+  preview: string | null
+}
+
+/** Collapse a preview blob to one short line. */
+function previewOf(text: string | null): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)
+}
+
+function rowToToolResult(row: ToolResultRow): ToolResultRecord {
+  return {
+    ref: row.ref,
+    tool: row.tool,
+    ...(row.call_id !== null ? { callId: row.call_id } : {}),
+    ...(row.session_id !== null ? { sessionId: row.session_id } : {}),
+    createdAt: row.created_at,
+    chars: row.chars,
+    text: row.text,
+  }
+}
+
+function rowToToolResultMeta(row: ToolResultMetaRow): ToolResultMeta {
+  return {
+    ref: row.ref,
+    tool: row.tool,
+    ...(row.call_id !== null ? { callId: row.call_id } : {}),
+    ...(row.session_id !== null ? { sessionId: row.session_id } : {}),
+    createdAt: row.created_at,
+    chars: row.chars,
+    preview: previewOf(row.preview),
+  }
 }
 
 /**
@@ -107,6 +181,24 @@ export class MemoryStore {
         value TEXT NOT NULL
       )
     `)
+    // Exact-text archive for oversized tool results. The transcript keeps only
+    // a short stub carrying `ref`; the full text stays here so `memory_expand`
+    // can hand it back verbatim after the built-in pruner (or a compaction) has
+    // replaced the middle with an unrecoverable marker. Content-addressed: the
+    // same payload archives once, however many times it is produced.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tool_results (
+        ref        TEXT PRIMARY KEY,
+        tool       TEXT NOT NULL,
+        call_id    TEXT,
+        session_id TEXT,
+        created_at INTEGER NOT NULL,
+        chars      INTEGER NOT NULL,
+        text       TEXT NOT NULL
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_created ON tool_results (created_at)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results (session_id, created_at)')
   }
 
   /**
@@ -140,6 +232,124 @@ export class MemoryStore {
   kvDelete(key: string): void {
     this.assertOpen()
     this.db.prepare('DELETE FROM plugin_kv WHERE key = ?').run(key)
+  }
+
+  /**
+   * Archive the exact text of one oversized tool result (idempotent by ref).
+   * @param record - the archived payload.
+   * @returns `true` when a new row was inserted.
+   */
+  archiveToolResult(record: ToolResultRecord): boolean {
+    this.assertOpen()
+    const info = this.db.prepare(`
+      INSERT OR IGNORE INTO tool_results (ref, tool, call_id, session_id, created_at, chars, text)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.ref,
+      record.tool,
+      record.callId ?? null,
+      record.sessionId ?? null,
+      record.createdAt,
+      record.chars,
+      record.text,
+    )
+    return Number(info.changes) > 0
+  }
+
+  /**
+   * Read an archived tool result by ref.
+   * @param ref - the content-addressed ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getToolResult(ref: string): ToolResultRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM tool_results WHERE ref = ?').get(ref) as ToolResultRow | undefined
+    return row === undefined ? undefined : rowToToolResult(row)
+  }
+
+  /**
+   * Find the newest archived result produced by one tool call.
+   * @param callId - the tool call id.
+   * @returns the record, or `undefined` when the call was never archived.
+   */
+  findToolResultByCallId(callId: string): ToolResultRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM tool_results WHERE call_id = ? ORDER BY created_at DESC LIMIT 1').get(callId) as ToolResultRow | undefined
+    return row === undefined ? undefined : rowToToolResult(row)
+  }
+
+  /**
+   * List archived results, newest first, without their full text.
+   * @param limit - maximum rows to return.
+   * @returns the listing.
+   */
+  listToolResults(limit = 20): ToolResultMeta[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, tool, call_id, session_id, created_at, chars, substr(text, 1, 400) AS preview FROM tool_results ORDER BY created_at DESC LIMIT ?',
+    ).all(limit) as unknown as ToolResultMetaRow[]
+    return rows.map(rowToToolResultMeta)
+  }
+
+  /**
+   * Search archived text by substring (case-insensitive for ASCII).
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings, newest first.
+   */
+  searchToolResults(query: string, limit = 5): ToolResultMeta[] {
+    this.assertOpen()
+    const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
+    const rows = this.db.prepare(
+      `SELECT ref, tool, call_id, session_id, created_at, chars, substr(text, 1, 400) AS preview FROM tool_results WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+    ).all(pattern, limit) as unknown as ToolResultMetaRow[]
+    return rows.map(rowToToolResultMeta)
+  }
+
+  /**
+   * Count archived tool results.
+   * @returns the number of rows.
+   */
+  countToolResults(): number {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM tool_results').get() as { n: number }
+    return row.n
+  }
+
+  /**
+   * Total archived text size in code points.
+   * @returns the summed archived character count.
+   */
+  toolResultChars(): number {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT COALESCE(SUM(chars), 0) AS n FROM tool_results').get() as { n: number }
+    return row.n
+  }
+
+  /**
+   * Delete archived results older than a timestamp.
+   * @param timestamp - epoch milliseconds cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  deleteToolResultsBefore(timestamp: number): number {
+    this.assertOpen()
+    const info = this.db.prepare('DELETE FROM tool_results WHERE created_at < ?').run(timestamp)
+    return Number(info.changes)
+  }
+
+  /**
+   * Keep only the newest N archived results.
+   * @param maxEntries - the number of rows to keep.
+   * @returns the number of deleted rows.
+   */
+  trimToolResults(maxEntries: number): number {
+    this.assertOpen()
+    const info = this.db.prepare(`
+      DELETE FROM tool_results WHERE ref NOT IN (
+        SELECT ref FROM tool_results ORDER BY created_at DESC, ref DESC LIMIT ?
+      )
+    `).run(maxEntries)
+    return Number(info.changes)
   }
 
   private assertOpen(): void {

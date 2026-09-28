@@ -19,6 +19,8 @@ import type {
   MemoryConfig,
   PyramidConfig,
 } from './types.ts'
+import { DEFAULT_TOOL_ARCHIVE_OPTIONS } from './tool-archive.ts'
+import type { ToolArchiveOptions } from './tool-archive.ts'
 
 /** Default per-tier token budgets (matches the design goal: total <= window). */
 export const DEFAULT_BUDGET: BudgetConfig = {
@@ -432,6 +434,24 @@ export interface MemoryCompactionConfig {
   concise_local_mode?: boolean
   /** Local-model conciseness mode: the directive text (defaults to a built-in). */
   concise_local_directive?: string
+  /**
+   * Tool-result archiving (exact-text CCR). Oversized tool results are copied
+   * verbatim into the store and their live surface node is rewritten to a short
+   * stub carrying a ref, so `memory_expand` can hand the full text back later —
+   * including after the built-in (lossy) pruner or a compaction would have
+   * destroyed it. Default true.
+   */
+  tool_archive?: boolean
+  /** Tool-result archiving: code points above which a result is archived. Default 6000. */
+  tool_archive_threshold_chars?: number
+  /** Tool-result archiving: code points kept from the head of the stub. Default 2048. */
+  tool_archive_head_chars?: number
+  /** Tool-result archiving: code points kept from the tail of the stub. Default 1024. */
+  tool_archive_tail_chars?: number
+  /** Tool-result archiving: archived entries retained (newest win). Default 500. */
+  tool_archive_max_entries?: number
+  /** Tool-result archiving: days to retain an archived entry (0 disables). Default 30. */
+  tool_archive_retention_days?: number
 }
 
 /** Schemastery schema for {@link MemoryCompactionConfig} (validates types only). */
@@ -476,6 +496,12 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   rag_surface_dedupe: z.boolean(),
   concise_local_mode: z.boolean(),
   concise_local_directive: z.string(),
+  tool_archive: z.boolean(),
+  tool_archive_threshold_chars: z.number().step(1).min(100),
+  tool_archive_head_chars: z.number().step(1).min(0),
+  tool_archive_tail_chars: z.number().step(1).min(0),
+  tool_archive_max_entries: z.number().step(1).min(1),
+  tool_archive_retention_days: z.number().min(0),
 })
 
 /** Default low-value tool sources excluded from ingestion. */
@@ -490,6 +516,7 @@ export const DEFAULT_INGEST_DENYLIST = [
   'memory_reset',
   'memory_ingest',
   'memory_force_compress',
+  'memory_expand',
   'todo_write',
   'ask_user_question',
   'interrupt_agent',
@@ -528,5 +555,40 @@ export function resolveRetrievalOptions(raw: MemoryCompactionConfig): ResolvedRe
     enabled: retrieval.enabled ?? true,
     topK: raw.rag_top_k ?? retrieval.topK ?? 3,
     minScore: raw.rag_min_score ?? retrieval.minScore ?? DEFAULT_RETRIEVAL_MIN_SCORE,
+  }
+}
+
+/**
+ * Code points reserved for the archive marker inside an archived stub. The
+ * marker carries the ref and a short usage hint and is bounded, so this is a
+ * safe upper bound used to keep `head + marker + tail` under the threshold.
+ */
+const ARCHIVE_MARKER_RESERVE_CHARS = 220
+
+/**
+ * Resolve the tool-result archive policy.
+ * @param raw - the config from cordis.yml.
+ * @returns the resolved policy with defaults applied.
+ */
+export function resolveToolArchiveOptions(raw: MemoryCompactionConfig): ToolArchiveOptions {
+  const thresholdChars = raw.tool_archive_threshold_chars ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.thresholdChars
+  let headChars = raw.tool_archive_head_chars ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.headChars
+  let tailChars = raw.tool_archive_tail_chars ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.tailChars
+  // The kept head and tail must leave room for the marker, or the stub would
+  // not be smaller than the original. Shrink both in proportion when a user
+  // config sets budgets that cannot fit.
+  const budget = Math.max(0, thresholdChars - ARCHIVE_MARKER_RESERVE_CHARS)
+  if (headChars + tailChars > budget) {
+    const scale = headChars + tailChars === 0 ? 0 : budget / (headChars + tailChars)
+    headChars = Math.floor(headChars * scale)
+    tailChars = Math.floor(tailChars * scale)
+  }
+  return {
+    enabled: raw.tool_archive ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.enabled,
+    thresholdChars,
+    headChars,
+    tailChars,
+    maxEntries: raw.tool_archive_max_entries ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.maxEntries,
+    retentionDays: raw.tool_archive_retention_days ?? DEFAULT_TOOL_ARCHIVE_OPTIONS.retentionDays,
   }
 }

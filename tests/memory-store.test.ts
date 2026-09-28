@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterAll, describe, expect, it } from 'vitest'
 import { MemoryStore } from '../src/core.ts'
 import type { MemoryDoc } from '../src/core.ts'
+import type { ToolResultRecord } from '../src/memory-store.ts'
 
 const dirs: string[] = []
 function tempDir(): string {
@@ -195,5 +196,113 @@ describe('MemoryStore', () => {
     expect(store.count()).toBe(1)
     store.close()
     expect(existsSync(file)).toBe(true)
+  })
+})
+
+/**
+ * The tool-result archive backs `memory_expand`: an oversized tool result is
+ * replaced on the transcript by a short stub carrying a content-addressed ref,
+ * and the exact text stays here so it can be handed back verbatim.
+ */
+describe('MemoryStore tool results', () => {
+  function record(overrides: Partial<ToolResultRecord> = {}): ToolResultRecord {
+    return {
+      ref: 'tr_aaaaaaaaaaaa',
+      tool: 'pwsh',
+      createdAt: 1000,
+      chars: 5,
+      text: 'hello',
+      ...overrides,
+    }
+  }
+
+  it('archives idempotently by ref and reads the record back', () => {
+    const store = new MemoryStore(':memory:')
+    const first = record({ callId: 'c1', sessionId: 's1' })
+    expect(store.archiveToolResult(first)).toBe(true)
+    expect(store.archiveToolResult({ ...first, tool: 'other' })).toBe(false)
+    expect(store.getToolResult(first.ref)).toEqual(first)
+    expect(store.getToolResult('tr_missing0000')).toBeUndefined()
+    expect(store.countToolResults()).toBe(1)
+    store.close()
+  })
+
+  it('omits absent optional fields instead of returning nulls', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record())
+    const got = store.getToolResult(record().ref)
+    expect(got).toEqual(record())
+    expect('callId' in (got ?? {})).toBe(false)
+    expect('sessionId' in (got ?? {})).toBe(false)
+    store.close()
+  })
+
+  it('finds the newest archived result of one tool call', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record({ ref: 'tr_old00000000', callId: 'c1', createdAt: 100 }))
+    store.archiveToolResult(record({ ref: 'tr_new00000000', callId: 'c1', createdAt: 300 }))
+    store.archiveToolResult(record({ ref: 'tr_mid00000000', callId: 'c2', createdAt: 200 }))
+    expect(store.findToolResultByCallId('c1')?.ref).toBe('tr_new00000000')
+    expect(store.findToolResultByCallId('c2')?.ref).toBe('tr_mid00000000')
+    expect(store.findToolResultByCallId('c9')).toBeUndefined()
+    store.close()
+  })
+
+  it('lists newest first with a one-line preview and no full text', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record({ ref: 'tr_a0000000000', createdAt: 1, text: 'alpha', chars: 3 }))
+    store.archiveToolResult(record({ ref: 'tr_b0000000000', createdAt: 2, text: 'line one\n\n  line two', chars: 20 }))
+    store.archiveToolResult(record({ ref: 'tr_c0000000000', createdAt: 3, text: 'gamma', chars: 5 }))
+    const rows = store.listToolResults()
+    expect(rows.map(r => r.ref)).toEqual(['tr_c0000000000', 'tr_b0000000000', 'tr_a0000000000'])
+    expect(rows[1]?.preview).toBe('line one line two')
+    expect('text' in (rows[0] ?? {})).toBe(false)
+    expect(store.listToolResults(1).map(r => r.ref)).toEqual(['tr_c0000000000'])
+    expect(store.countToolResults()).toBe(3)
+    expect(store.toolResultChars()).toBe(28)
+    store.close()
+  })
+
+  it('searches case-insensitively and escapes LIKE wildcards', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record({ ref: 'tr_pct00000000', text: 'progress 100% done_b', chars: 20 }))
+    store.archiveToolResult(record({ ref: 'tr_other000000', text: 'HELLO world', chars: 11 }))
+    expect(store.searchToolResults('100%').map(r => r.ref)).toEqual(['tr_pct00000000'])
+    expect(store.searchToolResults('hello').map(r => r.ref)).toEqual(['tr_other000000'])
+    expect(store.searchToolResults('%').map(r => r.ref)).toEqual(['tr_pct00000000'])
+    expect(store.searchToolResults('_b').map(r => r.ref)).toEqual(['tr_pct00000000'])
+    expect(store.searchToolResults('absent')).toEqual([])
+    store.close()
+  })
+
+  it('deletes by age and trims to the newest entries', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record({ ref: 'tr_old00000000', createdAt: 100 }))
+    store.archiveToolResult(record({ ref: 'tr_new00000000', createdAt: 200 }))
+    expect(store.deleteToolResultsBefore(200)).toBe(1)
+    expect(store.listToolResults().map(r => r.ref)).toEqual(['tr_new00000000'])
+    store.archiveToolResult(record({ ref: 'tr_tie_a000000', createdAt: 300 }))
+    store.archiveToolResult(record({ ref: 'tr_tie_b000000', createdAt: 300 }))
+    expect(store.trimToolResults(1)).toBe(2)
+    expect(store.listToolResults().map(r => r.ref)).toEqual(['tr_tie_b000000'])
+    store.close()
+  })
+
+  it('persists archived results across reopen', () => {
+    const file = join(tempDir(), 'archive.db')
+    const store = new MemoryStore(file)
+    store.archiveToolResult(record({ ref: 'tr_keep0000000', callId: 'c7', tool: 'read', text: 'kept text', chars: 9 }))
+    store.close()
+    const reopened = new MemoryStore(file)
+    expect(reopened.getToolResult('tr_keep0000000')?.text).toBe('kept text')
+    expect(reopened.findToolResultByCallId('c7')?.ref).toBe('tr_keep0000000')
+    reopened.close()
+  })
+
+  it('refuses tool-result access after close', () => {
+    const store = new MemoryStore(':memory:')
+    store.close()
+    expect(() => store.countToolResults()).toThrow()
+    expect(() => store.getToolResult('tr_any00000000')).toThrow()
   })
 })

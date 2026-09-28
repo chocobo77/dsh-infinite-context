@@ -168,6 +168,21 @@
         # directive pays for itself within a turn. Injected at most once per
         # surface (re-injected only after compaction drops the previous copy).
         concise_local_mode: true
+        # Tool-result archive (CCR): a tool result larger than the threshold is
+        # stored verbatim under a content-addressed ref (tr_<sha256[0..12)>) and
+        # the surface node becomes a head+ref+tail stub, so the built-in
+        # tool-result-pruner (which drops the middle beyond recovery, and only
+        # when a compaction fires) never has to destroy anything: memory_expand
+        # can hand the full text back. The threshold sits below the pruner's
+        # 8192 so our stub wins. Rewrites only touch nodes appended since the
+        # previous pass (a rebuilt prefix is a provider cache miss); the one
+        # exception is compaction, which rebuilds the prefix anyway.
+        tool_archive: true
+        tool_archive_threshold_chars: 6000
+        tool_archive_head_chars: 2048
+        tool_archive_tail_chars: 1024
+        tool_archive_max_entries: 500
+        tool_archive_retention_days: 30
         rag_ingest_importance: 0.3
         rag_ingest_denylist:
           - memory_search
@@ -180,6 +195,7 @@
           - memory_reset
           - memory_ingest
           - memory_force_compress
+          - memory_expand
           - todo_write
           - ask_user_question
           - interrupt_agent

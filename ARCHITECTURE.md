@@ -246,9 +246,48 @@ scans the current surface for the marker and skips the injection while a copy is
 still present; compaction dropping the copy re-arms it. The check is on surface
 state rather than a turn counter, so it also survives restarts and rewinds.
 
+### 7.3 Tool-result archive (CCR)
+
+DSH ships a `tool-result-pruner` that rewrites a tool result above 8192 chars to
+`head(4096) + "[... tool result middle pruned ...]" + tail(1024)`. The middle is
+gone permanently, there is no read-back path, and it only runs when a compaction
+happens to fire — between two compactions an oversized result sits on the surface
+at full size. The plugin turns that lossy cut into a recoverable one:
+
+- `tools/result` is an observer notification, so `capture()` sees the RAW content
+  before anything prunes it. Payloads above `tool_archive_threshold_chars`
+  (default 6000, deliberately below the pruner threshold of 8192 so our stub wins)
+  are stored verbatim in `tool_results` under a content-addressed
+  `ref = "tr_" + sha256(text)[0..12)`; the same payload archives once, however
+  many times it is produced. Ingestion into the memory pyramid is unchanged.
+- The live node is then replaced by a stub of `tool_archive_head_chars` (2048) + a
+  marker carrying the ref and the original size + `tool_archive_tail_chars` (1024)
+  (`replaceTextMiddle`, which refuses to write a stub that would not shrink the
+  message). The rewrite uses the same surface op the built-in pruner uses:
+  `session.append("tool/result", { ...event.data, message }, { surfaceOp: { op: "replace", startSeq, endSeq }, sourceEventSeqs: [seq] })`.
+- Two rewrite points: `agent/pre-step` (before `next()`, i.e. before the request is
+  built) rewrites only nodes appended since the previous pass, and
+  `compactIfNeeded` rewrites every oversized node FIRST, so our stub lands before
+  the built-in pruner can destroy the middle.
+- The barrier is what keeps this prefix-cache-safe. `lastPassSeq` (a WeakMap keyed
+  by `Session`) records the highest seq seen in the first pass and never rewrites
+  history: a node the provider has already been sent is never rebuilt, because a
+  rebuilt prefix is a cache miss. Rewriting old nodes is acceptable exactly at
+  compaction time, where the prefix was about to be rebuilt anyway.
+- `memory_expand(ref?, query?, offset?, limit?)` is the read path: list or search
+  the archive, page through one stored text by code point (offset/limit), or get
+  ±200-code-point windows around `query` hits.
+
+Retention (`tool_archive_max_entries` = 500, newest win, and
+`tool_archive_retention_days` = 30) is enforced on the next capture. The archive is
+exact text for retrieval, not memory: `tool_results` is never embedded, never
+injected, and `memory_expand` sits on the ingest denylist so reading a 20K result
+back does not re-ingest it.
+
 ---
 
 ## 8. Component / module map
+
 
 | File | Depends on DSH? | Responsibility |
 |---|---|---|
@@ -271,7 +310,8 @@ state rather than a turn counter, so it also survives restarts and rewinds.
 | `src/OutputSanitizer.ts` | no | Tool-result sanitization: per-source strategies for rendered text and `ContentBlock[]` (the automatic `tools/result` path) plus structured JSON objects (web_search/code_exec/generic truncation, the manual ingest path). |
 | `src/VectorRetriever.ts` | yes | RAG ingestion (dedup ×3, size caps, timeout) + budget-aware retrieval + surface-aware de-dup (`normalizeSurfaceText`/`surfaceSegments`/`isMemoryOnSurface`/`buildSurfaceBlob`). |
 | `src/conciseness-mode.ts` | yes | Local-model conciseness directive: marker, default text, `createConciseMessage`, idempotence check `hasConciseDirective`. |
-| `src/tools.ts` | yes | Manual model-callable tools. |
+| `src/tool-archive.ts` | yes | Tool-result archive (CCR): content-addressed `tr_` refs, stub rewriting (`replaceTextMiddle`, append-time + pre-compaction passes with a per-session barrier), retention/cap. |
+| `src/tools.ts` | yes | Manual model-callable tools (incl. `memory_expand`, the archive read path). |
 | `src/core.ts` | no | Barrel re-exporting the dependency-free core. |
 | `src/index.ts` | yes | Package barrel. |
 
@@ -297,7 +337,22 @@ CREATE TABLE memories (
 );
 CREATE INDEX idx_memories_tier   ON memories (tier);
 CREATE INDEX idx_memories_created ON memories (created_at);
+
+CREATE TABLE tool_results (
+  ref        TEXT PRIMARY KEY,          -- "tr_" + sha256(text)[0..12)
+  tool       TEXT NOT NULL,             -- producing tool name
+  call_id    TEXT,                      -- tool-call id of the surface stub
+  session_id TEXT,
+  created_at INTEGER NOT NULL,          -- epoch ms
+  chars      INTEGER NOT NULL,          -- code-point length of text
+  text       TEXT NOT NULL              -- the exact archived payload
+);
+CREATE INDEX idx_tool_results_created ON tool_results (created_at);
+CREATE INDEX idx_tool_results_session ON tool_results (session_id, created_at);
 ```
+
+`memories` is the retrieval corpus; `tool_results` is an exact-text archive (7.3)
+that is never embedded and never retrieved as memory.
 
 Uses Node's built-in `node:sqlite` (`DatabaseSync`), the same medium DSH's own
 `storage-sqlite` backend uses — no native `sqlite3` dependency. Missing parent
@@ -493,3 +548,15 @@ generation. Input metering counts nested tool-result/tool-call payloads
   (and puts it inside a source checkout that reinstalls delete). Relative paths
   therefore resolve below `<DSH_HOME>/storages`, and the store creates its own
   parent directory instead of trusting the caller.
+- **Lossy pruning is made reversible instead of avoided.** Rather than fight the
+  built-in `tool-result-pruner` (which destroys the middle of an oversized result
+  with no read-back path, and only inside a compaction), the plugin archives the
+  exact payload first and leaves a ref-bearing stub behind. The transcript shrinks
+  the same way, but `memory_expand` can hand the text back; the cost is one row per
+  oversized result plus two stub-shaped surface events per rewritten node.
+- **Rewrites stop at the last sent message.** Replacing a surface node invalidates
+  the provider prefix cache, so the archive pass keeps a per-session barrier
+  (`lastPassSeq`) and only touches nodes appended after the previous pass — the
+  first pass records the barrier and rewrites nothing. The single deliberate
+  exception is compaction, which rebuilds the prefix anyway: that is where
+  deferred stubs are flushed, ahead of the built-in pruner.
