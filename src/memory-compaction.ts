@@ -44,18 +44,23 @@ import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import {
   DEFAULT_INGEST_DENYLIST,
   MemoryCompactionConfigSchema,
+  resolveAbsorbOptions,
   resolveRetrievalOptions,
   resolveToolArchiveOptions,
+  resolveUsageOptions,
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
+import { USAGE_KIND, UsageLedger } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import {
   COMPRESS_FAILURE_COOLDOWN,
   decidePressureCompaction,
+  nextGrowthEma,
   shouldCompressHistory,
+  shouldNudgeCompaction,
 } from './compaction-policy.ts'
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
@@ -282,6 +287,10 @@ interface SessionCounter {
   lastCompressedTurn?: number
   /** Estimated tokens observed at the previous check (for surge detection). */
   lastTokens?: number
+  /** Smoothed per-step surface growth (tokens), for the early-compression nudge. */
+  growthEma?: number
+  /** Estimated tokens of the surface at the previous check (growth baseline). */
+  lastSizeTokens?: number
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
 }
@@ -297,6 +306,8 @@ export interface PersistentKV {
 export interface CompressResult {
   messages: readonly Message[]
   tokensSaved: number
+  /** Set when the run was pulled forward by the growth nudge, not the trigger. */
+  readonly nudged?: boolean
 }
 
 /** Options for one {@link HistoryCompressor.compress} call. */
@@ -359,6 +370,11 @@ export class HistoryCompressor {
    * — conversation + plugin overhead — overflows the model window.
    */
   readonly injectionBudget: number
+  /**
+   * Whether the compressor may fire EARLY — before the trigger is crossed —
+   * when the smoothed surface growth says the next step would cross it anyway.
+   */
+  readonly nudge: boolean
 
   constructor(
     ctx: Context,
@@ -369,6 +385,7 @@ export class HistoryCompressor {
     targetRatio = 0.6,
     injectionBudget = 0,
     kv: PersistentKV | null = null,
+    nudge = false,
   ) {
     this.ctx = ctx
     this.config = config
@@ -378,6 +395,7 @@ export class HistoryCompressor {
     this.targetRatio = targetRatio
     this.injectionBudget = injectionBudget
     this.kv = kv
+    this.nudge = nudge
     this.loadPersistedCounters()
   }
 
@@ -539,13 +557,42 @@ export class HistoryCompressor {
     const window = options.window ?? this.ctx.memoryContext.contextWindow
     const beforeTokens = this.estimateMessageTokens(messages)
 
+    // Growth tracking for the early-compression nudge: the distance the
+    // surface travelled since the previous check, smoothed (see nextGrowthEma)
+    // so one unusual step cannot trigger a premature compression.
+    const growthTokens = nextGrowthEma(
+      entry.growthEma,
+      entry.lastSizeTokens === undefined ? 0 : beforeTokens - entry.lastSizeTokens,
+    )
+    entry.growthEma = growthTokens
+    entry.lastSizeTokens = beforeTokens
+
     // Token-pressure trigger with surge bypass and failure cooldown. The
     // plugin's own per-turn RAG injection (spliced in after this check) is
     // reserved up front so the trigger reflects the REAL request size.
     const budget = this.tokenBudget(window)
     const triggerTokens = Math.max(0, Math.floor(budget * this.triggerRatio) - this.injectionBudget)
+    // Early-compression nudge (Strategy 8): if the surface is under the trigger
+    // but its OWN smoothed growth says the next step crosses the trigger,
+    // compressing now costs the same LLM call and lands the request under the
+    // line instead of over it. Fires at most once per turn (see the guard).
+    const nudged = shouldNudgeCompaction({
+      enabled: this.nudge,
+      tokens: beforeTokens,
+      growthTokens,
+      triggerTokens,
+      turn: currentTurn,
+      ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
+      failureCooldown: entry.failureCooldown,
+    })
+    if (nudged && !force) {
+      this.ctx.logger.info(
+        `[ContextGovernor] Compression nudge: ${beforeTokens} tokens now, ~${Math.round(growthTokens)} more by the next step, `
+        + `trigger ${triggerTokens} — compressing one step early`
+      )
+    }
     const verdict = shouldCompressHistory({
-      force,
+      force: force || nudged,
       turn: currentTurn,
       lastCompressedTurn: entry.lastCompressedTurn,
       lastTokens: entry.lastTokens,
@@ -701,7 +748,7 @@ export class HistoryCompressor {
         )
       }
 
-      return { messages: newMessages, tokensSaved: saved }
+      return { messages: newMessages, tokensSaved: saved, ...(nudged && !force ? { nudged: true } : {}) }
     } catch (err) {
       entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
       this.persistCounter(sessionId)
@@ -1098,6 +1145,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * ref-bearing stub left on the surface so `memory_expand` can read it back.
    */
   private readonly toolArchive: ToolResultArchive
+  /**
+   * Context accounting (Strategy 9): what the plugin injected or removed, and
+   * what the provider charged for the request.
+   */
+  private readonly usage: UsageLedger
 
   /**
    * @param ctx - the plugin context.
@@ -1135,6 +1187,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       tool_archive_tail_chars,
       tool_archive_max_entries,
       tool_archive_retention_days,
+      tool_absorb,
+      tool_absorb_min_chars,
+      tool_absorb_max_digest_chars,
+      compress_nudge,
+      usage_ledger,
+      usage_retention_days,
       ...basicConfig
     } = config
     super(ctx, basicConfig as BasicCompactionConfig)
@@ -1174,6 +1232,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         set: (key, value) => ctx.memoryContext.kvSet(key, value),
         delete: (key) => ctx.memoryContext.kvDelete(key),
       },
+      compress_nudge ?? true,
     )
 
     // Initialize the sanitizer config (Strategy 3)
@@ -1203,6 +1262,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // a ref. The built-in pruner deletes the middle of a big result for good;
     // this keeps it retrievable — and fires below the pruner threshold so its
     // lossy marker is not reached first.
+    const archiveOptions = resolveToolArchiveOptions(config)
     this.toolArchive = new ToolResultArchive({
       store: {
         archiveToolResult: record => ctx.memoryContext.archiveToolResult(record),
@@ -1215,9 +1275,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         deleteToolResultsBefore: timestamp => ctx.memoryContext.deleteToolResultsBefore(timestamp),
         trimToolResults: maxEntries => ctx.memoryContext.trimToolResults(maxEntries),
       },
-      options: resolveToolArchiveOptions(config),
+      options: archiveOptions,
       logger: ctx.logger,
       estimateMessage: message => ctx.tokenMeter.estimateMessage(message),
+      // Absorb-style distillation (Strategy 7): the stub carries a digest of
+      // the signal lines instead of a blind head+tail slice. The digest cap is
+      // derived from the archive threshold so the stub always stays under it.
+      absorb: resolveAbsorbOptions(config, archiveOptions.thresholdChars),
     })
 
     // Register back-reference so tools.ts can reach the compressor for force-compress,
@@ -1228,6 +1292,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       sanitizerConfig: this.sanitizerConfig,
     }
     ctx.memoryContext.retriever = { ingest: (text, source) => this.retriever.ingest(text, source) }
+
+    // Context accounting (Strategy 9). Append-only and best-effort: it records
+    // what the plugin injected/removed and what the provider charged, which is
+    // the only way to answer "were those tokens worth it" after the fact.
+    this.usage = new UsageLedger({
+      store: {
+        recordUsageEvent: record => ctx.memoryContext.recordUsageEvent(record),
+        usageTotals: sinceTs => ctx.memoryContext.usageTotals(sinceTs),
+        listUsageEvents: limit => ctx.memoryContext.listUsageEvents(limit),
+        pruneUsageEvents: beforeTs => ctx.memoryContext.pruneUsageEvents(beforeTs),
+      },
+      options: resolveUsageOptions(config),
+      logger: ctx.logger,
+    })
+    ctx.memoryContext.usage = {
+      summary: days => this.usage.summary(days),
+      totals: sinceTs => this.usage.totals(sinceTs),
+      recent: limit => this.usage.recent(limit),
+    }
 
     // Wire Strategy 3 (output sanitization + ingestion): observe every settled
     // tool call and hand its STRUCTURED content blocks to the sanitizer — the
@@ -1243,12 +1326,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Archive the EXACT text first: the stub written into the surface later
       // carries only a ref, and `memory_expand` resolves it long after the
       // sanitizer has reduced this payload to a summary. Best-effort.
-      this.toolArchive.capture(
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const captured = this.toolArchive.capture(
         exec.name,
         exec.callId,
-        exec.agent === undefined ? undefined : String(exec.agent.session.id),
+        sessionId,
         textOfBlocks(result.content),
       )
+      if (captured !== null && captured.digest !== null) {
+        // Absorb: the digest is both the surface stub and a memory, so the
+        // signal lines outlive the stub itself once compaction drops it.
+        this.usage.record(
+          USAGE_KIND.absorbChars,
+          Array.from(captured.digest).length,
+          sessionId === undefined ? {} : { sessionId },
+        )
+        void this.retriever.ingest(captured.digest, exec.name)
+      }
       void this.onToolResult(exec.name, result.content)
     })
 
@@ -1256,6 +1350,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // (Strategy 1) and model-context adoption (G8) — both must keep working
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
+    this.registerUsage(ctx)
 
     // Mid-thinking context guard: wrap the agent's LLM stream and inject a
     // CONTEXT_WINDOW_EXCEEDED finish when input + output-so-far approaches the
@@ -1323,6 +1418,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     try {
       const archived = this.toolArchive.rewriteAllResults(agent.session)
       if (archived.replaced > 0) {
+        this.usage.record(USAGE_KIND.archiveChars, archived.charsRemoved, {
+          sessionId: String(agent.session.id),
+        })
         this.ctx.logger.info(
           `[ContextGovernor] Tool-result archive (pre-compaction): stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars (refs: ${archived.refs.join(', ')})`,
         )
@@ -1619,6 +1717,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       try {
         const archived = this.toolArchive.rewriteNewResults(payload.agent.session)
         if (archived.replaced > 0) {
+          this.usage.record(USAGE_KIND.archiveChars, archived.charsRemoved, {
+            sessionId: String(payload.agent.session.id),
+          })
           ctx.logger.info(
             `[ContextGovernor] Tool-result archive: stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars off the surface (refs: ${archived.refs.join(', ')})`,
           )
@@ -1673,6 +1774,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         )
         if (compressResult !== null) {
           currentMessages = [...compressResult.messages]
+          this.usage.record(USAGE_KIND.compactionSaved, compressResult.tokensSaved, { sessionId })
+          if (compressResult.nudged === true) this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
         }
 
         // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
@@ -1710,6 +1813,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             if (retrieval !== null) {
               injections.push(retrieval.message)
               this.lastInjectedIds.set(session, new Set(retrieval.ids))
+              // Price the injection: tokens actually added to the request, how
+              // many memories that bought, and how many were dropped because
+              // the model could already see them.
+              this.usage.record(
+                USAGE_KIND.injectTokens,
+                estimateTokens(messageText(retrieval.message)),
+                { sessionId },
+              )
+              this.usage.record(USAGE_KIND.injectMemories, retrieval.hitCount, { sessionId })
+              this.usage.record(USAGE_KIND.surfaceSkips, retrieval.skipped, { sessionId })
               ctx.logger.info(
                 `[ContextGovernor] RAG injected: ${retrieval.hitCount} memories for query "${userText.slice(0, 60)}…"`,
               )
@@ -1779,6 +1892,39 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         )
       }
       return decision
+    })
+  }
+
+  /**
+   * Record the provider's own token accounting (Strategy 9).
+   *
+   * DSH's {@link TokenUsage} counts are DISJOINT: `inputTokens` is the
+   * *uncached* input, so the billed input is input + cacheRead + cacheWrite.
+   * They are stored separately (never pre-summed) because summing here would
+   * erase the cache-hit ratio — exactly the signal this accounting exists to
+   * expose. Steps whose adapter reported nothing are simply not counted.
+   *
+   * @param ctx - the plugin context.
+   */
+  private registerUsage(ctx: Context): void {
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'assistant/message') return
+      const usage = event.data.usage
+      if (usage === undefined) return
+      const sessionId = String(session.id)
+      this.usage.record(USAGE_KIND.llmRequests, 1, { sessionId })
+      if (usage.inputTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, { sessionId })
+      }
+      if (usage.outputTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmOutput, usage.outputTokens, { sessionId })
+      }
+      if (usage.cacheReadTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmCacheRead, usage.cacheReadTokens, { sessionId })
+      }
+      if (usage.cacheWriteTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmCacheWrite, usage.cacheWriteTokens, { sessionId })
+      }
     })
   }
 

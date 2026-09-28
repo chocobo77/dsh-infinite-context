@@ -48,7 +48,7 @@ export function apply(ctx: Context) {
 
   ctx.tools.register(defineTool({
     name: 'memory_status',
-    description: 'Report the memory system status: tier counts, budgets, embedder, forgetting policy, and the adopted model context window.',
+    description: 'Report the memory system status: tier counts, budgets, embedder, forgetting policy, the adopted model context window, and the last week of context accounting (injected tokens/memories, surface skips, archived chars, compactions, provider cache hit rate).',
     parameters: {},
     output: {
       schema: { type: 'string' },
@@ -61,6 +61,7 @@ export function apply(ctx: Context) {
         modelContext: ctx.memoryContext.modelInfo
           ?? { contextWindow: ctx.memoryContext.contextWindow, source: 'config' },
         perModelWindows: ctx.memoryContext.perModelWindows(),
+        usage: ctx.memoryContext.usageSummary(7) ?? null,
       }, null, 2)
     },
     presentCall: () => ({ card: 'generic', title: 'Memory status', kind: 'other' }),

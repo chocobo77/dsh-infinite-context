@@ -326,8 +326,11 @@ export class VectorRetriever {
     excludeIds?: ReadonlySet<string>,
     tokenBudget?: number,
     surfaceTexts?: readonly string[],
-  ): Promise<{ message: UserMessage; hitCount: number; ids: string[] } | null> {
+  ): Promise<{ message: UserMessage; hitCount: number; ids: string[]; skipped: number } | null> {
     try {
+      // Memories dropped because the model already reads their text on the
+      // surface; reported to the caller so the usage ledger can price them.
+      let surfaceSkipped = 0
       let timer: NodeJS.Timeout | undefined
       const hits = await Promise.race([
         this.ctx.memoryContext.retrieve(query, this.config.topK, this.config.minScore),
@@ -352,8 +355,9 @@ export class VectorRetriever {
         if (surfaceBlob !== undefined) {
           const kept = fresh.filter(({ doc }) => !isMemoryOnSurface(doc.text, surfaceBlob))
           if (kept.length < fresh.length) {
+            surfaceSkipped = fresh.length - kept.length
             this.ctx.logger.info(
-              `${TAG} surface dedup: skipped ${fresh.length - kept.length}/${fresh.length} memories already in the active context`,
+              `${TAG} surface dedup: skipped ${surfaceSkipped}/${fresh.length} memories already in the active context`,
             )
             fresh = kept
           }
@@ -413,6 +417,7 @@ export class VectorRetriever {
         }),
         hitCount: injectedIds.length,
         ids: injectedIds,
+        skipped: surfaceSkipped,
       }
     } catch (err) {
       this.ctx.logger.warn(

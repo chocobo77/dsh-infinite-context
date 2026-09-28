@@ -44,6 +44,8 @@ export interface ToolResultRecord {
   readonly createdAt: number
   readonly chars: number
   readonly text: string
+  /** Distilled signal lines (see absorb.ts); absent for pre-absorb rows. */
+  readonly digest?: string | undefined
 }
 
 /** A listing view of an archived result: everything but the full text. */
@@ -55,6 +57,36 @@ export interface ToolResultMeta {
   readonly createdAt: number
   readonly chars: number
   readonly preview: string
+  /** Distilled signal lines (see absorb.ts), when the result was absorbed. */
+  readonly digest?: string | undefined
+}
+
+/**
+ * One row of the context-accounting ledger (see usage-ledger.ts): either a
+ * measurement of what the plugin did to the request, or a provider usage count.
+ */
+export interface UsageEventRecord {
+  readonly ts: number
+  readonly kind: string
+  readonly value: number
+  readonly sessionId?: string | undefined
+  readonly detail?: string | undefined
+}
+
+/** Aggregated ledger rows for one kind. */
+export interface UsageTotal {
+  readonly kind: string
+  readonly events: number
+  readonly value: number
+}
+
+/** A ledger row as stored. */
+interface UsageEventRow {
+  ts: number
+  kind: string
+  value: number
+  session_id: string | null
+  detail: string | null
 }
 
 interface MemoryRow {
@@ -79,6 +111,7 @@ interface ToolResultRow {
   created_at: number
   chars: number
   text: string
+  digest: string | null
 }
 
 interface ToolResultMetaRow {
@@ -89,6 +122,7 @@ interface ToolResultMetaRow {
   created_at: number
   chars: number
   preview: string | null
+  digest: string | null
 }
 
 /** Collapse a preview blob to one short line. */
@@ -105,6 +139,7 @@ function rowToToolResult(row: ToolResultRow): ToolResultRecord {
     createdAt: row.created_at,
     chars: row.chars,
     text: row.text,
+    ...(row.digest !== null ? { digest: row.digest } : {}),
   }
 }
 
@@ -117,6 +152,7 @@ function rowToToolResultMeta(row: ToolResultMetaRow): ToolResultMeta {
     createdAt: row.created_at,
     chars: row.chars,
     preview: previewOf(row.preview),
+    ...(row.digest !== null ? { digest: row.digest } : {}),
   }
 }
 
@@ -194,11 +230,32 @@ export class MemoryStore {
         session_id TEXT,
         created_at INTEGER NOT NULL,
         chars      INTEGER NOT NULL,
-        text       TEXT NOT NULL
+        text       TEXT NOT NULL,
+        digest     TEXT
       )
     `)
+    // Same idempotent migration guard as `memories.kind`: stores created before
+    // the absorb digest existed gain the column instead of failing on INSERT.
+    const toolColumns = this.db.prepare('PRAGMA table_info(tool_results)').all() as { name: string }[]
+    if (!toolColumns.some(col => col.name === 'digest')) {
+      this.db.exec('ALTER TABLE tool_results ADD COLUMN digest TEXT')
+    }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_created ON tool_results (created_at)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results (session_id, created_at)')
+    // Context-accounting ledger (see usage-ledger.ts): append-only, pruned by
+    // age, and never read by retrieval. One row per measurement.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS usage_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         INTEGER NOT NULL,
+        kind       TEXT NOT NULL,
+        value      INTEGER NOT NULL,
+        session_id TEXT,
+        detail     TEXT
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_kind ON usage_events (kind, ts)')
   }
 
   /**
@@ -242,8 +299,8 @@ export class MemoryStore {
   archiveToolResult(record: ToolResultRecord): boolean {
     this.assertOpen()
     const info = this.db.prepare(`
-      INSERT OR IGNORE INTO tool_results (ref, tool, call_id, session_id, created_at, chars, text)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO tool_results (ref, tool, call_id, session_id, created_at, chars, text, digest)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.ref,
       record.tool,
@@ -252,8 +309,17 @@ export class MemoryStore {
       record.createdAt,
       record.chars,
       record.text,
+      record.digest ?? null,
     )
-    return Number(info.changes) > 0
+    if (Number(info.changes) > 0) return true
+    // The row already exists (content-addressed). Backfill a digest computed
+    // on a later rewrite, but never overwrite one that is already there.
+    if (record.digest !== undefined && record.digest.length > 0) {
+      this.db.prepare(
+        `UPDATE tool_results SET digest = ? WHERE ref = ? AND (digest IS NULL OR digest = '')`,
+      ).run(record.digest, record.ref)
+    }
+    return false
   }
 
   /**
@@ -286,7 +352,7 @@ export class MemoryStore {
   listToolResults(limit = 20): ToolResultMeta[] {
     this.assertOpen()
     const rows = this.db.prepare(
-      'SELECT ref, tool, call_id, session_id, created_at, chars, substr(text, 1, 400) AS preview FROM tool_results ORDER BY created_at DESC LIMIT ?',
+      'SELECT ref, tool, call_id, session_id, created_at, chars, digest, substr(text, 1, 400) AS preview FROM tool_results ORDER BY created_at DESC LIMIT ?',
     ).all(limit) as unknown as ToolResultMetaRow[]
     return rows.map(rowToToolResultMeta)
   }
@@ -301,7 +367,7 @@ export class MemoryStore {
     this.assertOpen()
     const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
     const rows = this.db.prepare(
-      `SELECT ref, tool, call_id, session_id, created_at, chars, substr(text, 1, 400) AS preview FROM tool_results WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+      `SELECT ref, tool, call_id, session_id, created_at, chars, digest, substr(text, 1, 400) AS preview FROM tool_results WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
     ).all(pattern, limit) as unknown as ToolResultMetaRow[]
     return rows.map(rowToToolResultMeta)
   }
@@ -349,6 +415,70 @@ export class MemoryStore {
         SELECT ref FROM tool_results ORDER BY created_at DESC, ref DESC LIMIT ?
       )
     `).run(maxEntries)
+    return Number(info.changes)
+  }
+
+  /**
+   * Append one ledger measurement.
+   * @param record - the event to store.
+   */
+  recordUsageEvent(record: UsageEventRecord): void {
+    this.assertOpen()
+    this.db.prepare(
+      'INSERT INTO usage_events (ts, kind, value, session_id, detail) VALUES (?, ?, ?, ?, ?)',
+    ).run(
+      record.ts,
+      record.kind,
+      record.value,
+      record.sessionId ?? null,
+      record.detail ?? null,
+    )
+  }
+
+  /**
+   * Sum ledger values per kind.
+   * @param sinceTs - epoch-millisecond lower bound (inclusive); omit for all time.
+   * @returns one row per kind, ordered by kind.
+   */
+  usageTotals(sinceTs?: number): UsageTotal[] {
+    this.assertOpen()
+    const rows = sinceTs === undefined
+      ? this.db.prepare('SELECT kind, COUNT(*) AS events, SUM(value) AS value FROM usage_events GROUP BY kind ORDER BY kind').all()
+      : this.db.prepare('SELECT kind, COUNT(*) AS events, SUM(value) AS value FROM usage_events WHERE ts >= ? GROUP BY kind ORDER BY kind').all(sinceTs)
+    return (rows as unknown as { kind: string; events: number; value: number }[]).map(row => ({
+      kind: row.kind,
+      events: Number(row.events),
+      value: Number(row.value),
+    }))
+  }
+
+  /**
+   * Read the newest ledger events.
+   * @param limit - maximum rows.
+   * @returns the events, newest first.
+   */
+  listUsageEvents(limit = 20): UsageEventRecord[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ts, kind, value, session_id, detail FROM usage_events ORDER BY id DESC LIMIT ?',
+    ).all(limit) as unknown as UsageEventRow[]
+    return rows.map(row => ({
+      ts: row.ts,
+      kind: row.kind,
+      value: row.value,
+      ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+      ...(row.detail === null ? {} : { detail: row.detail }),
+    }))
+  }
+
+  /**
+   * Delete ledger events older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneUsageEvents(beforeTs: number): number {
+    this.assertOpen()
+    const info = this.db.prepare('DELETE FROM usage_events WHERE ts < ?').run(beforeTs)
     return Number(info.changes)
   }
 

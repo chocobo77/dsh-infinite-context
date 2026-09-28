@@ -27,6 +27,8 @@ import type { Session, SessionEvent, SessionSeq, ToolResultMessage } from '@deep
 // Type-only: the `compaction/*` SessionEventMap merge (the shadow-price event).
 import type {} from '@deepseek-ai/dsh-compaction'
 import type { ToolResultMeta, ToolResultRecord } from './memory-store.ts'
+import { DEFAULT_ABSORB_OPTIONS, buildDigest } from './absorb.ts'
+import type { AbsorbOptions } from './absorb.ts'
 
 /**
  * The store surface the archive needs. `MemoryContext` mirrors these methods,
@@ -185,9 +187,12 @@ export interface ArchiveRewriteResult {
 
 /** One archived copy. */
 export interface ArchiveCaptureResult {
-  readonly ref: string
+  /** Content-addressed ref; absent when the payload was distilled but not archived. */
+  readonly ref?: string | undefined
   readonly chars: number
   readonly inserted: boolean
+  /** Distilled signal lines (see absorb.ts), or null when not distilled. */
+  readonly digest: string | null
 }
 
 /** Archive size summary. */
@@ -212,6 +217,52 @@ export interface ToolResultArchiveDeps {
   readonly estimateMessage: (message: ToolResultMessage) => number
   /** Clock, injectable for tests; defaults to Date.now. */
   readonly now?: () => number
+  /** Absorb-style distillation policy (defaults to DEFAULT_ABSORB_OPTIONS). */
+  readonly absorb?: AbsorbOptions
+}
+
+/**
+ * The stub that stands in for an absorbed result: the digest, plus the
+ * read-back hint. Bounded by the digest cap, so it stays under the archive
+ * threshold and the built-in pruner never touches it.
+ * @param ref - the archive ref.
+ * @param digest - the distilled signal lines.
+ * @param chars - the size of the text it replaced, in code points.
+ * @returns the stub text.
+ */
+export function digestStub(ref: string, digest: string, chars: number): string {
+  return digest + '\n\n[... ' + chars + ' chars absorbed and archived as ' + ref
+    + ' \u2014 call memory_expand {"ref":"' + ref + '"} for the full text ...]'
+}
+
+/**
+ * Replace every text block of `blocks` with one stub, keeping non-text blocks
+ * (images) where they were.
+ * @param blocks - original tool-result content.
+ * @param stub - the replacement stub text.
+ * @returns the rewritten content, or `null` when nothing should be replaced.
+ */
+export function replaceTextWithStub(
+  blocks: readonly ContentBlock[],
+  stub: string,
+): ContentBlock[] | null {
+  const totalChars = measureContent(blocks)
+  const rewritten: ContentBlock[] = []
+  let replaced = false
+  for (const block of blocks) {
+    if (block.type !== 'text') {
+      rewritten.push(block)
+      continue
+    }
+    // Later text blocks (a separate content part of the same result) are
+    // folded into the digest, so they are dropped rather than duplicated.
+    if (replaced) continue
+    rewritten.push({ ...block, text: stub })
+    replaced = true
+  }
+  if (!replaced) return null
+  if (measureContent(rewritten) >= totalChars) return null
+  return rewritten
 }
 
 const EMPTY_RESULT: ArchiveRewriteResult = { replaced: 0, charsRemoved: 0, refs: [] }
@@ -225,6 +276,7 @@ export class ToolResultArchive {
   private readonly logger: ToolArchiveLogger
   private readonly estimateMessage: (message: ToolResultMessage) => number
   private readonly now: () => number
+  private readonly absorbOptions: AbsorbOptions
   /**
    * Highest surface seq already passed over, per session. This is the cache
    * barrier: nodes at or below it belong to a request prefix already sent.
@@ -240,6 +292,7 @@ export class ToolResultArchive {
     this.logger = deps.logger
     this.estimateMessage = deps.estimateMessage
     this.now = deps.now ?? (() => Date.now())
+    this.absorbOptions = deps.absorb ?? DEFAULT_ABSORB_OPTIONS
   }
 
   /** Whether archiving is on. */
@@ -259,7 +312,7 @@ export class ToolResultArchive {
    * @param callId - the tool call id, when known.
    * @param sessionId - the owning session id, when known.
    * @param text - the exact result text.
-   * @returns the archived ref, or `null` when nothing was archived.
+   * @returns the archive ref, or `null` when nothing was archived.
    */
   capture(
     tool: string,
@@ -269,7 +322,13 @@ export class ToolResultArchive {
   ): ArchiveCaptureResult | null {
     if (!this.options.enabled) return null
     const chars = measureChars(text)
-    if (chars <= this.options.thresholdChars) return null
+    // The digest is computed before the archive gate so a result that is worth
+    // distilling but sits just under the archive threshold still contributes
+    // its signal lines (to the stub policy and to the caller).
+    const digest = buildDigest(tool, text, this.absorbOptions)
+    if (chars <= this.options.thresholdChars) {
+      return digest === null ? null : { chars, inserted: false, digest }
+    }
     const ref = archiveRef(text)
     try {
       const inserted = this.store.archiveToolResult({
@@ -280,9 +339,10 @@ export class ToolResultArchive {
         createdAt: this.now(),
         chars,
         text,
+        ...(digest === null ? {} : { digest }),
       })
       this.enforceRetention()
-      return { ref, chars, inserted }
+      return { ref, chars, inserted, digest }
     } catch (error) {
       this.logger.warn('tool archive: store failed for ' + ref + ': ' + reasonOf(error))
       return null
@@ -411,10 +471,19 @@ export class ToolResultArchive {
       if (charsBefore <= this.options.thresholdChars) continue
       const callId = original.source?.callId
       const known = callId === undefined ? undefined : this.safeFindByCallId(callId)
-      const ref = known?.ref
-        ?? this.capture(known?.tool ?? 'unknown', callId, String(session.id), text)?.ref
-        ?? archiveRef(text)
-      const content = replaceTextMiddle(original.content, archiveMarker(ref, charsBefore), this.options)
+      const tool = known?.tool ?? 'unknown'
+      const captured = known === undefined
+        ? this.capture(tool, callId, String(session.id), text)
+        : undefined
+      const ref = known?.ref ?? captured?.ref ?? archiveRef(text)
+      // Absorb first: a digest of the signal lines (errors, counts, paths) is
+      // far more useful than a blind head+tail slice, is bounded well below the
+      // threshold, and is what the model sees instead of the payload. Fall back
+      // to head+tail when the payload has no extractable signal.
+      const digest = known?.digest ?? captured?.digest ?? buildDigest(tool, text, this.absorbOptions)
+      const content = digest !== null && digest !== undefined
+        ? replaceTextWithStub(original.content, digestStub(ref, digest, charsBefore))
+        : replaceTextMiddle(original.content, archiveMarker(ref, charsBefore), this.options)
       if (content === null) continue
       const charsAfter = measureContent(content)
       const message = freezeMessage<ToolResultMessage>({ ...original, content })
