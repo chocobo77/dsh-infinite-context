@@ -22,7 +22,7 @@ import {
 } from './config.ts'
 import { createEmbedder, type Embedder } from './embedder.ts'
 import { VectorIndex } from './vector-index.ts'
-import { MemoryStore } from './memory-store.ts'
+import { MemoryStore, type ToolResultMeta, type ToolResultRecord } from './memory-store.ts'
 import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
 import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type SummarizationTarget } from './memory-engine.ts'
@@ -354,6 +354,89 @@ export class MemoryContext extends Service {
   kvDelete(key: string): void {
     this.requireEngine()
     this.store?.kvDelete(key)
+  }
+
+  /**
+   * Archive one oversized tool result verbatim (tool-result CCR).
+   * @param record - the archived payload (content-addressed by ref).
+   * @returns true when a new row was inserted.
+   */
+  archiveToolResult(record: ToolResultRecord): boolean {
+    this.requireEngine()
+    return this.store?.archiveToolResult(record) ?? false
+  }
+
+  /**
+   * Read an archived tool result back by ref.
+   * @param ref - the archive ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getToolResult(ref: string): ToolResultRecord | undefined {
+    this.requireEngine()
+    return this.store?.getToolResult(ref)
+  }
+
+  /**
+   * Find the newest archived result for one tool call.
+   * @param callId - the tool call id.
+   * @returns the record, or `undefined` when the call was never archived.
+   */
+  findToolResultByCallId(callId: string): ToolResultRecord | undefined {
+    this.requireEngine()
+    return this.store?.findToolResultByCallId(callId)
+  }
+
+  /**
+   * List archived tool results, newest first, without their full text.
+   * @param limit - maximum rows to return.
+   * @returns the listing.
+   */
+  listToolResults(limit?: number): ToolResultMeta[] {
+    this.requireEngine()
+    return this.store?.listToolResults(limit) ?? []
+  }
+
+  /**
+   * Search archived tool-result text by substring.
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings.
+   */
+  searchToolResults(query: string, limit?: number): ToolResultMeta[] {
+    this.requireEngine()
+    return this.store?.searchToolResults(query, limit) ?? []
+  }
+
+  /** @returns the number of archived tool results. */
+  countToolResults(): number {
+    this.requireEngine()
+    return this.store?.countToolResults() ?? 0
+  }
+
+  /** @returns the total archived text size in code points. */
+  toolResultChars(): number {
+    this.requireEngine()
+    return this.store?.toolResultChars() ?? 0
+  }
+
+  /**
+   * Delete archived tool results older than a timestamp.
+   * @param timestamp - epoch milliseconds cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  deleteToolResultsBefore(timestamp: number): number {
+    this.requireEngine()
+    return this.store?.deleteToolResultsBefore(timestamp) ?? 0
+  }
+
+  /**
+   * Keep only the newest N archived tool results.
+   * @param maxEntries - the number of rows to keep.
+   * @returns the number of deleted rows.
+   */
+  trimToolResults(maxEntries: number): number {
+    this.requireEngine()
+    return this.store?.trimToolResults(maxEntries) ?? 0
   }
 
   /** Run a forgetting sweep. */

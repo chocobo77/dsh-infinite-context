@@ -45,9 +45,11 @@ import {
   DEFAULT_INGEST_DENYLIST,
   MemoryCompactionConfigSchema,
   resolveRetrievalOptions,
+  resolveToolArchiveOptions,
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
+import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import {
@@ -1091,6 +1093,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly conciseLocalMode: boolean
   /** Text of the local-model conciseness directive. */
   private readonly conciseLocalDirective: string
+  /**
+   * Oversized tool-result archive: exact text kept in the store, with a short
+   * ref-bearing stub left on the surface so `memory_expand` can read it back.
+   */
+  private readonly toolArchive: ToolResultArchive
 
   /**
    * @param ctx - the plugin context.
@@ -1122,6 +1129,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       rag_surface_dedupe,
       concise_local_mode,
       concise_local_directive,
+      tool_archive,
+      tool_archive_threshold_chars,
+      tool_archive_head_chars,
+      tool_archive_tail_chars,
+      tool_archive_max_entries,
+      tool_archive_retention_days,
       ...basicConfig
     } = config
     super(ctx, basicConfig as BasicCompactionConfig)
@@ -1185,6 +1198,28 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     this.retriever = new VectorRetriever(ctx, retrieverConfig)
 
+    // Tool-result archive (exact-text CCR): oversized tool results are copied
+    // verbatim into the store and their surface node becomes a small stub with
+    // a ref. The built-in pruner deletes the middle of a big result for good;
+    // this keeps it retrievable — and fires below the pruner threshold so its
+    // lossy marker is not reached first.
+    this.toolArchive = new ToolResultArchive({
+      store: {
+        archiveToolResult: record => ctx.memoryContext.archiveToolResult(record),
+        getToolResult: ref => ctx.memoryContext.getToolResult(ref),
+        findToolResultByCallId: callId => ctx.memoryContext.findToolResultByCallId(callId),
+        listToolResults: limit => ctx.memoryContext.listToolResults(limit),
+        searchToolResults: (query, limit) => ctx.memoryContext.searchToolResults(query, limit),
+        countToolResults: () => ctx.memoryContext.countToolResults(),
+        toolResultChars: () => ctx.memoryContext.toolResultChars(),
+        deleteToolResultsBefore: timestamp => ctx.memoryContext.deleteToolResultsBefore(timestamp),
+        trimToolResults: maxEntries => ctx.memoryContext.trimToolResults(maxEntries),
+      },
+      options: resolveToolArchiveOptions(config),
+      logger: ctx.logger,
+      estimateMessage: message => ctx.tokenMeter.estimateMessage(message),
+    })
+
     // Register back-reference so tools.ts can reach the compressor for force-compress,
     // reuse the configured retriever for ingestion (single config source), and
     // reuse the configured sanitizer cap instead of a hard-coded one.
@@ -1205,6 +1240,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         block => block.type === 'text' && block.text.trim().length > 0,
       )
       if (!hasText) return
+      // Archive the EXACT text first: the stub written into the surface later
+      // carries only a ref, and `memory_expand` resolves it long after the
+      // sanitizer has reduced this payload to a summary. Best-effort.
+      this.toolArchive.capture(
+        exec.name,
+        exec.callId,
+        exec.agent === undefined ? undefined : String(exec.agent.session.id),
+        textOfBlocks(result.content),
+      )
       void this.onToolResult(exec.name, result.content)
     })
 
@@ -1269,6 +1313,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     trigger: CompactionTrigger,
     signal: AbortSignal,
   ): Promise<CompactionResult | null> {
+    // --- Tool-result archive (exact-text CCR) ---
+    // A compaction is about to rewrite the request prefix anyway, so this is
+    // the cheap moment for a FULL-surface pass: stub every oversized result
+    // BEFORE the base policy runs, so the built-in pruner (which deletes the
+    // middle for good) has nothing left to prune, and results that predate this
+    // plugin instance become retrievable too. Repeat calls are no-ops once the
+    // oversized nodes are stubs, so this never invalidates a prefix twice.
+    try {
+      const archived = this.toolArchive.rewriteAllResults(agent.session)
+      if (archived.replaced > 0) {
+        this.ctx.logger.info(
+          `[ContextGovernor] Tool-result archive (pre-compaction): stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars (refs: ${archived.refs.join(', ')})`,
+        )
+      }
+    } catch (error) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Tool-result archive full pass failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
     if (trigger === 'pressure' && this.dynamicThreshold && !signal.aborted) {
       const handled = await this.forceNarrowedPressure(agent, signal)
       if (handled !== undefined) return handled
@@ -1545,6 +1608,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Periodic cleanup of stale session counters + stale forced-pressure marks
       this.compressor.cleanupStale()
       this.cleanupStaleForceMarks()
+
+      // --- Tool-result archive (exact-text CCR) ---
+      // Stub oversized tool results that appeared since the last pass BEFORE the
+      // request for this step is assembled, so the model reads a ref instead of
+      // the payload and `memory_expand` can hand the full text back later. The
+      // pass is cache-safe: it only touches nodes appended after the previous
+      // barrier, never a request prefix that was already sent. Isolated so a
+      // failed rewrite cannot block compression or retrieval.
+      try {
+        const archived = this.toolArchive.rewriteNewResults(payload.agent.session)
+        if (archived.replaced > 0) {
+          ctx.logger.info(
+            `[ContextGovernor] Tool-result archive: stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars off the surface (refs: ${archived.refs.join(', ')})`,
+          )
+        }
+      } catch (error) {
+        ctx.logger.warn(
+          `[ContextGovernor] Tool-result archive rewrite failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
 
       const decision = await next()
       if (payload.signal.aborted || decision.kind !== 'enter' || decision.messages.length === 0) {
