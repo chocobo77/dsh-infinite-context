@@ -41,6 +41,35 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only: brings the `ctx.tokenMeter` service declaration into scope.
 import type {} from '@deepseek-ai/dsh-token-meter'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+
+/**
+ * compaction-basic 0.2.0 起对 BasicCompactionConfig 做「拒绝未知键」的严格校验
+ * （validateKeys），而插件自有键经 rest-spread 全量进入 basicConfig，新加插件键
+ * （如 fold_ranges）会直接导致插件加载失败。构造引擎前按 0.2.0 的公开键集做
+ * 白名单转发：插件键静默留在插件侧，运行时不认识的键也不会再炸。
+ */
+const BASIC_COMPACT_PUBLIC_KEYS: ReadonlySet<string> = new Set([
+  'thresholdRatio',
+  'headroomTokens',
+  'retainRatio',
+  'retainTokens',
+  'summarizationProvider',
+  'summarizationModel',
+  'maxTokens',
+  'compactionRetries',
+  'maxOverflowRetries',
+  'modelPolicies',
+  'auto',
+])
+
+function pickBasicCompactionKeys(raw: Record<string, unknown>): BasicCompactionConfig {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (BASIC_COMPACT_PUBLIC_KEYS.has(key)) out[key] = value
+  }
+  return out as BasicCompactionConfig
+}
+
 import {
   DEFAULT_INGEST_DENYLIST,
   MemoryCompactionConfigSchema,
@@ -1269,7 +1298,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       usage_retention_days,
       ...basicConfig
     } = config
-    super(ctx, basicConfig as BasicCompactionConfig)
+    super(ctx, pickBasicCompactionKeys(basicConfig))
     this.retrieval = resolveRetrievalOptions(config)
 
     // Provide the pyramid-consolidation summarizer to the memory context.
