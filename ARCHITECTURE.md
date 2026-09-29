@@ -349,7 +349,37 @@ rows per kind and computes `cacheRead / (input + cacheRead + cacheWrite)`
 (`memory_status` prints it); `record` silently ignores disabled, non-finite and
 zero values, every store failure is logged and swallowed (metering never breaks a
 turn), retention (`usage_retention_days`, default 30, 0 disables) is enforced every
-256 writes, and `usage_events` is drained oldest-first.
+256 writes, and `usage_events` is drained oldest-first. Each LLM record also
+lends its `detail` column to the model id (`provider/model`, resolved through
+`memoryContext.modelInfo`), so `summary(days).models` and `memory_status`'s
+`usage.models` break the ledger down per model — the upstream MODEL SWITCHES
+view — while per-kind totals stay unchanged.
+
+---
+
+### 7.7 Reversible compaction (`fold_ranges`)
+
+Compression is only safe to run if what it folds away stays recoverable. Before
+the fold takes effect, `HistoryCompressor` serializes the exact messages being
+folded (the same serialization the summarizer sees, plus code points and a
+token estimate) into `folded_ranges` and mints a `fl_…` ref (12 random hex
+chars). The header prepended to the summary (src/fold-archive.ts
+`foldedRangeHeader`) reports the message count and char count and names the ref,
+so the summary block tells the model the exact messages are archived and how to
+read them back; when no ref can be minted the header degrades to the plain
+"details preserved below" form instead of promising a broken lookup.
+`memory_expand ref=fl_…` restores the full serialized text and marks the row
+restored, `memory_search` appends keyword hits inside folded history, and
+`memory_status`'s `foldedRanges` reports count/chars/tokens plus the most recent
+entries. Retention is bounded twice over (`fold_range_retention_days`, default 30,
+0 keeps; `fold_range_max_entries`, default 300, trimmed oldest-first), both
+enforced on every archive. This is the engine-layer equivalent of upstream
+billion-context's `decompress` (docs/billion-context/ABSORPTION.md): the read-back
+path is a tool call, not a surface rewrite — re-splicing old messages into the
+live transcript would invalidate the prefix cache and unbalance tool-call/result
+ranges, which the archive deliberately never touches. A compression whose output
+is later rejected may leave one unused archive row; it is storage-only and stays
+under the two retention bounds.
 
 ---
 
@@ -362,9 +392,10 @@ turn), retention (`usage_retention_days`, default 30, 0 disables) is enforced ev
 | `src/embedder.ts` | no | `Embedder` interface, `LightweightEmbedder`, cosine/normalize helpers. |
 | `src/transformers-embedder.ts` | no | Optional `TransformersEmbedder` (all-MiniLM-L6-v2). |
 | `src/vector-index.ts` | no | `VectorIndex` (top-K cosine search). |
-| `src/memory-store.ts` | no | SQLite (`node:sqlite`) persistence of `MemoryDoc`, the `tool_results` archive (+`digest`) and the `usage_events` ledger. |
+| `src/memory-store.ts` | no | SQLite (`node:sqlite`) persistence of `MemoryDoc`, the `tool_results` archive (+`digest`), the `folded_ranges` reversible-compaction archive and the `usage_events` ledger. |
 | `src/absorb.ts` | no | Immediate distillation: `buildDigest` signal-line extraction (errors/counts/diff stats/paths + head/tail), line clipping, digest cap. |
-| `src/usage-ledger.ts` | no | Context accounting: `UsageLedger.record`/`totals`/`recent`/`prune`/`summary`, disjoint provider-usage folding, cache-hit rate. |
+| `src/usage-ledger.ts` | no | Context accounting: `UsageLedger.record`/`totals`/`recent`/`prune`/`summary`, disjoint provider-usage folding, per-model attribution (`detail = provider/model`), cache-hit rate. |
+| `src/fold-archive.ts` | no | Reversible compaction: `foldedRangeHeader` (ref-bearing fold header with graceful degradation) plus `FoldOptions`/`DEFAULT_FOLD_OPTIONS` resolution. |
 | `src/token-budget.ts` | no | `TokenBudget`, CJK-aware `estimateTokens` + content-block metering (`estimateContentTokens`: nested tool-result/tool-call payloads, capped). |
 | `src/forgetting.ts` | no | `ForgettingPolicy`, scoring. |
 | `src/memory-engine.ts` | no | Orchestration: store/embed/retrieve/consolidate/forget/status. |
@@ -420,6 +451,20 @@ CREATE TABLE tool_results (
 CREATE INDEX idx_tool_results_created ON tool_results (created_at);
 CREATE INDEX idx_tool_results_session ON tool_results (session_id, created_at);
 
+CREATE TABLE folded_ranges (
+  ref            TEXT PRIMARY KEY,       -- "fl_" + 12 random hex chars (7.7)
+  ts             INTEGER NOT NULL,       -- epoch ms
+  session_id     TEXT,
+  messages       INTEGER NOT NULL,       -- folded message count
+  chars          INTEGER NOT NULL,       -- code points of the serialized text
+  tokens         INTEGER NOT NULL,       -- CJK-aware estimate at fold time
+  summary        TEXT NOT NULL,          -- the summary the fold produced
+  original       TEXT NOT NULL,          -- the exact serialized messages
+  restored_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_folded_ranges_ts      ON folded_ranges (ts);
+CREATE INDEX idx_folded_ranges_session ON folded_ranges (session_id, ts);
+
 CREATE TABLE usage_events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,          -- epoch ms
@@ -435,7 +480,9 @@ CREATE INDEX idx_usage_events_kind ON usage_events (kind, ts);
 `memories` is the retrieval corpus; `tool_results` is an exact-text archive (7.3)
 that is never embedded and never retrieved as memory; `usage_events` is the
 append-only ledger behind `memory_status`'s context accounting (7.6) and is pruned
-by time rather than capped by entry count.
+by time rather than capped by entry count; `folded_ranges` is the reversible
+compaction archive (7.7): exact folded text, ref-addressable, bounded by age and
+entry count.
 
 Uses Node's built-in `node:sqlite` (`DatabaseSync`), the same medium DSH's own
 `storage-sqlite` backend uses — no native `sqlite3` dependency. Missing parent
@@ -661,3 +708,12 @@ generation. Input metering counts nested tool-result/tool-call payloads
   `input + cacheRead + cacheWrite`. Collapsing them into one number would erase the
   cache hit rate — the most useful single signal for judging whether injection and
   prefix-preserving rewrites are actually paying off.
+- **Reversible compaction archives instead of re-splicing.** Every fold keeps its
+  exact folded messages under a `fl_…` ref before the summary replaces them — the
+  engine-layer equivalent of upstream billion-context's `decompress`. Read-back is
+  a tool call (`memory_expand`), never a surface rewrite: re-inserting old
+  messages would invalidate the prefix cache and unbalance tool-call/result
+  ranges, while an archive row is lossless, bounded by retention, and invisible to
+  the transcript. The upstream feature set is tracked in docs/billion-context/
+  (UPSTREAM.md as the long-term follow-up target, ABSORPTION.md for per-feature
+  conflicts and decisions).

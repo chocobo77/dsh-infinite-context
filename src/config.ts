@@ -23,6 +23,8 @@ import { DEFAULT_TOOL_ARCHIVE_OPTIONS } from './tool-archive.ts'
 import type { ToolArchiveOptions } from './tool-archive.ts'
 import { DEFAULT_ABSORB_OPTIONS } from './absorb.ts'
 import type { AbsorbOptions } from './absorb.ts'
+import { DEFAULT_FOLD_OPTIONS } from './fold-archive.ts'
+import type { FoldOptions } from './fold-archive.ts'
 import { DEFAULT_USAGE_OPTIONS } from './usage-ledger.ts'
 import type { UsageOptions } from './usage-ledger.ts'
 
@@ -475,6 +477,16 @@ export interface MemoryCompactionConfig {
   usage_ledger?: boolean
   /** Ledger: days of events to keep (0 disables pruning). Default 30. */
   usage_retention_days?: number
+  /**
+   * Reverse compaction (see fold-archive.ts): before a compression replaces a
+   * range with a summary, the exact messages are archived so `memory_expand`
+   * can read them back. Turning this off makes compaction lossy. Default true.
+   */
+  fold_ranges?: boolean
+  /** Folded-range archive: days to retain a range (0 disables age pruning). Default 30. */
+  fold_range_retention_days?: number
+  /** Folded-range archive: newest entries kept. Default 300. */
+  fold_range_max_entries?: number
 }
 
 /** Schemastery schema for {@link MemoryCompactionConfig} (validates types only). */
@@ -531,6 +543,9 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   compress_nudge: z.boolean(),
   usage_ledger: z.boolean(),
   usage_retention_days: z.number().min(0),
+  fold_ranges: z.boolean(),
+  fold_range_retention_days: z.number().min(0),
+  fold_range_max_entries: z.number().step(1).min(1),
 })
 
 /** Default low-value tool sources excluded from ingestion. */
@@ -657,6 +672,19 @@ export function resolveAbsorbOptions(
  * @param raw - the config from cordis.yml.
  * @returns the resolved policy with defaults applied.
  */
+/**
+ * Resolve the folded-range (reverse-compaction) archive policy.
+ * @param raw - the config from cordis.yml.
+ * @returns the resolved policy with defaults applied.
+ */
+export function resolveFoldOptions(raw: MemoryCompactionConfig): FoldOptions {
+  return {
+    enabled: raw.fold_ranges ?? DEFAULT_FOLD_OPTIONS.enabled,
+    retentionDays: raw.fold_range_retention_days ?? DEFAULT_FOLD_OPTIONS.retentionDays,
+    maxEntries: raw.fold_range_max_entries ?? DEFAULT_FOLD_OPTIONS.maxEntries,
+  }
+}
+
 export function resolveUsageOptions(raw: MemoryCompactionConfig): UsageOptions {
   return {
     enabled: raw.usage_ledger ?? DEFAULT_USAGE_OPTIONS.enabled,

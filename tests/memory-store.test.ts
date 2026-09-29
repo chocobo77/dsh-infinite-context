@@ -360,4 +360,102 @@ describe('MemoryStore tool results', () => {
     expect(() => reopened.listUsageEvents()).toThrow()
     expect(() => reopened.recordUsageEvent({ ts: 1, kind: 'x', value: 1 })).toThrow()
   })
+
+  it('aggregates usage totals per detail label (per provider/model)', () => {
+    const store = new MemoryStore(':memory:')
+    store.recordUsageEvent({ ts: 10, kind: 'llm_input_tokens', value: 100, detail: 'p/a' })
+    store.recordUsageEvent({ ts: 20, kind: 'llm_input_tokens', value: 40, detail: 'p/b' })
+    store.recordUsageEvent({ ts: 30, kind: 'llm_requests', value: 1, detail: 'p/a' })
+    // Detail-less events are excluded: they cannot be attributed to a model.
+    store.recordUsageEvent({ ts: 40, kind: 'llm_input_tokens', value: 7 })
+    expect(store.usageTotalsByDetail()).toEqual([
+      { kind: 'llm_input_tokens', detail: 'p/a', events: 1, value: 100 },
+      { kind: 'llm_input_tokens', detail: 'p/b', events: 1, value: 40 },
+      { kind: 'llm_requests', detail: 'p/a', events: 1, value: 1 },
+    ])
+    // Same inclusive window bound as usageTotals.
+    expect(store.usageTotalsByDetail(20)).toEqual([
+      { kind: 'llm_input_tokens', detail: 'p/b', events: 1, value: 40 },
+      { kind: 'llm_requests', detail: 'p/a', events: 1, value: 1 },
+    ])
+    store.close()
+  })
+
+  describe('folded history ranges', () => {
+    const fold = {
+      messages: 12,
+      chars: 4000,
+      tokens: 1100,
+      summary: 'the agent renamed the config key',
+      original: 'user: rename storePath\nassistant: done',
+      sessionId: 's1',
+    }
+
+    it('archives a range and reads the exact text back', () => {
+      const store = new MemoryStore(':memory:')
+      const ref = store.archiveFoldedRange({ ...fold, createdAt: 500 })
+      expect(ref.startsWith('fl_')).toBe(true)
+      const record = store.getFoldedRange(ref)
+      expect(record?.original).toBe(fold.original)
+      expect(record?.summary).toBe(fold.summary)
+      expect(record?.createdAt).toBe(500)
+      expect(record?.messages).toBe(12)
+      expect(record?.restoredCount).toBe(0)
+      expect(store.getFoldedRange('fl_missing')).toBeUndefined()
+      store.close()
+    })
+
+    it('honours an explicit ref and never overwrites an existing row', () => {
+      const store = new MemoryStore(':memory:')
+      expect(store.archiveFoldedRange({ ...fold, ref: 'fl_fixed', createdAt: 1 })).toBe('fl_fixed')
+      expect(store.archiveFoldedRange({ ...fold, ref: 'fl_fixed', summary: 'second', createdAt: 2 })).toBe('fl_fixed')
+      expect(store.getFoldedRange('fl_fixed')?.summary).toBe(fold.summary)
+      store.close()
+    })
+
+    it('lists newest first without the original text and searches both columns', () => {
+      const store = new MemoryStore(':memory:')
+      const old = store.archiveFoldedRange({ ...fold, ref: 'fl_old', createdAt: 10 })
+      const fresh = store.archiveFoldedRange({ ...fold, ref: 'fl_new', createdAt: 20, summary: 'unrelated wording' })
+      expect(store.listFoldedRanges().map(row => row.ref)).toEqual([fresh, old])
+      expect(store.listFoldedRanges(1).map(row => row.ref)).toEqual([fresh])
+      expect(store.listFoldedRanges()[0]?.preview).toBe('unrelated wording')
+      expect(store.searchFoldedRanges('config key').map(row => row.ref)).toEqual([old])
+      expect(store.searchFoldedRanges('rename storePath').map(row => row.ref)).toEqual([fresh, old])
+      // LIKE wildcards in the query are escaped, so they match literally.
+      expect(store.searchFoldedRanges('%')).toEqual([])
+      expect(store.searchFoldedRanges('config key', 1).length).toBe(1)
+      store.close()
+    })
+
+    it('marks restores, aggregates stats, and prunes by age then by cap', () => {
+      const store = new MemoryStore(':memory:')
+      const a = store.archiveFoldedRange({ ...fold, ref: 'fl_a', createdAt: 100 })
+      store.archiveFoldedRange({ ...fold, ref: 'fl_b', createdAt: 200 })
+      store.markFoldedRangeRestored(a)
+      store.markFoldedRangeRestored(a)
+      expect(store.getFoldedRange(a)?.restoredCount).toBe(2)
+      expect(store.foldedRangeStats()).toEqual({ count: 2, chars: 8000, tokens: 2200 })
+      // Strictly older rows are dropped.
+      expect(store.pruneFoldedRanges(200)).toBe(1)
+      expect(store.foldedRangeStats().count).toBe(1)
+      store.archiveFoldedRange({ ...fold, ref: 'fl_c', createdAt: 300 })
+      expect(store.trimFoldedRanges(1)).toBe(1)
+      expect(store.listFoldedRanges().map(row => row.ref)).toEqual(['fl_c'])
+      store.close()
+    })
+
+    it('persists folded ranges across reopen and refuses access after close', () => {
+      const file = join(tempDir(), 'folded.db')
+      const store = new MemoryStore(file)
+      const ref = store.archiveFoldedRange({ ...fold, createdAt: 42 })
+      store.close()
+      const reopened = new MemoryStore(file)
+      expect(reopened.getFoldedRange(ref)?.original).toBe(fold.original)
+      expect(reopened.foldedRangeStats().count).toBe(1)
+      reopened.close()
+      expect(() => reopened.listFoldedRanges()).toThrow()
+      expect(() => reopened.getFoldedRange(ref)).toThrow()
+    })
+  })
 })

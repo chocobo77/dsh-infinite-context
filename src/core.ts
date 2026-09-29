@@ -47,3 +47,8 @@ export {
   type PressureDecisionInput,
   type PressureDecisionMode,
 } from './compaction-policy.ts'
+export {
+  DEFAULT_FOLD_OPTIONS,
+  foldedRangeHeader,
+  type FoldOptions,
+} from './fold-archive.ts'

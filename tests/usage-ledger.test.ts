@@ -4,7 +4,7 @@ import {
   USAGE_KIND,
   UsageLedger,
 } from '../src/usage-ledger.ts'
-import type { UsageEventRecord, UsageTotal } from '../src/memory-store.ts'
+import type { UsageDetailTotal, UsageEventRecord, UsageTotal } from '../src/memory-store.ts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -17,6 +17,7 @@ interface FakeStore {
     usageTotals(sinceTs?: number): UsageTotal[]
     listUsageEvents(limit?: number): UsageEventRecord[]
     pruneUsageEvents(beforeTs: number): number
+    usageTotalsByDetail(sinceTs?: number): UsageDetailTotal[]
   }
 }
 
@@ -49,6 +50,23 @@ function makeStore(): FakeStore {
       listUsageEvents(limit = 20) {
         if (fake.failing) throw new Error('list down')
         return [...events].reverse().slice(0, limit)
+      },
+      usageTotalsByDetail(sinceTs) {
+        if (fake.failing) throw new Error('detail down')
+        const byKey = new Map<string, UsageDetailTotal>()
+        for (const event of events) {
+          if (event.detail === undefined) continue
+          if (sinceTs !== undefined && event.ts < sinceTs) continue
+          const key = event.kind + '\u0000' + event.detail
+          const current = byKey.get(key) ?? { kind: event.kind, detail: event.detail, events: 0, value: 0 }
+          byKey.set(key, {
+            kind: event.kind,
+            detail: event.detail,
+            events: current.events + 1,
+            value: current.value + event.value,
+          })
+        }
+        return [...byKey.values()].sort((a, b) => (a.kind + a.detail < b.kind + b.detail ? -1 : 1))
       },
       pruneUsageEvents(beforeTs) {
         if (fake.failing) throw new Error('prune down')
@@ -176,6 +194,48 @@ describe('UsageLedger', () => {
     expect(fake.prunes[0]).toBe(1_000 - 30 * DAY_MS)
   })
 
+  it('buckets llm usage per model so a mid-session switch stays visible', () => {
+    const fake = makeStore()
+    const { ledger } = makeLedger(fake)
+    ledger.record(USAGE_KIND.llmRequests, 1, { detail: 'p/a' })
+    ledger.record(USAGE_KIND.llmInput, 100, { detail: 'p/a' })
+    ledger.record(USAGE_KIND.llmCacheRead, 900, { detail: 'p/a' })
+    ledger.record(USAGE_KIND.llmOutput, 50, { detail: 'p/a' })
+    // The switch: the same prefix is re-billed uncached, so the hit rate drops.
+    ledger.record(USAGE_KIND.llmRequests, 1, { detail: 'p/b' })
+    ledger.record(USAGE_KIND.llmInput, 1000, { detail: 'p/b' })
+    ledger.record(USAGE_KIND.llmCacheRead, 0, { detail: 'p/b' })
+    ledger.record(USAGE_KIND.llmCacheWrite, 1000, { detail: 'p/b' })
+    // Events without a model label never form a bucket of their own.
+    ledger.record(USAGE_KIND.llmRequests, 1)
+    const summary = ledger.summary(7)
+    // Same request count, so the tie breaks alphabetically.
+    expect(summary.models.map(model => model.model)).toEqual(['p/a', 'p/b'])
+    const a = summary.models.find(model => model.model === 'p/a')
+    const b = summary.models.find(model => model.model === 'p/b')
+    expect(a).toEqual({
+      model: 'p/a',
+      requests: 1,
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 0,
+      cacheHitRate: 0.9,
+    })
+    expect(b?.cacheHitRate).toBe(0)
+    // The blended total still reports every request, labelled or not.
+    expect(summary.llm.requests).toBe(3)
+  })
+
+  it('reports no model buckets when the store cannot aggregate by detail', () => {
+    const fake = makeStore()
+    const { ledger } = makeLedger(fake)
+    // Exercising a store that predates the optional aggregation.
+    delete (fake.store as { usageTotalsByDetail?: unknown }).usageTotalsByDetail
+    ledger.record(USAGE_KIND.llmRequests, 1, { detail: 'p/a' })
+    expect(ledger.summary(7).models).toEqual([])
+  })
+
   it('lists the newest events first and survives a broken store', () => {
     const fake = makeStore()
     const { ledger, warnings } = makeLedger(fake)
@@ -189,6 +249,7 @@ describe('UsageLedger', () => {
     expect(ledger.recent()).toEqual([])
     expect(ledger.prune()).toBe(0)
     expect(ledger.summary().events).toBe(0)
-    expect(warnings).toHaveLength(5)
+    // 4 store reads + the per-model aggregation all fail and warn.
+    expect(warnings).toHaveLength(6)
   })
 })

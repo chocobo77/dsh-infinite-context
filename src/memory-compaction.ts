@@ -45,6 +45,7 @@ import {
   DEFAULT_INGEST_DENYLIST,
   MemoryCompactionConfigSchema,
   resolveAbsorbOptions,
+  resolveFoldOptions,
   resolveRetrievalOptions,
   resolveToolArchiveOptions,
   resolveUsageOptions,
@@ -52,6 +53,7 @@ import {
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
+import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import { USAGE_KIND, UsageLedger } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
@@ -694,10 +696,16 @@ export class HistoryCompressor {
       // DSH contract: PreStepDecision.enter requires UserMessage[] and every
       // message must carry id/content(ContentBlock[])/source — construct via
       // createUserMessage (never a bare { role, content: string } object).
+      // Reverse compaction: archive the exact messages before they are
+      // replaced, and put the ref in the header so the model can pull the
+      // literal text back with memory_expand (upstream's `decompress`).
+      // A rejected compression may leave an unused archive row; retention
+      // prunes it, and nothing else references it.
+      const foldHeader = this.archiveFoldedRange(sessionId, oldMessages, summaryText)
       const summaryMessage = createUserMessage({
         content: [{
           type: 'text',
-          text: `[Compressed history — ${oldMessages.length} earlier messages, details preserved below]\n\n${summaryText}`,
+          text: `${foldHeader}\n\n${summaryText}`,
         }],
         source: { kind: 'plugin:' + PLUGIN } as any,
       })
@@ -810,10 +818,16 @@ export class HistoryCompressor {
         throw new Error('LLM produced empty summary')
       }
 
+      // Reverse compaction: archive the exact messages before they are
+      // replaced, and put the ref in the header so the model can pull the
+      // literal text back with memory_expand (upstream's `decompress`).
+      // A rejected compression may leave an unused archive row; retention
+      // prunes it, and nothing else references it.
+      const foldHeader = this.archiveFoldedRange(sessionId, oldMessages, summaryText)
       const summaryMessage = createUserMessage({
         content: [{
           type: 'text',
-          text: `[Compressed history — ${oldMessages.length} earlier messages, details preserved below]\n\n${summaryText}`,
+          text: `${foldHeader}\n\n${summaryText}`,
         }],
         source: { kind: 'plugin:' + PLUGIN } as any,
       })
@@ -933,6 +947,66 @@ export class HistoryCompressor {
     ].join('\n')
 
     return this.llmSummarize(prompt, target)
+  }
+
+  /**
+   * Archive the exact messages a compression is about to fold into a summary,
+   * and return the header that introduces that summary on the surface.
+   *
+   * Reversibility is the point (upstream `decompress`): the summary costs
+   * tokens, the archive costs only disk, and `memory_expand ref=fl_…` brings
+   * the literal text back when the model needs the detail. Best-effort — an
+   * archive failure degrades to the plain header, it never blocks compaction.
+   *
+   * @param sessionId - the session whose history is being folded.
+   * @param messages - the messages being replaced by the summary.
+   * @param summaryText - the summary that will replace them.
+   * @returns the header line for the summary message.
+   */
+  private archiveFoldedRange(
+    sessionId: string,
+    messages: readonly Message[],
+    summaryText: string,
+  ): string {
+    const options = resolveFoldOptions(this.config)
+    if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
+    try {
+      const original = serializeMessagesForSummary(messages)
+      const chars = original.length
+      const ref = this.ctx.memoryContext.archiveFoldedRange({
+        messages: messages.length,
+        chars,
+        tokens: this.estimateMessageTokens(messages),
+        summary: summaryText,
+        original,
+        sessionId,
+      })
+      this.enforceFoldRetention(options)
+      return foldedRangeHeader(messages.length, chars, ref)
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Folded-range archive failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return foldedRangeHeader(messages.length, 0, null)
+    }
+  }
+
+  /**
+   * Drop folded ranges past retention, then past the entry cap.
+   * @param options - the resolved folded-range policy.
+   */
+  private enforceFoldRetention(options: FoldOptions): void {
+    try {
+      if (options.retentionDays > 0) {
+        const dayMs = 24 * 60 * 60 * 1000
+        this.ctx.memoryContext.pruneFoldedRanges(Date.now() - options.retentionDays * dayMs)
+      }
+      if (options.maxEntries > 0) this.ctx.memoryContext.trimFoldedRanges(options.maxEntries)
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Folded-range retention sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
   }
 
   /**
@@ -1302,6 +1376,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         usageTotals: sinceTs => ctx.memoryContext.usageTotals(sinceTs),
         listUsageEvents: limit => ctx.memoryContext.listUsageEvents(limit),
         pruneUsageEvents: beforeTs => ctx.memoryContext.pruneUsageEvents(beforeTs),
+        usageTotalsByDetail: sinceTs => ctx.memoryContext.usageTotalsByDetail(sinceTs),
       },
       options: resolveUsageOptions(config),
       logger: ctx.logger,
@@ -1912,18 +1987,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const usage = event.data.usage
       if (usage === undefined) return
       const sessionId = String(session.id)
-      this.usage.record(USAGE_KIND.llmRequests, 1, { sessionId })
+      // Attribute every count to the routed provider/model. A mid-session
+      // model switch invalidates the provider prefix cache, so without the
+      // per-model split that drop is indistinguishable from TTL expiry.
+      const model = ctx.memoryContext.modelInfo
+      const attribution = model === null || (model.provider === undefined && model.model === undefined)
+        ? { sessionId }
+        : { sessionId, detail: `${model.provider ?? 'unknown'}/${model.model ?? 'unknown'}` }
+      this.usage.record(USAGE_KIND.llmRequests, 1, attribution)
       if (usage.inputTokens !== undefined) {
-        this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, { sessionId })
+        this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, attribution)
       }
       if (usage.outputTokens !== undefined) {
-        this.usage.record(USAGE_KIND.llmOutput, usage.outputTokens, { sessionId })
+        this.usage.record(USAGE_KIND.llmOutput, usage.outputTokens, attribution)
       }
       if (usage.cacheReadTokens !== undefined) {
-        this.usage.record(USAGE_KIND.llmCacheRead, usage.cacheReadTokens, { sessionId })
+        this.usage.record(USAGE_KIND.llmCacheRead, usage.cacheReadTokens, attribution)
       }
       if (usage.cacheWriteTokens !== undefined) {
-        this.usage.record(USAGE_KIND.llmCacheWrite, usage.cacheWriteTokens, { sessionId })
+        this.usage.record(USAGE_KIND.llmCacheWrite, usage.cacheWriteTokens, attribution)
       }
     })
   }

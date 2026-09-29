@@ -187,6 +187,13 @@
     # prints the last 7 days.
     usage_ledger: true
     usage_retention_days: 30
+    # --- reverse compaction (folded-range archive) ---
+    # Before a compression folds a range into a summary, the exact messages are
+    # archived so memory_expand ref=fl_… can read them back (upstream decompress
+    # equivalent). Turning this off makes compaction lossy.
+    fold_ranges: true
+    fold_range_retention_days: 30
+    fold_range_max_entries: 300
     rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
     # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
