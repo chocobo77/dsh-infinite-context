@@ -199,6 +199,12 @@
         # memory_status. Never pre-summed (that would erase the cache hit rate).
         usage_ledger: true
         usage_retention_days: 30
+        # Reverse compaction: before a compression folds a range into a summary,
+        # the exact messages are archived (folded_ranges) so memory_expand can
+        # read them back — the engine-layer equivalent of upstream decompress.
+        fold_ranges: true
+        fold_range_retention_days: 30
+        fold_range_max_entries: 300
         rag_ingest_importance: 0.3
         rag_ingest_denylist:
           - memory_search

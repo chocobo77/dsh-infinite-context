@@ -15,7 +15,7 @@
  * @module dsh-infinite-context/usage-ledger
  */
 
-import type { UsageEventRecord, UsageTotal } from './memory-store.ts'
+import type { UsageDetailTotal, UsageEventRecord, UsageTotal } from './memory-store.ts'
 
 /** Ledger policy. */
 export interface UsageOptions {
@@ -67,6 +67,8 @@ export interface UsageLedgerStore {
   usageTotals(sinceTs?: number): UsageTotal[]
   listUsageEvents(limit?: number): UsageEventRecord[]
   pruneUsageEvents(beforeTs: number): number
+  /** Optional: per-detail aggregation, present on the SQLite store. */
+  usageTotalsByDetail?(sinceTs?: number): UsageDetailTotal[]
 }
 
 /** Dependencies, all injectable for tests. */
@@ -98,9 +100,35 @@ export interface UsageSummary {
     /** cacheRead / (input + cacheRead + cacheWrite); 0 when nothing was billed. */
     readonly cacheHitRate: number
   }
+  /**
+   * Per-model buckets (the `detail` label of the llm_* events, newest model
+   * last). A mid-session model switch shows up here as a second bucket with a
+   * collapsed cache-hit rate instead of hiding inside the blended total.
+   */
+  readonly models: readonly UsageModelTotal[]
+}
+
+/** One model's share of the ledger window. */
+export interface UsageModelTotal {
+  readonly model: string
+  readonly requests: number
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+  /** cacheRead / (input + cacheRead + cacheWrite); 0 when nothing was billed. */
+  readonly cacheHitRate: number
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+/** Ledger kind → the per-model field it feeds. */
+const LLM_DETAIL_FIELD: Record<string, 'input' | 'output' | 'read' | 'write'> = {
+  [USAGE_KIND.llmInput]: 'input',
+  [USAGE_KIND.llmOutput]: 'output',
+  [USAGE_KIND.llmCacheRead]: 'read',
+  [USAGE_KIND.llmCacheWrite]: 'write',
+}
 
 /** Human-readable error reason. */
 function reasonOf(error: unknown): string {
@@ -219,6 +247,7 @@ export class UsageLedger {
       events += total.events
     }
     const value = (kind: string): number => byKind.get(kind) ?? 0
+    const models = this.modelTotals(days)
     const inputTokens = value(USAGE_KIND.llmInput)
     const cacheReadTokens = value(USAGE_KIND.llmCacheRead)
     const cacheWriteTokens = value(USAGE_KIND.llmCacheWrite)
@@ -241,6 +270,55 @@ export class UsageLedger {
         cacheWriteTokens,
         cacheHitRate: billed === 0 ? 0 : Math.round((cacheReadTokens / billed) * 1000) / 1000,
       },
+      models,
     }
+  }
+
+  /**
+   * Bucket the llm_* events by their `detail` label (the provider/model the
+   * request went to). Best-effort: a store without per-detail aggregation, or
+   * a failing query, yields no model rows instead of failing the status call.
+   * @param days - the window in days.
+   * @returns one bucket per model, busiest first.
+   */
+  private modelTotals(days: number): UsageModelTotal[] {
+    const aggregate = this.store.usageTotalsByDetail
+    if (aggregate === undefined) return []
+    type Bucket = { requests: number; input: number; output: number; read: number; write: number }
+    const buckets = new Map<string, Bucket>()
+    const bucketFor = (model: string): Bucket => {
+      const existing = buckets.get(model)
+      if (existing !== undefined) return existing
+      const created: Bucket = { requests: 0, input: 0, output: 0, read: 0, write: 0 }
+      buckets.set(model, created)
+      return created
+    }
+    try {
+      for (const row of aggregate.call(this.store, this.now() - days * DAY_MS)) {
+        const bucket = bucketFor(row.detail)
+        if (row.kind === USAGE_KIND.llmRequests) {
+          bucket.requests += row.events
+          continue
+        }
+        const field = LLM_DETAIL_FIELD[row.kind]
+        if (field === undefined) continue
+        bucket[field] += row.value
+      }
+    } catch (err) {
+      this.logger.warn(`[ContextGovernor] Usage per-model aggregation failed: ${reasonOf(err)}`)
+      return []
+    }
+    return [...buckets.entries()].map(([model, bucket]) => {
+      const modelBilled = bucket.input + bucket.read + bucket.write
+      return {
+        model,
+        requests: bucket.requests,
+        inputTokens: bucket.input,
+        outputTokens: bucket.output,
+        cacheReadTokens: bucket.read,
+        cacheWriteTokens: bucket.write,
+        cacheHitRate: modelBilled === 0 ? 0 : Math.round((bucket.read / modelBilled) * 1000) / 1000,
+      }
+    }).sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model))
   }
 }

@@ -35,7 +35,8 @@
 | 工具结果归档（CCR） | `tool_archive: true` — 超过 6000 字符的工具结果先按内容寻址入库（`tr_<sha256 前 12 位>`），表面节点换成带 ref 的短桩；新节点入库后与压缩前各改写一次，把内置 pruner 的「有损中段剪枝」变成「可按 ref 取回」（`memory_expand`）；只改写**尚未发送过**的节点，绝不失效已建立的前缀缓存 |
 | 即时蒸馏（absorb） | `tool_absorb: true` — 超长工具结果先蒸馏出「信号行」（错误/失败/退出码/测试计数/diff stat/文件路径 + 首尾各 3 行，≤1200 字符）作为桩的主体；全文仍按 ref 入库、可 `memory_expand` 取回，蒸馏结果同时作为记忆入库（importance 低，遗忘优先退休） |
 | 压缩调度 nudge | `compress_nudge: true` — 用表面增长的 EMA 预判下一轮是否越线，会越线就把压缩提前一步执行（同一轮不重复、冷却期内不触发），避免「压缩跑起来时已经付过一轮超量输入」 |
-| 上下文计量账本 | `usage_ledger: true` — 逐请求记录注入 tokens/条数、表面跳过、归档/蒸馏字符、nudge 次数、压缩节省 tokens 与 LLM 的 input/output/cacheRead/cacheWrite（DSH 计数互斥，不预先求和），`memory_status` 输出最近 7 天汇总与缓存命中率 |
+| 可逆压缩（fold ranges） | `fold_ranges: true` — 压缩折叠前把被折叠的原始消息整体存入 `folded_ranges` 表，折叠桩标头标注条数/字符数与 `fl_…` 引用，`memory_expand ref=fl_…` 可整段取回原文（等价上游 `decompress`）；`memory_search` 会附折叠区关键词命中。保留上限：`fold_range_retention_days`（30 天）、`fold_range_max_entries`（300 条） |
+| 上下文计量账本 | `usage_ledger: true` — 逐请求记录注入 tokens/条数、表面跳过、归档/蒸馏字符、nudge 次数、压缩节省 tokens 与 LLM 的 input/output/cacheRead/cacheWrite（DSH 计数互斥，不预先求和）；每条 LLM 记录带 `provider/model` 归属，`memory_status` 的 `usage.models` 输出逐模型（MODEL SWITCHES 式）用量与缓存命中率，汇总窗口为最近 7 天 |
 | 结构化记忆 | `memory_index`（MEMORY.md 索引）+ `memory_maintain`（审计）+ 忘得可见 |
 | 模型 CTX 感知 | 自动读取 DSH 模型目录的 contextWindow；本地模型主动探测真实运行窗口（llama/ollama/openai，含 llama-server `meta.n_ctx`）；per-model 注册表按模型隔离 |
 | 高价值过滤 | denylist 过滤 24 个低价值工具；importance 分级（short=0.3/mid=0.6/long=0.6，long 继承批次 max） |
@@ -68,9 +69,10 @@ src/
 ├── index.ts              完整导出桶
 ├── tool-archive.ts       超长工具结果外置归档（CCR 式桩 + ref 取回）
 ├── absorb.ts             工具结果即时蒸馏（信号行提取，无依赖）
+├── fold-archive.ts       可逆压缩归档：折叠原文存取 + `fl_` 引用（无依赖）
 ├── usage-ledger.ts       上下文计量账本（注入/归档/压缩/缓存命中，无依赖）
 └── tools.ts              11 个手动工具
-tests/                    235 个单元测试
+tests/                    248 个单元测试
 ```
 
 ### 手动工具
@@ -78,7 +80,7 @@ tests/                    235 个单元测试
 | 工具 | 说明 |
 |------|------|
 | `memory_search(query?, k?)` | 语义检索持久化记忆 |
-| `memory_status` | 报告分层计数、预算、嵌入器、遗忘策略、模型 CTX + per-model 窗口，以及最近 7 天上下文计量（注入/跳过/归档/蒸馏/压缩节省/缓存命中率） |
+| `memory_status` | 报告分层计数、预算、嵌入器、遗忘策略、模型 CTX + per-model 窗口，最近 7 天上下文计量（注入/跳过/归档/蒸馏/压缩节省/缓存命中率）、逐模型用量 `usage.models`，以及可逆压缩区 `foldedRanges`（条数/字符/最近条目） |
 | `memory_index(limit?)` | MEMORY.md 风格结构化索引 |
 | `memory_maintain` | 只读审计：重复/冲突/过时 |
 | `memory_model_probe(forceProbe?, model?)` | 报告模型 CTX 来源，可强制探测 |
@@ -176,6 +178,9 @@ tests/                    235 个单元测试
 | `compress_nudge` | `true` | **压缩调度 nudge**：用表面增长的 EMA（`nextGrowthEma`，权重 0.5）预判「下一个请求会不会越线」，会越线就把这一轮压缩提前执行（`shouldNudgeCompaction`：同轮不重复、失败冷却期内不触发、增长未知不触发）。压缩原本每 N 轮才评估一次，等触发时往往已经付过一轮超量输入 |
 | `usage_ledger` | `true` | **上下文计量账本**：逐请求记录注入 tokens/条数、表面跳过数、归档与蒸馏字符数、nudge 次数、压缩节省 tokens，以及 LLM 的 `input/output/cacheRead/cacheWrite`（DSH 的计数是**互斥**的：`inputTokens` 只是未缓存部分，合并求和会抹掉缓存命中率）。`memory_status` 输出最近 7 天汇总与缓存命中率 |
 | `usage_retention_days` | `30` | 计量事件保留天数（`0` = 不淘汰）；每 256 次写入顺带清理一次 |
+| `fold_ranges` | `true` | **可逆压缩归档**：压缩折叠前把被折叠的原始消息（序列化全文 + 字符数 + token 估算）存入 `folded_ranges`，折叠桩标头条数/字符数与 `fl_…` 引用，`memory_expand ref=fl_…` 整段取回（等价上游 `decompress`）。压缩产出被拒时归档行可能留存但不被引用（只占存储，受下面两条上限约束） |
+| `fold_range_retention_days` | `30` | 折叠归档保留天数（`0` = 不淘汰）；每次归档顺带清理超期条目 |
+| `fold_range_max_entries` | `300` | 折叠归档条数上限；每次归档顺带按时间倒序裁剪 |
 
 ### 部署
 
@@ -234,7 +239,7 @@ scripts\install-dsh-plugin.ps1 -DetectOnly
 ### 测试
 
 ```sh
-# 单元测试（209 个，无 DSH 依赖）
+# 单元测试（248 个，无 DSH 依赖）
 vitest run --config vitest.config.ts
 
 # 类型检查
@@ -242,6 +247,10 @@ tsc -p tsconfig.typecheck.json --noEmit
 ```
 
 ---
+
+### 致谢
+
+本插件的压缩/上下文治理方向长期对齐 [billion-context](https://github.com/ranxianglei/billion-context)（MIT **外加一条附加条款**：任何终端用户可见或可交互、且使用了该软件的产品或服务，须在首页、文档或「关于/致谢」页面注明使用了 billion-context 并附指向该仓库的链接）。据此条款在此致谢并链接该仓库。我们仅在**引擎层等价重实现**其能力，未复制其源码。上游文档快照、长期更新目标与吸纳对照见 [`docs/billion-context/`](docs/billion-context/)：[`UPSTREAM.md`](docs/billion-context/UPSTREAM.md)（紧随更新目标与刷新流程）、[`ABSORPTION.md`](docs/billion-context/ABSORPTION.md)（功能吸纳对照与冲突取舍）。
 
 ## Introduction
 
@@ -275,7 +284,8 @@ feel via **multi-tier memory management**:
 | Tool-result archive (CCR) | `tool_archive: true` — a tool result above the threshold is archived by content hash (`tr_<sha256 12>`), and the surface node becomes a short stub carrying that ref. Rewritten once when a node is appended and once before compaction, so the lossy middle-cut performed by the built-in pruner becomes recoverable via `memory_expand`. Only nodes that were never sent are rewritten, so an established prefix cache is never invalidated |
 | Immediate distillation (absorb) | `tool_absorb: true` — an oversized result is distilled into signal lines first (errors/failures/exit codes/test counts/diff stats/paths plus 3 head and 3 tail lines, ≤1200 chars) and that digest becomes the stub body; the full text still archives under its ref for `memory_expand`, and the digest is also ingested as a memory (low importance, retired first) |
 | Compression scheduling nudge | `compress_nudge: true` — a surface-growth EMA predicts whether the NEXT request crosses the trigger and compresses one step early when it would (`shouldNudgeCompaction`; never twice in a turn, never during a cooldown) |
-| Context accounting ledger | `usage_ledger: true` — per-request accounting of injected tokens/memories, surface skips, archived/distilled chars, nudges, compaction tokens saved, and the LLM's input/output/cacheRead/cacheWrite (DSH counts are DISJOINT, so they are stored separately and never pre-summed); `memory_status` reports the last 7 days plus the cache hit rate |
+| Reversible compaction (fold ranges) | `fold_ranges: true` — before folding, the exact folded messages are archived in `folded_ranges`; the fold header carries the message/char counts and a `fl_…` ref, and `memory_expand ref=fl_…` restores the full text (upstream `decompress` parity); `memory_search` also surfaces keyword hits inside folded history. Retention: `fold_range_retention_days` (30 days) and `fold_range_max_entries` (300) |
+| Context accounting ledger | `usage_ledger: true` — per-request accounting of injected tokens/memories, surface skips, archived/distilled chars, nudges, compaction tokens saved, and the LLM's input/output/cacheRead/cacheWrite (DSH counts are DISJOINT, so they are stored separately and never pre-summed); every LLM record carries a `provider/model` attribution, and `memory_status` reports per-model usage (`usage.models`, MODEL SWITCHES style) for the last 7 days plus the cache hit rate |
 | Structured memory | `memory_index` (MEMORY.md style) + `memory_maintain` (audit) + visible forgetting |
 | Model CTX awareness | Auto-reads DSH model catalog contextWindow; local models are actively probed for their REAL runtime window (llama/ollama/openai incl. llama-server `meta.n_ctx`); per-model registry isolates concurrent sessions |
 | High-value filtering | denylist filters 24 low-value tools; importance tiers (short=0.3/mid=0.6/long=0.6, long inherits batch max) |
@@ -285,7 +295,7 @@ feel via **multi-tier memory management**:
 | Tool | Description |
 |------|-------------|
 | `memory_search(query?, k?)` | Semantic search over persisted memories |
-| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX + per-model windows, and the last 7 days of context accounting (injection, surface skips, archived/distilled chars, compaction tokens saved, cache hit rate) |
+| `memory_status` | Report tier counts, budgets, embedder, forgetting policy, model CTX + per-model windows, the last 7 days of context accounting (injection, surface skips, archived/distilled chars, compaction tokens saved, cache hit rate), per-model usage (`usage.models`), and reversible fold ranges (`foldedRanges`: counts, chars, recent entries) |
 | `memory_index(limit?)` | MEMORY.md-style structured index |
 | `memory_maintain` | Read-only audit: duplicates/conflicts/stale |
 | `memory_model_probe(forceProbe?, model?)` | Report model CTX source, force probe, list per-model windows |
@@ -329,12 +339,18 @@ scripts\install-dsh-plugin.ps1 <dir|tgz|npm:pkg|github:owner/repo> -Profile <nam
 ### Testing
 
 ```sh
-# Unit tests (235, no DSH dependency)
+# Unit tests (248, no DSH dependency)
 vitest run --config vitest.config.ts
 
 # Type check
 tsc -p tsconfig.typecheck.json --noEmit
 ```
+
+---
+
+### Acknowledgements
+
+The compression/context-governance direction of this plugin is aligned long-term with [billion-context](https://github.com/ranxianglei/billion-context) (MIT **plus one additional attribution term**: any end-user-visible or interactive product or service using that software must state that it uses billion-context on its home page, docs, or an About/Credits page, with a link to that repository). Per that clause we credit and link the repository here. We only re-implement its capabilities equivalently at the engine layer; no upstream source code was copied. The pinned upstream docs snapshot, the long-term follow-up target, and the absorption/conflict record live in [`docs/billion-context/`](docs/billion-context/): [`UPSTREAM.md`](docs/billion-context/UPSTREAM.md) and [`ABSORPTION.md`](docs/billion-context/ABSORPTION.md).
 
 ---
 

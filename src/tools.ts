@@ -41,7 +41,16 @@ export function apply(ctx: Context) {
     },
     async execute(args: { query: string; k?: number }) {
       const hits = await ctx.memoryContext.retrieve(args.query, args.k ?? 5)
-      return renderHits(hits)
+      const base = renderHits(hits)
+      // Upstream `search_context` parity: a keyword sweep over the folded
+      // (compressed) ranges, which the semantic store only keeps as
+      // summaries. Each hit names the ref that restores the exact text.
+      const folded = ctx.memoryContext.searchFoldedRanges(args.query, 3)
+      if (folded.length === 0) return base
+      const section = folded.map((row, index) => (
+        `[f${index + 1}] (folded range ${row.ref}, ${row.messages} messages, ${row.chars} chars)\n  ${row.preview}`
+      )).join('\n')
+      return base + '\n\nKeyword matches in folded (compressed) history — memory_expand ref=<ref> returns the exact text:\n' + section
     },
     presentCall: args => ({ card: 'generic', title: 'Memory search', kind: 'other', rawInput: args }),
   }))
@@ -58,6 +67,11 @@ export function apply(ctx: Context) {
       const status = ctx.memoryContext.status()
       return JSON.stringify({
         ...status,
+        // Reverse compaction: what is archived and therefore still recoverable.
+        foldedRanges: {
+          ...ctx.memoryContext.foldedRangeStats(),
+          recent: ctx.memoryContext.listFoldedRanges(5),
+        },
         modelContext: ctx.memoryContext.modelInfo
           ?? { contextWindow: ctx.memoryContext.contextWindow, source: 'config' },
         perModelWindows: ctx.memoryContext.perModelWindows(),
@@ -262,9 +276,9 @@ export function apply(ctx: Context) {
   }))
   ctx.tools.register(defineTool({
     name: 'memory_expand',
-    description: 'Read back a tool result that was archived off the context (tool-result CCR). Pass a ref to get its exact text back, optionally paginated with offset/limit or searched with query; omit ref to list the most recent archived results.',
+    description: 'Read archived text back from the store. Two kinds of ref: tr_… is an oversized tool result archived off the context (tool-result CCR, upstream ~billion-context CCR); fl_… is a folded history range — the exact messages a compression replaced with a summary (upstream `decompress`). Pass a ref to get its exact text back, optionally paginated with offset/limit or searched with query; omit ref to list the most recent archived results and folded ranges.',
     parameters: {
-      ref: { type: 'string', description: 'Archive ref (for example tr_ab12cd34ef56) from an archived tool-result stub.' },
+      ref: { type: 'string', description: 'Archive ref: tr_ab12cd34ef56 (archived tool result) or fl_ab12cd34ef56 (folded history range) — both appear in the stub/summary that replaced the text.' },
       query: { type: 'string', description: 'Substring to search: inside one archived result when ref is given, otherwise across every archived result.' },
       offset: { type: 'number', description: 'Code-point offset to start reading from (default 0).' },
       limit: { type: 'number', description: 'Code points to return (default 4000, max 20000); with ref+query, the number of match windows (default 5).' },
@@ -278,25 +292,56 @@ export function apply(ctx: Context) {
       const ref = args.ref?.trim()
       if (ref === undefined || ref.length === 0) {
         const listLimit = Math.max(1, Math.min(50, Math.floor(args.limit ?? 10)))
-        const rows = query === undefined || query.length === 0
-          ? ctx.memoryContext.listToolResults(listLimit)
-          : ctx.memoryContext.searchToolResults(query, listLimit)
-        if (rows.length === 0) return 'No archived tool results match.'
-        return rows.map(row => (
-          '[' + row.ref + '] ' + row.tool + ' · ' + row.chars + ' chars · ' + new Date(row.createdAt).toISOString()
-          + '\n  ' + row.preview
-        )).join('\n\n')
+        const searching = query !== undefined && query.length > 0
+        const rows = searching
+          ? ctx.memoryContext.searchToolResults(query, listLimit)
+          : ctx.memoryContext.listToolResults(listLimit)
+        const foldedRows = searching
+          ? ctx.memoryContext.searchFoldedRanges(query, listLimit)
+          : ctx.memoryContext.listFoldedRanges(listLimit)
+        const sections: string[] = []
+        if (rows.length > 0) {
+          sections.push(rows.map(row => (
+            '[' + row.ref + '] ' + row.tool + ' · ' + row.chars + ' chars · ' + new Date(row.createdAt).toISOString()
+            + '\n  ' + row.preview
+          )).join('\n\n'))
+        }
+        if (foldedRows.length > 0) {
+          sections.push('Folded history ranges (reversible compaction):\n' + foldedRows.map(row => (
+            '[' + row.ref + '] ' + row.messages + ' messages · ' + row.chars + ' chars · '
+            + new Date(row.createdAt).toISOString()
+            + (row.restoredCount > 0 ? ' · read back ' + row.restoredCount + 'x' : '')
+            + '\n  ' + row.preview
+          )).join('\n\n'))
+        }
+        if (sections.length === 0) return 'No archived tool results or folded history ranges match.'
+        return sections.join('\n\n')
       }
       const record = ctx.memoryContext.getToolResult(ref)
-      if (record === undefined) {
+      const folded = record === undefined ? ctx.memoryContext.getFoldedRange(ref) : undefined
+      let header: string
+      let original: string
+      if (record !== undefined) {
+        original = record.text
+        header = 'Archived tool result ' + record.ref + ' (tool ' + record.tool + ', ' + Array.from(record.text).length
+          + ' code points' + (record.callId === undefined ? '' : ', callId ' + record.callId) + ').'
+      } else if (folded !== undefined) {
+        // Reverse compaction: the exact pre-fold messages, restored on demand
+        // (upstream billion-context calls this `decompress`).
+        original = folded.original
+        ctx.memoryContext.markFoldedRangeRestored(folded.ref)
+        header = 'Folded history range ' + folded.ref + ' (' + folded.messages + ' messages, '
+          + Array.from(folded.original).length + ' code points, folded '
+          + new Date(folded.createdAt).toISOString() + ').\n'
+          + 'Summary currently on the surface: '
+          + folded.summary.replace(/\s+/g, ' ').trim().slice(0, 240)
+      } else {
         return 'Unknown archive ref: ' + ref + '. Call memory_expand without a ref to list recent entries.'
       }
-      const points = Array.from(record.text)
-      const header = 'Archived tool result ' + record.ref + ' (tool ' + record.tool + ', ' + points.length
-        + ' code points' + (record.callId === undefined ? '' : ', callId ' + record.callId) + ').'
+      const points = Array.from(original)
       if (query !== undefined && query.length > 0) {
         const label = JSON.stringify(query)
-        const haystack = record.text.toLowerCase()
+        const haystack = original.toLowerCase()
         const needle = query.toLowerCase()
         const maxWindows = Math.max(1, Math.min(20, Math.floor(args.limit ?? 5)))
         const windows: string[] = []

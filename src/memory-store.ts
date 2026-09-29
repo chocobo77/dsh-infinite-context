@@ -8,6 +8,7 @@
  * @module dsh-infinite-context/memory-store
  */
 
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -78,6 +79,58 @@ export interface UsageTotal {
   readonly kind: string
   readonly events: number
   readonly value: number
+}
+
+/** Aggregated ledger rows for one kind, split by the `detail` label. */
+export interface UsageDetailTotal {
+  readonly kind: string
+  readonly detail: string
+  readonly events: number
+  readonly value: number
+}
+
+/**
+ * One folded (summarized) history range, archived verbatim before the summary
+ * replaced it on the surface. This is what makes compaction *reversible*: the
+ * summary stays in the conversation while the exact messages stay readable
+ * here (`memory_expand` with the ref) — the engine-layer equivalent of the
+ * upstream `decompress` tool.
+ */
+export interface FoldedRangeRecord {
+  readonly ref: string
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly messages: number
+  readonly chars: number
+  readonly tokens: number
+  readonly summary: string
+  readonly original: string
+  readonly restoredCount: number
+}
+
+/** A listing view of a folded range: everything but the original text. */
+export interface FoldedRangeMeta {
+  readonly ref: string
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly messages: number
+  readonly chars: number
+  readonly tokens: number
+  readonly preview: string
+  readonly restoredCount: number
+}
+
+/** Row shape of `folded_ranges` as stored. */
+interface FoldedRangeRow {
+  ref: string
+  ts: number
+  session_id: string | null
+  messages: number
+  chars: number
+  tokens: number
+  summary: string
+  original: string
+  restored_count: number
 }
 
 /** A ledger row as stored. */
@@ -153,6 +206,41 @@ function rowToToolResultMeta(row: ToolResultMetaRow): ToolResultMeta {
     chars: row.chars,
     preview: previewOf(row.preview),
     ...(row.digest !== null ? { digest: row.digest } : {}),
+  }
+}
+
+/** Ref prefix of a folded history range (see `memory_expand`). */
+export const FOLDED_REF_PREFIX = 'fl_'
+
+/** Collision-free ref for one folded range. */
+function newFoldedRef(): string {
+  return FOLDED_REF_PREFIX + randomUUID().replace(/-/g, '').slice(0, 12)
+}
+
+function rowToFoldedRange(row: FoldedRangeRow): FoldedRangeRecord {
+  return {
+    ref: row.ref,
+    ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+    createdAt: row.ts,
+    messages: row.messages,
+    chars: row.chars,
+    tokens: row.tokens,
+    summary: row.summary,
+    original: row.original,
+    restoredCount: row.restored_count,
+  }
+}
+
+function rowToFoldedRangeMeta(row: FoldedRangeRow): FoldedRangeMeta {
+  return {
+    ref: row.ref,
+    ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+    createdAt: row.ts,
+    messages: row.messages,
+    chars: row.chars,
+    tokens: row.tokens,
+    preview: previewOf(row.summary),
+    restoredCount: row.restored_count,
   }
 }
 
@@ -256,6 +344,24 @@ export class MemoryStore {
     `)
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_kind ON usage_events (kind, ts)')
+    // Folded history ranges (see memory-compaction.ts): the exact messages a
+    // compression replaced with a summary. Written best-effort, read back only
+    // by memory_expand, never by retrieval.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS folded_ranges (
+        ref            TEXT PRIMARY KEY,
+        ts             INTEGER NOT NULL,
+        session_id     TEXT,
+        messages       INTEGER NOT NULL,
+        chars          INTEGER NOT NULL,
+        tokens         INTEGER NOT NULL,
+        summary        TEXT NOT NULL,
+        original       TEXT NOT NULL,
+        restored_count INTEGER NOT NULL DEFAULT 0
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_ts ON folded_ranges (ts)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_session ON folded_ranges (session_id, ts)')
   }
 
   /**
@@ -479,6 +585,144 @@ export class MemoryStore {
   pruneUsageEvents(beforeTs: number): number {
     this.assertOpen()
     const info = this.db.prepare('DELETE FROM usage_events WHERE ts < ?').run(beforeTs)
+    return Number(info.changes)
+  }
+
+  /**
+   * Sum ledger values per kind *and* detail label (e.g. one bucket per
+   * provider/model), so a mid-session model switch stays visible instead of
+   * being averaged away in the per-kind totals.
+   * @param sinceTs - epoch-millisecond lower bound (inclusive); omit for all time.
+   * @returns one row per (kind, detail) pair, ordered by kind then detail.
+   */
+  usageTotalsByDetail(sinceTs?: number): UsageDetailTotal[] {
+    this.assertOpen()
+    const sql = 'SELECT kind, detail, COUNT(*) AS events, SUM(value) AS value FROM usage_events WHERE detail IS NOT NULL'
+    const rows = sinceTs === undefined
+      ? this.db.prepare(sql + ' GROUP BY kind, detail ORDER BY kind, detail').all()
+      : this.db.prepare(sql + ' AND ts >= ? GROUP BY kind, detail ORDER BY kind, detail').all(sinceTs)
+    return (rows as unknown as { kind: string; detail: string; events: number; value: number }[]).map(row => ({
+      kind: row.kind,
+      detail: row.detail,
+      events: Number(row.events),
+      value: Number(row.value),
+    }))
+  }
+
+  // --- folded history ranges: compaction that can be undone --------------
+
+  /**
+   * Archive the exact messages a compression folded into a summary, so the
+   * summary on the surface stays reversible (read back with `memory_expand`).
+   * @param input - the folded payload; the ref is generated when omitted.
+   * @returns the archive ref to embed in the summary that replaced the range.
+   */
+  archiveFoldedRange(input: {
+    readonly messages: number
+    readonly chars: number
+    readonly tokens: number
+    readonly summary: string
+    readonly original: string
+    readonly sessionId?: string | undefined
+    readonly ref?: string | undefined
+    readonly createdAt?: number | undefined
+  }): string {
+    this.assertOpen()
+    const ref = input.ref ?? newFoldedRef()
+    this.db.prepare(
+      'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
+    ).run(
+      ref,
+      input.createdAt ?? Date.now(),
+      input.sessionId ?? null,
+      input.messages,
+      input.chars,
+      input.tokens,
+      input.summary,
+      input.original,
+    )
+    return ref
+  }
+
+  /**
+   * Read one folded range back, exact text included.
+   * @param ref - the archive ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getFoldedRange(ref: string): FoldedRangeRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM folded_ranges WHERE ref = ?').get(ref) as unknown as FoldedRangeRow | undefined
+    return row === undefined ? undefined : rowToFoldedRange(row)
+  }
+
+  /**
+   * List folded ranges newest first, without the original text.
+   * @param limit - maximum rows.
+   * @returns the listings.
+   */
+  listFoldedRanges(limit = 20): FoldedRangeMeta[] {
+    this.assertOpen()
+    const rows = this.db.prepare('SELECT * FROM folded_ranges ORDER BY ts DESC LIMIT ?').all(limit) as unknown as FoldedRangeRow[]
+    return rows.map(rowToFoldedRangeMeta)
+  }
+
+  /**
+   * Keyword-search folded ranges by their summary and original text.
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings, newest first.
+   */
+  searchFoldedRanges(query: string, limit = 5): FoldedRangeMeta[] {
+    this.assertOpen()
+    const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
+    const rows = this.db.prepare(
+      'SELECT * FROM folded_ranges WHERE summary LIKE ? ESCAPE \'\\\' OR original LIKE ? ESCAPE \'\\\' ORDER BY ts DESC LIMIT ?',
+    ).all(pattern, pattern, limit) as unknown as FoldedRangeRow[]
+    return rows.map(rowToFoldedRangeMeta)
+  }
+
+  /**
+   * Record that a folded range was read back through `memory_expand`.
+   * @param ref - the archive ref.
+   */
+  markFoldedRangeRestored(ref: string): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE folded_ranges SET restored_count = restored_count + 1 WHERE ref = ?').run(ref)
+  }
+
+  /**
+   * Aggregate size of the folded-range archive.
+   * @returns row count and summed chars/tokens.
+   */
+  foldedRangeStats(): { count: number; chars: number; tokens: number } {
+    this.assertOpen()
+    const row = this.db.prepare(
+      'SELECT COUNT(*) AS count, COALESCE(SUM(chars), 0) AS chars, COALESCE(SUM(tokens), 0) AS tokens FROM folded_ranges',
+    ).get() as unknown as { count: number; chars: number; tokens: number }
+    return { count: Number(row.count), chars: Number(row.chars), tokens: Number(row.tokens) }
+  }
+
+  /**
+   * Delete folded ranges older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneFoldedRanges(beforeTs: number): number {
+    this.assertOpen()
+    const info = this.db.prepare('DELETE FROM folded_ranges WHERE ts < ?').run(beforeTs)
+    return Number(info.changes)
+  }
+
+  /**
+   * Keep only the newest N folded ranges.
+   * @param maxEntries - the cap (<= 0 clears the archive).
+   * @returns the number of deleted rows.
+   */
+  trimFoldedRanges(maxEntries: number): number {
+    this.assertOpen()
+    const info = this.db.prepare(
+      'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
+    ).run(Math.max(0, maxEntries))
     return Number(info.changes)
   }
 

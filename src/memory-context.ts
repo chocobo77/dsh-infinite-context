@@ -24,8 +24,11 @@ import { createEmbedder, type Embedder } from './embedder.ts'
 import { VectorIndex } from './vector-index.ts'
 import {
   MemoryStore,
+  type FoldedRangeMeta,
+  type FoldedRangeRecord,
   type ToolResultMeta,
   type ToolResultRecord,
+  type UsageDetailTotal,
   type UsageEventRecord,
   type UsageTotal,
 } from './memory-store.ts'
@@ -414,6 +417,88 @@ export class MemoryContext extends Service {
     return this.store?.searchToolResults(query, limit) ?? []
   }
 
+  // --- folded history ranges: reversible compaction (see fold-archive.ts) ---
+
+  /**
+   * Archive the exact messages one compression folded into a summary.
+   * @param input - the folded payload.
+   * @returns the archive ref, or `null` when the store is unavailable.
+   */
+  archiveFoldedRange(input: {
+    readonly messages: number
+    readonly chars: number
+    readonly tokens: number
+    readonly summary: string
+    readonly original: string
+    readonly sessionId?: string | undefined
+  }): string | null {
+    this.requireEngine()
+    return this.store?.archiveFoldedRange(input) ?? null
+  }
+
+  /**
+   * Read a folded range back, exact text included.
+   * @param ref - the archive ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getFoldedRange(ref: string): FoldedRangeRecord | undefined {
+    this.requireEngine()
+    return this.store?.getFoldedRange(ref)
+  }
+
+  /**
+   * List folded ranges, newest first, without their original text.
+   * @param limit - maximum rows to return.
+   * @returns the listing.
+   */
+  listFoldedRanges(limit?: number): FoldedRangeMeta[] {
+    this.requireEngine()
+    return this.store?.listFoldedRanges(limit) ?? []
+  }
+
+  /**
+   * Keyword-search folded ranges (summary and original text).
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings.
+   */
+  searchFoldedRanges(query: string, limit?: number): FoldedRangeMeta[] {
+    this.requireEngine()
+    return this.store?.searchFoldedRanges(query, limit) ?? []
+  }
+
+  /** Record that a folded range was read back through `memory_expand`. */
+  markFoldedRangeRestored(ref: string): void {
+    this.requireEngine()
+    this.store?.markFoldedRangeRestored(ref)
+  }
+
+  /** @returns the folded-range archive size (rows, chars, tokens). */
+  foldedRangeStats(): { count: number; chars: number; tokens: number } {
+    this.requireEngine()
+    return this.store?.foldedRangeStats() ?? { count: 0, chars: 0, tokens: 0 }
+  }
+
+  /**
+   * Delete folded ranges older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneFoldedRanges(beforeTs: number): number {
+    this.requireEngine()
+    return this.store?.pruneFoldedRanges(beforeTs) ?? 0
+  }
+
+  /**
+   * Keep only the newest N folded ranges.
+   * @param maxEntries - the cap.
+   * @returns the number of deleted rows.
+   */
+  trimFoldedRanges(maxEntries: number): number {
+    this.requireEngine()
+    return this.store?.trimFoldedRanges(maxEntries) ?? 0
+  }
+
   /** @returns the number of archived tool results. */
   countToolResults(): number {
     this.requireEngine()
@@ -483,6 +568,16 @@ export class MemoryContext extends Service {
   pruneUsageEvents(beforeTs: number): number {
     this.requireEngine()
     return this.store?.pruneUsageEvents(beforeTs) ?? 0
+  }
+
+  /**
+   * Sum ledger values per kind and detail label (per provider/model buckets).
+   * @param sinceTs - epoch-millisecond lower bound (inclusive).
+   * @returns one row per (kind, detail) pair.
+   */
+  usageTotalsByDetail(sinceTs?: number): UsageDetailTotal[] {
+    this.requireEngine()
+    return this.store?.usageTotalsByDetail(sinceTs) ?? []
   }
 
   /** Run a forgetting sweep. */
