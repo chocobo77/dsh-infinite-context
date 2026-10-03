@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterAll, describe, expect, it } from 'vitest'
 import { MemoryStore } from '../src/core.ts'
 import type { MemoryDoc } from '../src/core.ts'
+import { normalizeForDedup } from '../src/memory-store.ts'
 import type { ToolResultRecord, UsageEventRecord } from '../src/memory-store.ts'
 
 const dirs: string[] = []
@@ -204,6 +205,30 @@ describe('MemoryStore', () => {
  * replaced on the transcript by a short stub carrying a content-addressed ref,
  * and the exact text stays here so it can be handed back verbatim.
  */
+describe('normalizeForDedup', () => {
+  it('masks volatile dates, times and long digit runs', () => {
+    expect(normalizeForDedup('Build 2026-10-04T12:30:00.123Z ok')).toBe('build # ok')
+    expect(normalizeForDedup('run 2026/10/04 done')).toBe('run # done')
+    expect(normalizeForDedup('at 12:30:00 sharp')).toBe('at # sharp')
+    expect(normalizeForDedup('id 1234567890')).toBe('id #')
+  })
+
+  it('keeps labelled endpoints distinct but still masks bare counters', () => {
+    // Masking every 4-digit run (the old behaviour) collapsed these into one key
+    // and made ingest silently skip the second memory.
+    expect(normalizeForDedup('port 3000')).toBe('port 3000')
+    expect(normalizeForDedup('port 3000')).not.toBe(normalizeForDedup('port 8080'))
+    expect(normalizeForDedup('pid 4242 count 12')).toBe('pid 4242 count 12')
+    expect(normalizeForDedup('listening on 8080')).toBe('listening on 8080')
+    // ...while an unlabelled counter is still treated as volatile noise.
+    expect(normalizeForDedup('printed 42000 items')).toBe('printed # items')
+  })
+
+  it('still collapses case and whitespace', () => {
+    expect(normalizeForDedup('  Foo   BAR ')).toBe('foo bar')
+  })
+})
+
 describe('MemoryStore tool results', () => {
   function record(overrides: Partial<ToolResultRecord> = {}): ToolResultRecord {
     return {
