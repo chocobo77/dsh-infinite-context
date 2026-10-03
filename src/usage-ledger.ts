@@ -28,6 +28,32 @@ export interface UsageOptions {
 /** Defaults: on, one month of history. */
 export const DEFAULT_USAGE_OPTIONS: UsageOptions = { enabled: true, retentionDays: 30 }
 
+/** One session's routed model, as `session.requestContext()` reports it. */
+export interface UsageAttributionRoute {
+  readonly provider?: string
+  readonly model?: string
+}
+
+/**
+ * The ledger attribution for one assistant message: the session it belongs to,
+ * plus `provider/model` when the route is known.
+ *
+ * The route MUST come from the session itself (`session.requestContext()`), not
+ * from a tracker-wide "last observed" slot: with concurrent sessions on
+ * different models, that slot belongs to whichever model was observed most
+ * recently, which silently bills this session's cache/billing buckets to the
+ * wrong model — exactly the per-model split this attribution exists to provide.
+ */
+export function usageAttribution(
+  sessionId: string,
+  route: UsageAttributionRoute | undefined,
+): { sessionId: string; detail?: string } {
+  if (route === undefined || (route.provider === undefined && route.model === undefined)) {
+    return { sessionId }
+  }
+  return { sessionId, detail: `${route.provider ?? 'unknown'}/${route.model ?? 'unknown'}` }
+}
+
 /** Event kinds. Stable strings — they are persisted, so never rename one. */
 export const USAGE_KIND = {
   /** Estimated tokens of the retrieved-context injection. */
