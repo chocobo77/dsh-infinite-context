@@ -200,9 +200,17 @@ export class ModelContextTracker {
     // Mirror into the per-model registry: a probe narrowing must win over the
     // declared value, and each model keeps its own slot.
     if (info.model !== undefined) this.setModelWindow({ ...info, source: info.source })
+    // The global "last observed" slot mirrors the EFFECTIVE window of the most
+    // recently observed model: the registry's value when it has one. Using the
+    // raw declared value here let a declaration replayed on every turn widen the
+    // slot back past an adopted probe, even though the per-model registry (and
+    // `windowFor`) correctly stayed narrowed — and the global slot feeds budget
+    // math for the routed model.
+    const effective = (info.model === undefined ? undefined : this.windowsByModel.get(info.model)?.contextWindow)
+      ?? info.contextWindow
     const current = this.modelContext
     if (current !== null
-      && current.contextWindow === info.contextWindow
+      && current.contextWindow === effective
       && current.source === info.source
       && current.provider === info.provider
       && current.model === info.model) {
@@ -211,7 +219,7 @@ export class ModelContextTracker {
     this.modelContext = {
       ...(info.provider === undefined ? {} : { provider: info.provider }),
       ...(info.model === undefined ? {} : { model: info.model }),
-      contextWindow: info.contextWindow,
+      contextWindow: effective,
       source: info.source,
       detectedAt: Date.now(),
     }

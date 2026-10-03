@@ -42,8 +42,12 @@ describe('ModelContextTracker', () => {
   it('probe adoption overrides the request-context source when it changes', () => {
     const tracker = new ModelContextTracker(94_000, false)
     tracker.adopt({ model: 'm', contextWindow: 8192, source: 'request-context' })
+    // The probe reports WIDER than the declaration, and narrow-only says a probe
+    // may never inflate capacity (`setModelWindow`), so the effective window
+    // stays at the declaration; only the source label moves to the probe (that
+    // is what this test is about). A user's `config` override may widen.
     tracker.adopt({ model: 'm', contextWindow: 16_384, source: 'probe' })
-    expect(tracker.effectiveWindow).toBe(16_384)
+    expect(tracker.effectiveWindow).toBe(8192)
     expect(tracker.info?.source).toBe('probe')
   })
 
@@ -117,6 +121,26 @@ describe('ModelContextTracker probe ceiling', () => {
     // A model that declared its own window is capped by that declaration.
     tracker.adopt({ model: 'big-remote', contextWindow: 200_000, source: 'request-context' })
     expect(tracker.probeCeilingFor('big-remote', 94_000)).toBe(200_000)
+  })
+})
+
+describe('ModelContextTracker global slot narrowing', () => {
+  it('does not let a replayed declaration widen the global slot past a probe', () => {
+    const tracker = new ModelContextTracker(94_000, true)
+    tracker.adopt({ model: 'qwen3', contextWindow: 100_000, source: 'request-context' })
+    expect(tracker.effectiveWindow).toBe(100_000)
+    // The live probe reveals the server's real runtime window.
+    tracker.adopt({ model: 'qwen3', contextWindow: 32_000, source: 'probe' })
+    expect(tracker.effectiveWindow).toBe(32_000)
+    expect(tracker.windowFor('qwen3')).toBe(32_000)
+    // The declared window is re-observed every turn; it must not widen either
+    // slot back (the global slot feeds budget math for the routed model).
+    tracker.adopt({ model: 'qwen3', contextWindow: 100_000, source: 'request-context' })
+    expect(tracker.effectiveWindow).toBe(32_000)
+    expect(tracker.windowFor('qwen3')).toBe(32_000)
+    // A user's own config override is declared truth and MAY widen.
+    tracker.adopt({ model: 'qwen3', contextWindow: 131_072, source: 'config' })
+    expect(tracker.effectiveWindow).toBe(131_072)
   })
 })
 
