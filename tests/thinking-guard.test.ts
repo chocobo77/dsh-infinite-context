@@ -95,6 +95,20 @@ describe('computeGuardLine (dynamic reserve)', () => {
     expect(computeGuardLine(-1, 60_000, 10_000, 8_192, 0.9)).toBeUndefined()
     expect(computeGuardLine(Number.NaN, 60_000, 10_000, 8_192, 0.9)).toBeUndefined()
   })
+
+  it('stands down when the line cannot rise above the fixed prefix', () => {
+    // 8K local window with ~6K of tool schemas: the reserve exceeds the window,
+    // so the old `max(1, …)` clamp made the guard hard-fire before every
+    // generation (and again after every compaction retry).
+    expect(computeGuardLine(8_192, 6_000, 6_000, 8_192, 0.7)).toBeUndefined()
+    // A tiny positive line is just as futile: 20K window, 12K of tools.
+    expect(computeGuardLine(20_000, 8_000, 12_000, 8_192, 0.7)).toBeUndefined()
+  })
+
+  it('still guards when the message budget exceeds the fixed prefix', () => {
+    const line = computeGuardLine(32_768, 8_000, 6_000, 8_192, 0.7)!
+    expect(line).toBeGreaterThan(6_000)
+  })
 })
 
 describe('decideGuardTrigger', () => {
