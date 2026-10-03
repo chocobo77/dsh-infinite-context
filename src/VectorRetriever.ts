@@ -105,11 +105,13 @@ export function normalizeSurfaceText(text: string): string {
 
 /**
  * Split a memory's text into normalized segments that can be looked up in the
- * surface blob. The provenance prefix (`[tier=…, …]`) is stripped first — it is
- * added at injection time and never appears on the surface.
+ * surface blob. Both provenance prefixes are stripped first — `[source: …]`
+ * (written by ingest) and `[tier=…, …]` (added at injection time). Neither
+ * appears on the surface, and at 20+ chars the source header alone would count
+ * as an unmatched segment and defeat the match ratio.
  */
 export function surfaceSegments(memoryText: string): string[] {
-  const withoutProvenance = memoryText.replace(/^\[tier=[^\]]*\]\s*/i, '')
+  const withoutProvenance = memoryText.replace(/^\[(?:tier=|source:)[^\]]*\]\s*/i, '')
   return withoutProvenance
     .split(/\n+|(?<=\.)\s+/)
     .map(segment => normalizeSurfaceText(segment))

@@ -191,6 +191,16 @@ describe('surface-aware dedup helpers', () => {
     expect(segments).toEqual(['some longer memory body text'])
   })
 
+  it('strips the ingest-time source header too', () => {
+    // `[source: …]` is written by ingest and never appears on the surface; left
+    // in, it counts as a 20-char segment and pushes a short memory below the
+    // 70% match ratio, re-injecting content that is still visible.
+    expect(surfaceSegments('[source: web_search]\nthe quick brown fox jumps'))
+      .toEqual(['the quick brown fox jumps'])
+    const blob = buildSurfaceBlob(['the quick brown fox jumps'])
+    expect(isMemoryOnSurface('[source: web_search]\nthe quick brown fox jumps', blob!)).toBe(true)
+  })
+
   it('drops segments shorter than the minimum match length', () => {
     expect(surfaceSegments('memory A')).toEqual([])
   })
