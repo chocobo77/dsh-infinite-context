@@ -238,7 +238,9 @@ export class MemoryContext extends Service {
         // A live probe reflects the server's REAL runtime context, which can
         // be far smaller than the declared catalog window. Cap the adoption at
         // the PROBED model's own declared window (per-model registry) — a probe
-        // can only LOWER that model's window, never inflate it.
+        // can only LOWER that model's window, never inflate it. The ceiling is
+        // never the global "last observed" slot, which may belong to another
+        // model (a small local one could otherwise flatten this model's probe).
         //
         // Note: `adopt` also moves the global "last observed" slot to the
         // probed model, so the config-fallback window follows the most
@@ -246,9 +248,7 @@ export class MemoryContext extends Service {
         // deployments (the fallback then reflects the REAL window, not a wrong
         // declaration); multi-model runtimes always read the per-model
         // registry via windowForModel, which this call also maintains.
-        const ceiling = this.modelTracker.windowFor(model)
-          ?? this.modelTracker.info?.contextWindow
-          ?? this.resolved.contextWindow
+        const ceiling = this.modelTracker.probeCeilingFor(model, this.resolved.contextWindow)
         const adopted = Math.min(window, ceiling)
         this.modelTracker.adopt({ model, contextWindow: adopted, source: 'probe' })
         this.modelTracker.markResolved(model)
