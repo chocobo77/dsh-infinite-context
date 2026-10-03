@@ -239,6 +239,9 @@ async function probeListing(
     ? data
     : data.filter(entry => (entry as { id?: unknown })?.id === name)
   for (const raw of entries) {
+    // Listings are remote input: a null or primitive entry must be skipped, not
+    // dereferenced — every probe is best-effort and never throws into its caller.
+    if (typeof raw !== 'object' || raw === null) continue
     const found = entryContext(raw as Record<string, unknown>, fields)
     if (found !== undefined) return found
   }

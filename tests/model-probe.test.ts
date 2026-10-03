@@ -189,6 +189,15 @@ describe('isLocalBaseURL', () => {
   })
 })
 
+describe('malformed listings', () => {
+  it('skips null and primitive entries instead of throwing', async () => {
+    // The listing is remote input: `{data:[null]}` used to make entryContext
+    // throw a TypeError, breaking the "never throws into the caller" contract.
+    mockFetchOnce(() => jsonResponse({ data: [null, 'nope', { id: 'm', context_length: 4096 }] }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1')).resolves.toBe(4096)
+  })
+})
+
 describe('provider settings resolution', () => {
   const namespaces = [
     {
