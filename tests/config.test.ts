@@ -25,6 +25,13 @@ describe('resolveDshHome', () => {
     expect(resolveDshHome({}, home)).toBe(join(home, '.dsh'))
   })
 
+  it('absolute-izes a relative $DSH_HOME like DSH itself does', () => {
+    // A relative home would make resolveStorePath return a cwd-relative store
+    // path, which moves with the launch directory and looks like data loss.
+    expect(resolveDshHome({ DSH_HOME: 'relhome' }, join('C:', 'users', 'me'))).toBe(resolve('relhome'))
+    expect(isAbsolute(resolveDshHome({ DSH_HOME: 'relhome' }, join('C:', 'users', 'me')))).toBe(true)
+  })
+
   it('expands a leading ~', () => {
     const home = join('C:', 'users', 'me')
     expect(resolveDshHome({ DSH_HOME: '~' }, home)).toBe(home)
