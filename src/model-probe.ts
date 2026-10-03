@@ -32,6 +32,7 @@ const LOOPBACK_HOSTS = new Set([
   '::',
   '0.0.0.0',
   '::ffff:127.0.0.1',
+  '::ffff:7f00:1', // Node's normalized form of ::ffff:127.0.0.1
 ])
 
 /**
@@ -44,7 +45,10 @@ const LOOPBACK_HOSTS = new Set([
  * unauthenticated).
  */
 export function isLocalHostname(host: string): boolean {
-  const normalized = host.trim().toLowerCase()
+  // `URL.hostname` keeps the brackets around an IPv6 literal (`[::1]`), and a
+  // dotted IPv4-mapped literal is normalized to hex (`::ffff:7f00:1`); both
+  // spellings must resolve to local or a server on ::1 is never context-probed.
+  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
   if (normalized.length === 0) return false
   if (LOOPBACK_HOSTS.has(normalized)) return true
   if (normalized.startsWith('10.')) return true

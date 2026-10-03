@@ -177,6 +177,15 @@ describe('isLocalBaseURL', () => {
     expect(isLocalBaseURL('http://10.0.0.5/v1')).toBe(true)
   })
 
+  it('classifies IPv6 loopback literals as local', () => {
+    // URL.hostname keeps the brackets ([::1]) and Node normalizes an
+    // IPv4-mapped literal to hex (:0:0:0:0:0:ffff:127.0.0.1 → ::ffff:7f00:1).
+    expect(isLocalHostname('[::1]')).toBe(true)
+    expect(isLocalHostname('::ffff:7f00:1')).toBe(true)
+    expect(isLocalBaseURL('http://[::1]:1234/v1')).toBe(true)
+    expect(isLocalBaseURL('http://[::ffff:127.0.0.1]:1234/v1')).toBe(true)
+  })
+
   it('classifies public online base URLs as non-local (never probed)', () => {
     expect(isLocalBaseURL('https://open.bigmodel.cn/api/paas/v4')).toBe(false)
     expect(isLocalBaseURL('https://api.xiaomimimo.com/v1')).toBe(false)
