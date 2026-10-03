@@ -54,17 +54,25 @@ function stripHtmlRecursive(obj: unknown): unknown {
 }
 
 /** Extract just the content fields from a web_search result. */
-function sanitizeWebSearch(result: Record<string, unknown>): Record<string, unknown> {
-  const items = result.results ?? result.items ?? result.hits
-  if (!Array.isArray(items)) return stripHtmlRecursive(result) as Record<string, unknown>
-  const cleaned = items.slice(0, 10).map((item: Record<string, unknown>) => ({
+function sanitizeWebSearch(result: Record<string, unknown>, config: SanitizerConfig): Record<string, unknown> {
+  // DSH's own web_search reports `{ content?, sources: [{ url, title, snippet }] }`;
+  // other producers use results/items/hits. Missing `sources` meant the REAL
+  // payload skipped extraction and the 10-item cap entirely.
+  const key = (['sources', 'results', 'items', 'hits'] as const).find(name => Array.isArray(result[name]))
+  if (key === undefined) {
+    // Unknown shape: still strip HTML, but bound the size like the generic path.
+    return truncateStrings(stripHtmlRecursive(result), config.maxChars) as Record<string, unknown>
+  }
+  const cleaned = (result[key] as Record<string, unknown>[]).slice(0, 10).map(item => ({
     title: typeof item.title === 'string' ? stripHtml(item.title) : item.title,
     snippet: typeof (item.snippet ?? item.description) === 'string'
       ? stripHtml(String(item.snippet ?? item.description))
       : (item.snippet ?? item.description),
     ...(item.url != null ? { url: item.url } : {}),
   }))
-  return { results: cleaned, total: result.total ?? cleaned.length }
+  const out: Record<string, unknown> = { [key]: cleaned, total: result.total ?? cleaned.length }
+  if (typeof result.content === 'string' && result.content.length > 0) out.content = stripHtml(result.content)
+  return out
 }
 
 /** Keep tail N lines of stdout + error from a code execution result. */
@@ -165,7 +173,7 @@ export function sanitizeToolResult(
 
   switch (source) {
     case 'web_search':
-      return sanitizeWebSearch(obj)
+      return sanitizeWebSearch(obj, config)
     case 'code_exec':
       return sanitizeCodeExec(obj)
     default:

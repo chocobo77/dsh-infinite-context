@@ -21,6 +21,27 @@ describe('structured object payloads (manual memory_ingest path)', () => {
     expect(out.total).toBe(99)
   })
 
+  it('web_search: recognizes the real {content, sources} shape', () => {
+    const raw = {
+      content: '<p>summary</p>',
+      sources: [
+        { title: '<b>Alpha</b>', snippet: '<i>one</i>', url: 'https://a.example' },
+        ...Array.from({ length: 12 }, (_, i) => ({ title: `t${i}`, snippet: `s${i}` })),
+      ],
+    }
+    const out = sanitizeToolResult(raw, 'web_search') as {
+      sources: { title: string; snippet: string; url?: string }[]
+      content?: string
+      total: number
+    }
+    expect(out.sources).toHaveLength(10)
+    expect(out.sources[0].title).toBe('Alpha')
+    expect(out.sources[0].snippet).toBe('one')
+    expect(out.sources[0].url).toBe('https://a.example')
+    expect(out.content).toBe('summary')
+    expect(out.total).toBe(10)
+  })
+
   it('code_exec: keeps the tail 200 lines of stdout plus error and exitCode', () => {
     const lines = Array.from({ length: 250 }, (_, i) => `line ${i}`)
     const out = sanitizeToolResult({ stdout: lines.join('\n'), stderr: 'boom', exitCode: 1 }, 'code_exec') as {

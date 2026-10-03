@@ -202,6 +202,21 @@ describe('tool-archive helpers', () => {
 })
 
 describe('ToolResultArchive', () => {
+  it('still returns the ref when retention pruning fails', () => {
+    const { store } = makeStore()
+    const failing: ToolArchiveStore = {
+      ...store,
+      deleteToolResultsBefore() { throw new Error('prune failed') },
+    }
+    const { archive, warnings } = makeArchive(failing, { ...OPTIONS, retentionDays: 1 })
+    const captured = archive.capture('pwsh', 'c1', 's1', longText())
+    // The row WAS stored: returning null ("nothing archived") would hide it and
+    // drop the caller's digest/absorb accounting.
+    expect(captured).not.toBeNull()
+    expect(captured?.ref.startsWith('tr_')).toBe(true)
+    expect(warnings.some(message => message.includes('retention'))).toBe(true)
+  })
+
   it('leaves an oversized result on the surface when the store rejects it', () => {
     const { store } = makeStore()
     const failing: ToolArchiveStore = {

@@ -330,8 +330,9 @@ export class ToolResultArchive {
       return digest === null ? null : { chars, inserted: false, digest }
     }
     const ref = archiveRef(text)
+    let inserted: boolean
     try {
-      const inserted = this.store.archiveToolResult({
+      inserted = this.store.archiveToolResult({
         ref,
         tool,
         ...(callId === undefined ? {} : { callId }),
@@ -341,12 +342,19 @@ export class ToolResultArchive {
         text,
         ...(digest === null ? {} : { digest }),
       })
-      this.enforceRetention()
-      return { ref, chars, inserted, digest }
     } catch (error) {
       this.logger.warn('tool archive: store failed for ' + ref + ': ' + reasonOf(error))
       return null
     }
+    // Pruning is best-effort and must NOT share the insert's catch: `null` means
+    // "nothing was archived", so a pruning failure would hide a stored row and
+    // drop the caller's digest/absorb accounting.
+    try {
+      this.enforceRetention()
+    } catch (error) {
+      this.logger.warn('tool archive: retention failed: ' + reasonOf(error))
+    }
+    return { ref, chars, inserted, digest }
   }
 
   /**
