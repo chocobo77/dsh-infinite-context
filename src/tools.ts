@@ -26,6 +26,38 @@ function renderHits(hits: { doc: { tier: string; text: string }; score: number }
   )).join('\n\n')
 }
 
+/**
+ * Code-point window(s) around every occurrence of `query` in `original`.
+ * @param original - the archived text.
+ * @param query - the substring to look for (case-insensitive).
+ * @param maxWindows - upper bound on the number of returned windows.
+ * @param pad - code points of context kept on each side of a match.
+ * @returns one `...window...` string per match, up to `maxWindows`.
+ */
+export function matchWindows(original: string, query: string, maxWindows: number, pad = 200): string[] {
+  const points = Array.from(original)
+  const haystack = original.toLowerCase()
+  const needle = query.toLowerCase()
+  const windows: string[] = []
+  let from = 0
+  while (windows.length < maxWindows) {
+    const at = haystack.indexOf(needle, from)
+    if (at < 0) break
+    // `indexOf` reports a UTF-16 offset, but the window is sliced from a
+    // CODE-POINT array: with an astral character (emoji, some CJK extensions)
+    // before the match the two index spaces diverge, so the window would start
+    // past the match and the scan would drift. Convert, and keep `from` in
+    // UTF-16 space because it feeds `indexOf`.
+    const startPoint = Array.from(original.slice(0, at)).length
+    const matchPoints = Array.from(original.slice(at, at + needle.length)).length
+    const start = Math.max(0, startPoint - pad)
+    const end = Math.min(points.length, startPoint + matchPoints + pad)
+    windows.push('...' + points.slice(start, end).join('') + '...')
+    from = at + needle.length
+  }
+  return windows
+}
+
 /** Register the memory tools. */
 export function apply(ctx: Context) {
   ctx.tools.register(defineTool({
@@ -341,19 +373,8 @@ export function apply(ctx: Context) {
       const points = Array.from(original)
       if (query !== undefined && query.length > 0) {
         const label = JSON.stringify(query)
-        const haystack = original.toLowerCase()
-        const needle = query.toLowerCase()
         const maxWindows = Math.max(1, Math.min(20, Math.floor(args.limit ?? 5)))
-        const windows: string[] = []
-        let from = 0
-        while (windows.length < maxWindows) {
-          const at = haystack.indexOf(needle, from)
-          if (at < 0) break
-          const start = Math.max(0, at - 200)
-          const end = Math.min(points.length, at + needle.length + 200)
-          windows.push('...' + points.slice(start, end).join('') + '...')
-          from = at + needle.length
-        }
+        const windows = matchWindows(original, query, maxWindows)
         if (windows.length === 0) return header + '\nNo match for ' + label + '.'
         return header + '\n' + windows.length + ' match window(s) for ' + label + ':\n\n' + windows.join('\n\n')
       }
