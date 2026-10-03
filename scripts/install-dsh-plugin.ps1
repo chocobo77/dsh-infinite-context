@@ -542,6 +542,53 @@ if ($kind -eq 'tarball') {
   }
 }
 
+# ------------------------------ 安装后一致性校验：同版本重打包时 node_modules 可能是旧的 ------------------------------
+# 实测（2026-10-04）：依赖是 file:…/packages/<pkg>-<ver>.tgz，同一版本号被重新 pack（内容变了）时，
+# dsh plugin add / pnpm 只更新锁文件的 integrity，**不会**重新解包 node_modules\<pkg> —— 于是“安装成功”
+# 但跑起来的仍是旧代码（dist 的 mtime 还停在上一次）。这里把 tgz 解到临时目录逐文件比对哈希，
+# 不一致就删掉解包目录重装一次，确保“装完即最新”。
+function Test-InstalledMatchesTarball {
+  param([string]$TarballPath, [string]$PackageDir)
+  if (-not (Test-Path $TarballPath) -or -not (Test-Path $PackageDir)) { return $true }
+  $tmp = Join-Path $env:TEMP ('dshipc-verify-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  try {
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    $null = & tar -xzf $TarballPath -C $tmp 2>&1
+    $src = Join-Path $tmp 'package'
+    if (-not (Test-Path $src)) { return $true }
+    $mismatch = @()
+    Get-ChildItem $src -Recurse -File | ForEach-Object {
+      $rel = $_.FullName.Substring($src.Length + 1)
+      $dst = Join-Path $PackageDir $rel
+      if (-not (Test-Path $dst)) { $mismatch += $rel }
+      elseif ((Get-FileHash $_.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $dst -Algorithm SHA256).Hash) { $mismatch += $rel }
+    }
+    return ($mismatch.Count -eq 0)
+  } catch { return $true }
+  finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+}
+
+if ($kind -eq 'tarball') {
+  $installedDir = Join-Path $profileDir ('node_modules\' + (Get-PkgNameFromTgz $installArg))
+  if (Test-Path $installedDir) {
+    if (Test-InstalledMatchesTarball -TarballPath $installArg -PackageDir $installedDir) {
+      Write-Ok "已安装副本与 tarball 一致（$installedDir）"
+    }
+    else {
+      Write-Warn2 '已安装副本与 tarball 不一致（同版本重打包 → pnpm 未重新解包）→ 强制重装该包'
+      Remove-Item -LiteralPath $installedDir -Recurse -Force
+      Push-Location $profileDir
+      try {
+        $null = & pnpm install --offline 2>&1
+        if ($LASTEXITCODE -ne 0) { $null = & pnpm install 2>&1 }
+      } finally { Pop-Location }
+      if (Test-InstalledMatchesTarball -TarballPath $installArg -PackageDir $installedDir) {
+        Write-Ok '强制重装完成，已安装副本与 tarball 一致'
+      } else { Write-Warn2 "重装后仍不一致 —— 请手动检查 $installedDir" }
+    }
+  }
+}
+
 # ------------------------------ 幂等清理：移除旧手动方式残留的同 id 条目 ------------------------------
 # 场景（2026-08-30 事故）：插件先以手动 file:/// 方式写入 profile cordis.patch.yml，
 # 之后又以 bundle 机制安装 → 同 id entry 出现两次 → loader 报 duplicate loader entry id。
