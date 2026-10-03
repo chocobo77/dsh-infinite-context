@@ -116,6 +116,19 @@ describe('dynamicCompactionRatio', () => {
     expect(dynamicCompactionRatio(0.7, 0.5, 0.9)).toBeCloseTo(0.5)
     expect(dynamicCompactionRatio(0.7, 0.5, 0.5)).toBeCloseTo(0.7)
   })
+
+  it('never raises the trigger above the base when the floor is unusable', () => {
+    // A misconfigured floor (0.9 > base 0.7) used to win the `Math.max` and
+    // push the trigger ABOVE the configured threshold — its exact opposite.
+    expect(dynamicCompactionRatio(0.7, 0.9, 1)).toBeCloseTo(0.7)
+    expect(dynamicCompactionRatio(0.7, 0.9, 0.6)).toBeCloseTo(0.7)
+    expect(dynamicCompactionRatio(0.7, 0.7, 1)).toBeCloseTo(0.7)
+    // Non-finite or non-positive floors collapse the curve to "always
+    // compress", so they are ignored and the base ratio applies.
+    expect(dynamicCompactionRatio(0.8, Number.NaN, 1)).toBeCloseTo(0.8)
+    expect(dynamicCompactionRatio(0.8, -1, 1)).toBeCloseTo(0.8)
+    expect(dynamicCompactionRatio(0.8, 0, 1)).toBeCloseTo(0.8)
+  })
 })
 
 describe('decidePressureCompaction with dynamicRatio', () => {

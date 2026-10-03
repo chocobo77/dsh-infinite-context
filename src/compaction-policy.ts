@@ -81,8 +81,13 @@ export function dynamicCompactionRatio(
   fillRatio: number,
 ): number {
   const t = Math.max(0, Math.min(1, (fillRatio - 0.5) / 0.4))
-  const effective = baseRatio - (baseRatio - floor) * t
-  return Math.max(floor, Math.min(baseRatio, effective))
+  // The floor may only LOWER the trigger. A floor at/above the base would raise
+  // it past the configured threshold (0.7 base + 0.9 floor → 0.9), and a
+  // non-finite or non-positive floor would collapse it to "always compress";
+  // both are unusable, so the base ratio applies unchanged instead.
+  const boundedFloor = Number.isFinite(floor) && floor > 0 ? Math.min(floor, baseRatio) : baseRatio
+  const effective = baseRatio - (baseRatio - boundedFloor) * t
+  return Math.max(boundedFloor, Math.min(baseRatio, effective))
 }
 
 /**
