@@ -475,7 +475,16 @@ export class ToolResultArchive {
       const captured = known === undefined
         ? this.capture(tool, callId, String(session.id), text)
         : undefined
-      const ref = known?.ref ?? captured?.ref ?? archiveRef(text)
+      // No stored row and no capture: there is no ref to hand back. Rewriting
+      // now would destroy the only copy of the payload and leave a stub pointing
+      // at an unknown ref, so leave the text untouched and retry on a later pass.
+      const ref = known?.ref ?? captured?.ref
+      if (ref === undefined) {
+        this.logger.warn(
+          'tool archive: could not store a ' + charsBefore + '-char tool result; leaving it on the surface',
+        )
+        continue
+      }
       // Absorb first: a digest of the signal lines (errors, counts, paths) is
       // far more useful than a blind head+tail slice, is bounded well below the
       // threshold, and is what the model sees instead of the payload. Fall back

@@ -202,6 +202,25 @@ describe('tool-archive helpers', () => {
 })
 
 describe('ToolResultArchive', () => {
+  it('leaves an oversized result on the surface when the store rejects it', () => {
+    const { store } = makeStore()
+    const failing: ToolArchiveStore = {
+      ...store,
+      archiveToolResult() { throw new Error('disk full') },
+    }
+    const { archive, warnings } = makeArchive(failing, OPTIONS)
+    const { session, events, addToolResult } = makeSession()
+    const seq = addToolResult('c1', longText())
+    const result = archive.rewriteAllResults(session as unknown as Session)
+    // Nothing was storable, so nothing may be rewritten: a stub would point at
+    // a ref that does not exist and the only copy of the text would be gone.
+    expect(result.replaced).toBe(0)
+    expect(result.refs).toEqual([])
+    const event = events.get(seq) as unknown as FakeEvent | undefined
+    expect(textOfBlocks(event?.data.message.content ?? [])).toContain('abcdefghij')
+    expect(warnings.some(message => message.includes('could not store'))).toBe(true)
+  })
+
   it('captures only oversized results, once per content', () => {
     const { rows, store } = makeStore()
     const { archive } = makeArchive(store, OPTIONS)
