@@ -149,23 +149,26 @@ function relativeAge(createdAt: number, now: number = Date.now()): string {
 }
 
 /** Split text into chunks of roughly `size` characters at sentence boundaries. */
-function chunkText(text: string, size: number): string[] {
-  if (text.length <= size) return [text]
+export function chunkText(text: string, size: number): string[] {
+  // A non-positive or non-finite size would spin forever: the hard-cut branch
+  // would push the same (empty) head and slice zero characters off `remaining`.
+  const width = Number.isFinite(size) ? Math.max(1, Math.floor(size)) : 1
+  if (text.length <= width) return [text]
   const chunks: string[] = []
   let remaining = text
   while (remaining.length > 0) {
-    if (remaining.length <= size) {
+    if (remaining.length <= width) {
       chunks.push(remaining)
       break
     }
-    let cut = remaining.lastIndexOf('. ', size)
-    if (cut < size * 0.3) cut = remaining.lastIndexOf('\n', size)
-    if (cut < size * 0.3) {
-      // Hard cut: exactly `size` chars — there is no separator to keep, and
-      // including one extra char (slice(cut + 1) with cut = size) would
+    let cut = remaining.lastIndexOf('. ', width)
+    if (cut < width * 0.3) cut = remaining.lastIndexOf('\n', width)
+    if (cut < width * 0.3) {
+      // Hard cut: exactly `width` chars — there is no separator to keep, and
+      // including one extra char (slice(cut + 1) with cut = width) would
       // overshoot the requested chunk size.
-      chunks.push(remaining.slice(0, size).trim())
-      remaining = remaining.slice(size).trim()
+      chunks.push(remaining.slice(0, width).trim())
+      remaining = remaining.slice(width).trim()
       continue
     }
     chunks.push(remaining.slice(0, cut + 1).trim())
@@ -272,9 +275,10 @@ export class VectorRetriever {
         )
       }
     })()
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
       const timeout = new Promise<never>((_, reject) => {
-        const timer = setTimeout(() => {
+        timer = setTimeout(() => {
           timedOut = true
           reject(new Error('memory store timeout'))
         }, MEMORY_STORE_TIMEOUT_MS)
@@ -285,6 +289,11 @@ export class VectorRetriever {
       this.ctx.logger.warn(
         `${TAG} memory store failed for source=${source}: ${err instanceof Error ? err.message : String(err)}`,
       )
+    } finally {
+      // `work` usually wins the race: without clearing, every ingest left an
+      // armed (unref'd) timer behind that later flipped `timedOut` for an
+      // already-finished run.
+      if (timer !== undefined) clearTimeout(timer)
     }
     if (timedOut) {
       // The losing `work` promise keeps running; without this handler a late

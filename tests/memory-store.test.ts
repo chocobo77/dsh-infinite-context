@@ -205,6 +205,21 @@ describe('MemoryStore', () => {
  * replaced on the transcript by a short stub carrying a content-addressed ref,
  * and the exact text stays here so it can be handed back verbatim.
  */
+describe('MemoryStore tool-result cap', () => {
+  it('clamps a non-positive cap instead of silently keeping everything', () => {
+    const store = new MemoryStore(':memory:')
+    for (const ref of ['tr_a', 'tr_b', 'tr_c']) {
+      store.archiveToolResult({ ref, tool: 'pwsh', createdAt: 1000 + ref.length, chars: ref.length, text: ref })
+    }
+    expect(store.countToolResults()).toBe(3)
+    // SQLite reads `LIMIT -1` as "no limit": before the clamp this deleted zero
+    // rows and reported success while the cap was supposedly enforced.
+    expect(store.trimToolResults(-1)).toBe(3)
+    expect(store.countToolResults()).toBe(0)
+    store.close()
+  })
+})
+
 describe('MemoryStore dedup key', () => {
   it('backfills the indexed dedup key for a legacy store', () => {
     const dir = tempDir()

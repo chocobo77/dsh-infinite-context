@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   VectorRetriever,
   buildSurfaceBlob,
+  chunkText,
   isMemoryOnSurface,
   normalizeSurfaceText,
   surfaceSegments,
@@ -182,6 +183,14 @@ describe('retrieve', () => {
 })
 
 describe('surface-aware dedup helpers', () => {
+  it('chunkText terminates for a non-positive or non-finite size', () => {
+    // A width of 0 used to spin forever: the hard-cut branch pushed the same
+    // (empty) head and sliced zero characters off `remaining`.
+    expect(chunkText('abc', 0)).toEqual(['a', 'b', 'c'])
+    expect(chunkText('abc', Number.NaN)).toEqual(['a', 'b', 'c'])
+    expect(chunkText('one. two. three.', 6)).toEqual(['one.', 'two.', 'three.'])
+  })
+
   it('normalizes case and collapses whitespace runs', () => {
     expect(normalizeSurfaceText('  Hello\n\tWorld  ')).toBe('hello world')
   })
