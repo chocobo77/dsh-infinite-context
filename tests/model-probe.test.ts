@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { isLocalBaseURL, isLocalHostname, probeLlama, probeModelContext, probeOllama, probeOpenAI } from '../src/core.ts'
+import {
+  isLocalBaseURL,
+  isLocalHostname,
+  probeLlama,
+  probeModelContext,
+  probeOllama,
+  probeOpenAI,
+  providerBaseURL,
+  providerProfile,
+} from '../src/core.ts'
 
 const originalFetch = globalThis.fetch
 
@@ -177,5 +186,42 @@ describe('isLocalBaseURL', () => {
   it('treats empty and unparseable base URLs as non-local (safe default)', () => {
     expect(isLocalBaseURL('')).toBe(false)
     expect(isLocalBaseURL('not a url')).toBe(false)
+  })
+})
+
+describe('provider settings resolution', () => {
+  const namespaces = [
+    {
+      ns: 'llm-pi-ai',
+      value: {
+        providers: {
+          qwen3: { baseURL: 'http://127.0.0.1:1234/v1' },
+          cloud: { baseURL: 'https://api.example.com/v1' },
+          blank: { baseURL: '' },
+        },
+      },
+    },
+  ]
+  const local = { provider: 'qwen3', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'qwen3'] }
+
+  it('walks the provider settings path inside its namespace', () => {
+    expect(providerProfile(namespaces, local)).toEqual({ baseURL: 'http://127.0.0.1:1234/v1' })
+    expect(providerBaseURL(namespaces, local)).toBe('http://127.0.0.1:1234/v1')
+    expect(isLocalBaseURL(providerBaseURL(namespaces, local) ?? '')).toBe(true)
+  })
+
+  it('classifies a remote profile as non-local', () => {
+    const remote = { provider: 'cloud', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'cloud'] }
+    expect(isLocalBaseURL(providerBaseURL(namespaces, remote) ?? '')).toBe(false)
+  })
+
+  it('returns undefined for a missing namespace, path, profile or URL', () => {
+    expect(providerProfile([], local)).toBeUndefined()
+    expect(providerBaseURL([], local)).toBeUndefined()
+    expect(providerBaseURL(namespaces, undefined)).toBeUndefined()
+    expect(providerBaseURL(namespaces, { ...local, settingsPath: ['providers', 'ghost'] })).toBeUndefined()
+    expect(providerBaseURL(namespaces, { ...local, settingsPath: [] })).toBeUndefined()
+    expect(providerBaseURL(namespaces, { provider: 'blank', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'blank'] })).toBeUndefined()
+    expect(providerProfile([{ ns: 'llm-pi-ai', value: 42 }], local)).toBeUndefined()
   })
 })
