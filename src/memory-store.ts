@@ -583,11 +583,15 @@ export class MemoryStore {
    */
   trimToolResults(maxEntries: number): number {
     this.assertOpen()
+    // SQLite reads `LIMIT -1` as "no limit": a negative cap made the subquery
+    // return EVERY ref, so `NOT IN` matched nothing and the trim deleted zero
+    // rows while reporting success. Clamp like `trimFoldedRanges` does.
+    const keep = Number.isFinite(maxEntries) ? Math.max(0, Math.floor(maxEntries)) : 0
     const info = this.db.prepare(`
       DELETE FROM tool_results WHERE ref NOT IN (
         SELECT ref FROM tool_results ORDER BY created_at DESC, ref DESC LIMIT ?
       )
-    `).run(maxEntries)
+    `).run(keep)
     return Number(info.changes)
   }
 
