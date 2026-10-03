@@ -10,7 +10,7 @@
  */
 
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import type {
   BudgetConfig,
@@ -99,7 +99,11 @@ export function resolveDshHome(
   homeDir: string = homedir(),
 ): string {
   const fromEnv = (env[DSH_HOME_ENV] ?? '').trim()
-  if (fromEnv.length > 0) return expandHome(fromEnv, homeDir)
+  // Absolute-ize exactly like DSH's own resolver (home-paths): a RELATIVE
+  // $DSH_HOME must not leak through, because every relative store path below
+  // would then be resolved against the process cwd — the "looks like losing
+  // every memory" hazard documented on `resolveStorePath`.
+  if (fromEnv.length > 0) return resolve(expandHome(fromEnv, homeDir))
   return join(homeDir, DSH_HOME_DIR_NAME)
 }
 
