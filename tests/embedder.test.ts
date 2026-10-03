@@ -8,6 +8,23 @@ import {
   tokenize,
 } from '../src/core.ts'
 
+describe('createEmbedder', () => {
+  it('fails fast when the optional transformers package is missing', async () => {
+    // This checkout does not install the optional dependency, so the factory
+    // must reject HERE with a clear message instead of handing back an embedder
+    // whose every embed() later fails inside best-effort retrieval paths.
+    // (If the package is ever added, revisit this expectation.)
+    await expect(createEmbedder({ kind: 'transformers', dimension: 256 }))
+      .rejects.toThrow(/@huggingface\/transformers/)
+  })
+
+  it('builds the default lightweight embedder', async () => {
+    const embedder = await createEmbedder({ kind: 'lightweight', dimension: 64 })
+    expect(embedder.dimension).toBe(64)
+    expect(await embedder.embed('hello')).toHaveLength(64)
+  })
+})
+
 describe('tokenize', () => {
   it('splits ASCII words and individual Han characters', () => {
     expect(tokenize('Hello world')).toEqual(['hello', 'world'])

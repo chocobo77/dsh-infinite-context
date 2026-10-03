@@ -18,6 +18,23 @@ import type { BudgetConfig, Tier } from './types.ts'
  * @param text - the text to estimate.
  * @returns an estimated token count (>= 0).
  */
+/**
+ * The longest CODE-POINT prefix of `line` whose estimated cost (plus its
+ * newline) fits `budget` tokens; `''` when not even one character fits.
+ */
+function clipToTokens(line: string, budget: number): string {
+  if (budget <= 1) return ''
+  const points = Array.from(line)
+  let lo = 0
+  let hi = points.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (estimateTokens(points.slice(0, mid).join('')) + 1 <= budget) lo = mid
+    else hi = mid - 1
+  }
+  return points.slice(0, lo).join('')
+}
+
 export function estimateTokens(text: string): number {
   if (text.length === 0) return 0
   let cjk = 0
@@ -227,11 +244,18 @@ export class TokenBudget {
     if (this.fits(tier, text)) return text
     const limit = this.for(tier)
     const lines = text.split('\n')
-    let kept: string[] = []
+    const kept: string[] = []
     let used = 0
     for (const line of lines) {
       const cost = estimateTokens(line) + 1 // +1 for the newline
-      if (used + cost > limit && kept.length > 0) break
+      if (used + cost > limit) {
+        if (kept.length > 0) break
+        // The FIRST line alone exceeds the tier: keeping it whole returned a
+        // result over the caller's budget. Clip it to the longest prefix that
+        // fits (code-point safe) instead.
+        kept.push(clipToTokens(line, limit - used))
+        break
+      }
       kept.push(line)
       used += cost
     }

@@ -147,6 +147,18 @@ export async function createEmbedder(config: EmbedderConfig): Promise<Embedder> 
     return new LightweightEmbedder(config.dimension)
   }
   if (config.kind === 'transformers') {
+    // The doc above promises a clear failure HERE so the caller can fall back,
+    // but importing our own wrapper always succeeds: the optional package is
+    // only touched on the first embed(), where the failure would be swallowed
+    // by the best-effort retrieval paths.
+    try {
+      await import('@huggingface/transformers')
+    } catch {
+      throw new Error(
+        "embedder kind 'transformers' requires the optional '@huggingface/transformers' package "
+        + '(install it, or use the default lightweight embedder)',
+      )
+    }
     const { TransformersEmbedder } = await import('./transformers-embedder.ts')
     return new TransformersEmbedder(config.model ?? 'sentence-transformers/all-MiniLM-L6-v2', config.dimension)
   }

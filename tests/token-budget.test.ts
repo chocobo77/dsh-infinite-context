@@ -5,6 +5,18 @@ import type { BudgetConfig } from '../src/core.ts'
 
 const BUDGET: BudgetConfig = { short: 10_000, mid: 20_000, long: 5_000, retrieved: 15_000 }
 
+describe('TokenBudget.truncateToBudget', () => {
+  it('clips a single over-budget first line instead of returning it whole', () => {
+    const budget = new TokenBudget({ short: 20, mid: 20, long: 20, retrieved: 20 }, 1000)
+    const huge = 'word '.repeat(500).trim()
+    const clipped = budget.truncateToBudget('short', huge)
+    // The invariant callers rely on: the result fits the tier.
+    expect(budget.fits('short', clipped)).toBe(true)
+    expect(clipped.length).toBeGreaterThan(0)
+    expect(clipped.length).toBeLessThan(huge.length)
+  })
+})
+
 describe('estimateTokens', () => {
   it('counts CJK characters ~1:1 and other characters ~1/4', () => {
     const ascii = estimateTokens('hello world this is a test')
