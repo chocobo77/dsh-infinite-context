@@ -231,7 +231,15 @@ function rowToFoldedRange(row: FoldedRangeRow): FoldedRangeRecord {
   }
 }
 
-function rowToFoldedRangeMeta(row: FoldedRangeRow): FoldedRangeMeta {
+/**
+ * Columns a folded-range LISTING needs. `original` is deliberately excluded:
+ * it holds whole conversation ranges (often hundreds of KB) and the meta type
+ * does not expose it, so `SELECT *` would materialize every payload for nothing.
+ */
+const FOLDED_RANGE_META_COLUMNS =
+  'ref, ts, session_id, messages, chars, tokens, summary, restored_count'
+
+function rowToFoldedRangeMeta(row: Omit<FoldedRangeRow, 'original'>): FoldedRangeMeta {
   return {
     ref: row.ref,
     ...(row.session_id === null ? {} : { sessionId: row.session_id }),
@@ -672,7 +680,9 @@ export class MemoryStore {
    */
   listFoldedRanges(limit = 20): FoldedRangeMeta[] {
     this.assertOpen()
-    const rows = this.db.prepare('SELECT * FROM folded_ranges ORDER BY ts DESC LIMIT ?').all(limit) as unknown as FoldedRangeRow[]
+    const rows = this.db
+      .prepare('SELECT ' + FOLDED_RANGE_META_COLUMNS + ' FROM folded_ranges ORDER BY ts DESC LIMIT ?')
+      .all(limit) as unknown as Omit<FoldedRangeRow, 'original'>[]
     return rows.map(rowToFoldedRangeMeta)
   }
 
@@ -686,8 +696,9 @@ export class MemoryStore {
     this.assertOpen()
     const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
     const rows = this.db.prepare(
-      'SELECT * FROM folded_ranges WHERE summary LIKE ? ESCAPE \'\\\' OR original LIKE ? ESCAPE \'\\\' ORDER BY ts DESC LIMIT ?',
-    ).all(pattern, pattern, limit) as unknown as FoldedRangeRow[]
+      'SELECT ' + FOLDED_RANGE_META_COLUMNS
+        + ' FROM folded_ranges WHERE summary LIKE ? ESCAPE \'\\\' OR original LIKE ? ESCAPE \'\\\' ORDER BY ts DESC LIMIT ?',
+    ).all(pattern, pattern, limit) as unknown as Omit<FoldedRangeRow, 'original'>[]
     return rows.map(rowToFoldedRangeMeta)
   }
 
