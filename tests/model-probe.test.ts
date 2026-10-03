@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PROBE_TIMEOUT_MS } from '../src/model-probe.ts'
 import {
   isLocalBaseURL,
   isLocalHostname,
@@ -195,6 +196,29 @@ describe('isLocalBaseURL', () => {
   it('treats empty and unparseable base URLs as non-local (safe default)', () => {
     expect(isLocalBaseURL('')).toBe(false)
     expect(isLocalBaseURL('not a url')).toBe(false)
+  })
+})
+
+describe('probe timeout coverage', () => {
+  it('bounds the response body read too, not just the headers', async () => {
+    vi.useFakeTimers()
+    try {
+      mockFetchOnce((_url, init) => {
+        const signal = (init as RequestInit | undefined)?.signal as AbortSignal | undefined
+        return {
+          ok: true,
+          // Headers arrived; the body stalls until the probe's own abort fires.
+          json: () => new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')))
+          }),
+        } as unknown as Response
+      })
+      const pending = probeLlama('http://127.0.0.1:8080')
+      await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS + 50)
+      await expect(pending).resolves.toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
