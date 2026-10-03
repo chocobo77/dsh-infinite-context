@@ -1260,7 +1260,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    */
   constructor(ctx: Context, config: MemoryCompactionConfig) {
     // Strip ALL plugin-specific fields before passing to BasicCompactionEngine.
-    // DSH插件开发经验: unresolved keys cause config validation failure → plugin fails to load.
+    // Unknown keys fail config validation, which stops this plugin from loading.
     const {
       retrieval,
       compress_round_interval,
