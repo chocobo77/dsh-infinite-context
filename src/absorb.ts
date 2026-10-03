@@ -100,7 +100,9 @@ export function buildDigest(
   const seen = new Set<string>()
   let used = measureChars(header)
   const add = (line: string): boolean => {
-    const trimmed = line.trim().slice(0, ABSORB_MAX_LINE_CHARS)
+    // Clip by CODE POINT: a UTF-16 slice can cut a surrogate pair in half and
+    // leave a lone surrogate in the persisted digest and the model-facing stub.
+    const trimmed = Array.from(line.trim()).slice(0, ABSORB_MAX_LINE_CHARS).join('')
     if (trimmed.length === 0 || seen.has(trimmed)) return false
     const cost = measureChars(trimmed) + 1
     if (used + cost > options.maxDigestChars) return false

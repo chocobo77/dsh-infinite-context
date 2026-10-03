@@ -38,7 +38,7 @@ const MAX_REF_CHARS = 64
  * range is simply not recoverable.
  *
  * @param messages - how many messages were folded into the summary.
- * @param chars - code points of the archived original.
+ * @param chars - code points of the archived serialized record.
  * @param ref - the archive ref, or `null` when archiving did not happen.
  * @returns the header line (no trailing newline).
  */
@@ -48,6 +48,9 @@ export function foldedRangeHeader(messages: number, chars: number, ref: string |
   if (ref === null || ref.trim().length === 0 || ref.length > MAX_REF_CHARS) {
     return `[Compressed history — ${count} earlier messages, details preserved below]`
   }
+  // The archive holds a SERIALIZED, text-only rendering (long messages are
+  // truncated), so the header must not promise byte-exact messages.
   return `[Compressed history — ${count} earlier messages, folded into the summary below. `
-    + `The exact messages (${size} chars) are archived: read them back with memory_expand ref=${ref}]`
+    + `A serialized text record of them (${size} chars, long messages truncated) is archived: `
+    + `read it back with memory_expand ref=${ref}]`
 }

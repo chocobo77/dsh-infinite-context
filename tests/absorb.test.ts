@@ -19,6 +19,19 @@ function makePayload(): string {
   return lines.join('\n')
 }
 
+describe('buildDigest unicode safety', () => {
+  it('never cuts a long line inside a surrogate pair', () => {
+    // A line longer than the per-line cap whose cut lands mid-pair: a UTF-16
+    // slice leaves a lone surrogate in the persisted digest and the stub.
+    const long = 'x' + '\u{1F600}'.repeat(ABSORB_MAX_LINE_CHARS)
+    const payload = ['[test] running suite', long, 'ERROR: boom', 'exit code 1'].join('\n')
+    const digest = buildDigest('pwsh', payload, OPTIONS)
+    expect(digest).not.toBeNull()
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+    expect(lone.test(digest!)).toBe(false)
+  })
+})
+
 describe('buildDigest', () => {
   it('declines when disabled or under the minimum size', () => {
     const payload = makePayload()
