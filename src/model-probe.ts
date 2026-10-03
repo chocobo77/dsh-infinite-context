@@ -68,6 +68,53 @@ export function isLocalBaseURL(baseURL: string): boolean {
   }
 }
 
+/**
+ * One LLM provider's settings location, exactly as
+ * `ctx.llm.listConfigurableProviders()` reports it.
+ */
+export interface ConfigurableProviderSettings {
+  readonly provider: string
+  readonly settingsNs: string
+  readonly settingsPath?: readonly string[]
+}
+
+/** One namespace entry, exactly as `ctx.settings.describe()` reports it. */
+export interface SettingsNamespaceEntry {
+  readonly ns: string
+  readonly value?: unknown
+}
+
+/**
+ * Resolve one provider's settings profile: find its namespace among the
+ * described settings and walk the provider's `settingsPath` into the namespace
+ * value (an `llm-pi-ai` provider lives at `value.providers[provider]`). Returns
+ * `undefined` when the namespace, any path segment, or the profile is missing.
+ */
+export function providerProfile(
+  namespaces: readonly SettingsNamespaceEntry[],
+  provider: ConfigurableProviderSettings | undefined,
+): Record<string, unknown> | undefined {
+  if (provider === undefined) return undefined
+  let value: unknown = namespaces.find(entry => entry.ns === provider.settingsNs)?.value
+  for (const key of provider.settingsPath ?? []) {
+    value = typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined
+  }
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+/**
+ * The provider's configured `baseURL`, or `undefined` when its profile carries
+ * no usable URL (a blank value counts as absent, so callers keep their safe
+ * default of treating the provider as remote).
+ */
+export function providerBaseURL(
+  namespaces: readonly SettingsNamespaceEntry[],
+  provider: ConfigurableProviderSettings | undefined,
+): string | undefined {
+  const url = providerProfile(namespaces, provider)?.baseURL
+  return typeof url === 'string' && url.length > 0 ? url : undefined
+}
+
 /** A positive integer field, or `undefined` when absent/unusable. */
 function positiveInt(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value

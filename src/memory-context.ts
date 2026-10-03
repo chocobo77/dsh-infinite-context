@@ -36,7 +36,13 @@ import { TokenBudget } from './token-budget.ts'
 import { ForgettingPolicy } from './forgetting.ts'
 import { MemoryEngine, type StoreMemoryOptions, type SummarizeFn, type SummarizationTarget } from './memory-engine.ts'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { isLocalBaseURL, probeModelContext } from './model-probe.ts'
+import {
+  isLocalBaseURL,
+  probeModelContext,
+  providerBaseURL,
+  type ConfigurableProviderSettings,
+  type SettingsNamespaceEntry,
+} from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { SanitizerConfig } from './OutputSanitizer.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
@@ -206,25 +212,18 @@ export class MemoryContext extends Service {
   }
 
   /**
-   * Whether the routed provider points at a LOCAL server. Reads the provider's
-   * `baseURL` from the DSH `llm-pi-ai` settings namespace and treats loopback /
-   * private-LAN hosts as local. Only local models get a live context probe;
-   * online models are trusted at the window they declared. A provider with no
-   * readable baseURL is treated as non-local (no probe) — the safe default.
+   * Whether the routed provider points at a LOCAL server. Resolves the
+   * provider's configured `baseURL` through the host services (see
+   * `resolveProviderBaseURL`) and treats loopback / private-LAN hosts as local.
+   * Only local models get a live context probe; online models are trusted at the
+   * window they declared. A provider with no readable baseURL is treated as
+   * non-local (no probe) — the safe default.
    *
    * Public because routing decisions beyond probing depend on it: the
    * local-model conciseness directive is injected only on local routes.
    */
   isLocalRoute(provider: string | undefined): boolean {
-    if (provider === undefined || provider.length === 0) return false
-    try {
-      const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings
-      const ns = settings?.get?.('llm-pi-ai') as { providers?: Record<string, { baseURL?: string }> } | undefined
-      const baseURL = ns?.providers?.[provider]?.baseURL
-      return isLocalBaseURL(baseURL ?? '')
-    } catch {
-      return false
-    }
+    return isLocalBaseURL(this.resolveProviderBaseURL(provider))
   }
 
   /**
@@ -280,12 +279,30 @@ export class MemoryContext extends Service {
   private resolveProbeBaseURL(provider: string | undefined): string {
     const configured = this.resolved.modelProbe.baseURL
     if (configured.length > 0) return configured
+    return this.resolveProviderBaseURL(provider)
+  }
+
+  /**
+   * The routed provider's configured `baseURL`, read through the host services:
+   * `ctx.llm.listConfigurableProviders()` locates the provider's settings
+   * namespace and path, and `ctx.settings.describe()` supplies the live values
+   * (`ctx.settings` exposes no `get` — a namespace is read by describing it).
+   * Returns '' when the provider or its URL cannot be resolved, which is the
+   * safe default for both callers: remote ⇒ no live probe, no conciseness hint.
+   */
+  private resolveProviderBaseURL(provider: string | undefined): string {
     if (provider === undefined || provider.length === 0) return ''
     try {
-      const settings = (this.context as { settings?: { get?: (ns: string) => unknown } }).settings
-      const ns = settings?.get?.('llm-pi-ai') as { providers?: Record<string, { baseURL?: string }> } | undefined
-      const baseURL = ns?.providers?.[provider]?.baseURL
-      return typeof baseURL === 'string' ? baseURL : ''
+      const context = this.context as {
+        llm?: { listConfigurableProviders?: () => readonly ConfigurableProviderSettings[] }
+        settings?: {
+          describe?: (options?: { redactSecrets?: boolean }) => readonly SettingsNamespaceEntry[]
+        }
+      }
+      const entry = context.llm?.listConfigurableProviders?.().find(candidate => candidate.provider === provider)
+      const namespaces = context.settings?.describe?.()
+      if (entry === undefined || !Array.isArray(namespaces)) return ''
+      return providerBaseURL(namespaces, entry) ?? ''
     } catch {
       return ''
     }
