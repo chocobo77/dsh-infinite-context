@@ -83,7 +83,7 @@ import {
 } from './config.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
-import { USAGE_KIND, UsageLedger } from './usage-ledger.ts'
+import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import {
@@ -2016,13 +2016,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const usage = event.data.usage
       if (usage === undefined) return
       const sessionId = String(session.id)
-      // Attribute every count to the routed provider/model. A mid-session
-      // model switch invalidates the provider prefix cache, so without the
-      // per-model split that drop is indistinguishable from TTL expiry.
-      const model = ctx.memoryContext.modelInfo
-      const attribution = model === null || (model.provider === undefined && model.model === undefined)
-        ? { sessionId }
-        : { sessionId, detail: `${model.provider ?? 'unknown'}/${model.model ?? 'unknown'}` }
+      // Attribute every count to THIS session's routed provider/model, read from
+      // the session itself — the tracker's global "last observed" slot can
+      // belong to a concurrent session on another model. A mid-session model
+      // switch invalidates the provider prefix cache, so without the per-model
+      // split that drop is indistinguishable from TTL expiry.
+      const attribution = usageAttribution(sessionId, session.requestContext())
       this.usage.record(USAGE_KIND.llmRequests, 1, attribution)
       if (usage.inputTokens !== undefined) {
         this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, attribution)

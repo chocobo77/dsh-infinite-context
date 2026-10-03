@@ -3,10 +3,25 @@ import {
   DEFAULT_USAGE_OPTIONS,
   USAGE_KIND,
   UsageLedger,
+  usageAttribution,
 } from '../src/usage-ledger.ts'
 import type { UsageDetailTotal, UsageEventRecord, UsageTotal } from '../src/memory-store.ts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+describe('usageAttribution', () => {
+  it('attributes to the session and its own routed model', () => {
+    expect(usageAttribution('s1', { provider: 'deepseek-official', model: 'deepseek-flash' }))
+      .toEqual({ sessionId: 's1', detail: 'deepseek-official/deepseek-flash' })
+  })
+
+  it('degrades to the session alone when the route is unknown', () => {
+    expect(usageAttribution('s1', undefined)).toEqual({ sessionId: 's1' })
+    expect(usageAttribution('s1', {})).toEqual({ sessionId: 's1' })
+    expect(usageAttribution('s1', { provider: 'local' })).toEqual({ sessionId: 's1', detail: 'local/unknown' })
+    expect(usageAttribution('s1', { model: 'qwen3' })).toEqual({ sessionId: 's1', detail: 'unknown/qwen3' })
+  })
+})
 
 interface FakeStore {
   readonly events: UsageEventRecord[]
