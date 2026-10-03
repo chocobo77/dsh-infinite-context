@@ -254,16 +254,25 @@ function rowToFoldedRangeMeta(row: Omit<FoldedRangeRow, 'original'>): FoldedRang
 
 /**
  * Normalize text for fuzzy-exact dedup: lowercases, collapses whitespace, and
- * replaces LONG digit runs (4+ digits — timestamps, counters, ids) with a
- * placeholder so volatile numbers do not defeat the exact-text match. Short
- * digit runs (1–3) are kept intact: values like ports or small counts are
- * semantically meaningful, and masking them would collapse genuinely different
- * facts ("port 3000" vs "port 8080") into one dedup key. Used by ingest dedup.
+ * masks only the VOLATILE number shapes so a repeat differing just by its
+ * timestamp still matches — ISO dates/times (`2026-10-04`, `12:30:00.123`) and
+ * long digit runs (8+ digits: epochs, long ids, counters).
+ *
+ * 4–7 digit runs are masked too (counters, ids), EXCEPT when the text labels
+ * them as a stable endpoint — `port 3000`, `pid 4242`, `listening on 8080`.
+ * Those are facts, not noise: masking them made ingest treat `port 3000` and
+ * `port 8080` as one memory and silently drop the second. Used by ingest dedup.
  */
 export function normalizeForDedup(text: string): string {
   return text
     .toLowerCase()
-    .replace(/\d{4,}/g, '#')
+    .replace(/\d{4}[-/.]\d{2}[-/.]\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?z?)?/g, '#')
+    .replace(/\b\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?\b/g, '#')
+    .replace(/\d{8,}/g, '#')
+    .replace(
+      /\b(?:port|pid)\s+\d{1,7}\b|\blisten(?:ing)? on\s+\d{1,7}\b|\b(\d{4,7})\b/g,
+      (match, bare) => (bare === undefined ? match : '#'),
+    )
     .replace(/\s+/g, ' ')
     .trim()
 }
