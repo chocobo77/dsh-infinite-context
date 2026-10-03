@@ -21,9 +21,7 @@
   "files": [
     "dist",
     "bundle.patch.yml",
-    "cordis.yml",
-    "README.md",
-    "ARCHITECTURE.md"
+    "cordis.yml"
   ],
   "types": "./dist/index.d.ts",
   "exports": {
