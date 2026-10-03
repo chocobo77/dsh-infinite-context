@@ -144,7 +144,9 @@ export function estimateSummaryOutputTokens(inputTokens: number, maxTokens = 819
  * trigger is enough to run the plugin's own compression (system/tools + the
  * summary replay + a fixed margin); `floor(window × ratio)` is the ceiling so
  * the guard never waits past `ratio` of the window even when the reserve is
- * tiny. Returns `undefined` when the window is unknown or non-positive.
+ * tiny. Returns `undefined` when the window is unknown, non-positive, or so
+ * small that the line cannot rise above the fixed system/tools prefix (no
+ * compression can rescue such a request, so a trigger would fire forever).
  */
 export function computeGuardLine(
   window: number,
@@ -158,7 +160,13 @@ export function computeGuardLine(
   const reserve = systemToolsTokens + estimateSummaryOutputTokens(inputTokens, maxTokens) + GUARD_MARGIN
   const ceiling = Math.floor(window * clampGuardRatio(ratio))
   const dynamicLine = Math.floor(window - reserve)
-  return Math.max(1, Math.min(dynamicLine, ceiling))
+  // A line at or below the fixed prefix is not a trigger, it is a guarantee: no
+  // compression can bring the request under it, so clamping to 1 would fire
+  // before EVERY generation until the retry cap and a small-window model could
+  // never answer. Stand down and let the provider's own overflow path — which
+  // can itself compact — handle the request instead.
+  if (dynamicLine <= systemToolsTokens) return undefined
+  return Math.min(dynamicLine, ceiling)
 }
 
 /**
