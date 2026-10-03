@@ -250,7 +250,7 @@ tsc -p tsconfig.typecheck.json --noEmit
 
 ### 致谢
 
-本插件的压缩/上下文治理方向长期对齐 [billion-context](https://github.com/ranxianglei/billion-context)（MIT **外加一条附加条款**：任何终端用户可见或可交互、且使用了该软件的产品或服务，须在首页、文档或「关于/致谢」页面注明使用了 billion-context 并附指向该仓库的链接）。据此条款在此致谢并链接该仓库。我们仅在**引擎层等价重实现**其能力，未复制其源码。上游文档快照、长期更新目标与吸纳对照见 [`docs/billion-context/`](docs/billion-context/)：[`UPSTREAM.md`](docs/billion-context/UPSTREAM.md)（紧随更新目标与刷新流程）、[`ABSORPTION.md`](docs/billion-context/ABSORPTION.md)（功能吸纳对照与冲突取舍）。
+本插件的压缩/上下文治理方向长期对齐 [billion-context](https://github.com/ranxianglei/billion-context)（MIT **外加一条附加条款**：任何终端用户可见或可交互、且使用了该软件的产品或服务，须在首页、文档或「关于/致谢」页面注明使用了 billion-context 并附指向该仓库的链接）。据此条款在此致谢并链接该仓库。我们仅在**引擎层等价重实现**其能力，未复制其源码。上游文档快照、长期更新目标与吸纳对照见 [`docs/billion-context/`](billion-context/)：[`UPSTREAM.md`](billion-context/UPSTREAM.md)（紧随更新目标与刷新流程）、[`ABSORPTION.md`](billion-context/ABSORPTION.md)（功能吸纳对照与冲突取舍）。
 
 ## Introduction
 
@@ -350,8 +350,8 @@ tsc -p tsconfig.typecheck.json --noEmit
 
 ### Acknowledgements
 
-The compression/context-governance direction of this plugin is aligned long-term with [billion-context](https://github.com/ranxianglei/billion-context) (MIT **plus one additional attribution term**: any end-user-visible or interactive product or service using that software must state that it uses billion-context on its home page, docs, or an About/Credits page, with a link to that repository). Per that clause we credit and link the repository here. We only re-implement its capabilities equivalently at the engine layer; no upstream source code was copied. The pinned upstream docs snapshot, the long-term follow-up target, and the absorption/conflict record live in [`docs/billion-context/`](docs/billion-context/): [`UPSTREAM.md`](docs/billion-context/UPSTREAM.md) and [`ABSORPTION.md`](docs/billion-context/ABSORPTION.md).
+The compression/context-governance direction of this plugin is aligned long-term with [billion-context](https://github.com/ranxianglei/billion-context) (MIT **plus one additional attribution term**: any end-user-visible or interactive product or service using that software must state that it uses billion-context on its home page, docs, or an About/Credits page, with a link to that repository). Per that clause we credit and link the repository here. We only re-implement its capabilities equivalently at the engine layer; no upstream source code was copied. The pinned upstream docs snapshot, the long-term follow-up target, and the absorption/conflict record live in [`docs/billion-context/`](billion-context/): [`UPSTREAM.md`](billion-context/UPSTREAM.md) and [`ABSORPTION.md`](billion-context/ABSORPTION.md).
 
 ---
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
+See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the full design.
