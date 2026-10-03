@@ -399,6 +399,8 @@ export class MemoryStore {
 
   /**
    * Archive the exact text of one oversized tool result (idempotent by ref).
+   * Re-archiving identical bytes reuses the row but refreshes its recency and
+   * attribution, so retention cannot discard a ref the surface just re-stubbed.
    * @param record - the archived payload.
    * @returns `true` when a new row was inserted.
    */
@@ -418,8 +420,16 @@ export class MemoryStore {
       record.digest ?? null,
     )
     if (Number(info.changes) > 0) return true
-    // The row already exists (content-addressed). Backfill a digest computed
-    // on a later rewrite, but never overwrite one that is already there.
+    // The row already exists (content-addressed): the caller may have just put a
+    // NEW stub in the transcript that points at it, and retention (age + entry
+    // cap) runs immediately afterwards. Refresh recency and attribution first,
+    // or a stale created_at lets that retention delete a row the live
+    // transcript still references — the payload would be unrecoverable.
+    this.db.prepare(
+      'UPDATE tool_results SET created_at = ?, call_id = ?, session_id = ? WHERE ref = ?',
+    ).run(record.createdAt, record.callId ?? null, record.sessionId ?? null, record.ref)
+    // Backfill a digest computed on a later rewrite, but never overwrite one
+    // that is already there.
     if (record.digest !== undefined && record.digest.length > 0) {
       this.db.prepare(
         `UPDATE tool_results SET digest = ? WHERE ref = ? AND (digest IS NULL OR digest = '')`,

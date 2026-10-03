@@ -321,6 +321,20 @@ describe('MemoryStore tool results', () => {
     store.close()
   })
 
+  it('refreshes recency and attribution when a duplicate ref is re-captured', () => {
+    const store = new MemoryStore(':memory:')
+    store.archiveToolResult(record({ callId: 'c1', sessionId: 's1', createdAt: 1000 }))
+    // Identical bytes captured later reuse the row, which must then look fresh:
+    // retention (age + entry cap) runs right after capture and would otherwise
+    // delete a row the newly written transcript stub still points at.
+    expect(store.archiveToolResult(record({ callId: 'c2', sessionId: 's2', createdAt: 5000 }))).toBe(false)
+    const got = store.getToolResult('tr_aaaaaaaaaaaa')
+    expect(got?.createdAt).toBe(5000)
+    expect(got?.callId).toBe('c2')
+    expect(got?.sessionId).toBe('s2')
+    store.close()
+  })
+
   it('records, totals, lists, and prunes usage events', () => {
     const store = new MemoryStore(':memory:')
     store.recordUsageEvent({ ts: 100, kind: 'inject_tokens', value: 10, sessionId: 's1' })
