@@ -142,12 +142,21 @@ function joinPath(baseURL: string, path: string): string {
   return `${baseURL.replace(/\/+$/, '')}${path}`
 }
 
-/** Fetch with a bounded timeout; resolves to `null` on any transport failure. */
-async function boundedFetch(url: string, init?: RequestInit): Promise<Response | null> {
+/**
+ * Fetch JSON with the probe timeout covering the WHOLE exchange — headers AND
+ * body. Clearing the timer as soon as `fetch` resolved covered only the headers,
+ * so a server that answered with headers and then stalled the body hung the
+ * probe forever, contradicting this module's "probes are bounded by a timeout".
+ * Resolves to `null` on a transport failure, a non-OK status, or a non-JSON body.
+ */
+async function boundedFetchJson(url: string, init?: RequestInit): Promise<Record<string, unknown> | null> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    if (!response.ok) return null
+    const body: unknown = await response.json()
+    return typeof body === 'object' && body !== null ? body as Record<string, unknown> : null
   } catch {
     return null
   } finally {
@@ -155,22 +164,9 @@ async function boundedFetch(url: string, init?: RequestInit): Promise<Response |
   }
 }
 
-/** Read a bounded JSON body, or `null` when the server refused or the body is not JSON. */
-async function readJson(response: Response): Promise<Record<string, unknown> | null> {
-  if (!response.ok) return null
-  try {
-    const body: unknown = await response.json()
-    return typeof body === 'object' && body !== null ? body as Record<string, unknown> : null
-  } catch {
-    return null
-  }
-}
-
 /** `GET /props` on llama-server: the effective `n_ctx` of the running model. */
 export async function probeLlama(baseURL: string): Promise<number | undefined> {
-  const response = await boundedFetch(joinPath(baseURL, '/props'))
-  if (response === null) return undefined
-  const body = await readJson(response)
+  const body = await boundedFetchJson(joinPath(baseURL, '/props'))
   if (body === null) return undefined
   const settings = body.default_generation_settings as Record<string, unknown> | undefined
   return positiveInt(settings?.n_ctx) ?? positiveInt(body.n_ctx)
@@ -180,13 +176,11 @@ export async function probeLlama(baseURL: string): Promise<number | undefined> {
 export async function probeOllama(baseURL: string, model?: string): Promise<number | undefined> {
   const name = label(model)
   if (name === undefined) return undefined
-  const response = await boundedFetch(joinPath(baseURL, '/api/show'), {
+  const body = await boundedFetchJson(joinPath(baseURL, '/api/show'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: name }),
   })
-  if (response === null) return undefined
-  const body = await readJson(response)
   if (body === null) return undefined
   const info = body.model_info as Record<string, unknown> | undefined
   const params = body.parameters as Record<string, unknown> | undefined
@@ -232,9 +226,7 @@ async function probeListing(
   model: string | undefined,
   fields: readonly string[],
 ): Promise<number | undefined> {
-  const response = await boundedFetch(url)
-  if (response === null) return undefined
-  const body = await readJson(response)
+  const body = await boundedFetchJson(url)
   if (body === null) return undefined
   const data = body.data
   if (!Array.isArray(data)) return undefined
