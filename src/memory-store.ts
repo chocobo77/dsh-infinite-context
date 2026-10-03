@@ -263,6 +263,15 @@ function rowToFoldedRangeMeta(row: Omit<FoldedRangeRow, 'original'>): FoldedRang
  * Those are facts, not noise: masking them made ingest treat `port 3000` and
  * `port 8080` as one memory and silently drop the second. Used by ingest dedup.
  */
+/** `plugin_kv` key holding the normalization rule version used for `text_norm`. */
+const DEDUP_RULE_KEY = 'dedup:normalize-version'
+/**
+ * Bump whenever `normalizeForDedup` changes shape. The next open then rebuilds
+ * every stored `text_norm`, instead of comparing new texts against keys an older
+ * rule produced (which would silently defeat dedup).
+ */
+const DEDUP_RULE_VERSION = '2'
+
 export function normalizeForDedup(text: string): string {
   return text
     .toLowerCase()
@@ -302,7 +311,8 @@ export class MemoryStore {
         source_turn_end   INTEGER,
         embedding         BLOB,
         merged_from       TEXT,
-        kind              TEXT
+        kind              TEXT,
+        text_norm         TEXT
       )
     `)
     // Migration for stores created before the `kind` column existed: ALTER
@@ -311,6 +321,12 @@ export class MemoryStore {
     if (!columns.some(col => col.name === 'kind')) {
       this.db.exec('ALTER TABLE memories ADD COLUMN kind TEXT')
     }
+    // Indexed dedup key: `hasTextNormalized` used to read every row and
+    // re-normalize it per ingested chunk, which grows linearly with the store.
+    if (!columns.some(col => col.name === 'text_norm')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN text_norm TEXT')
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_text_norm ON memories (text_norm)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories (tier)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at)')
     // Generic key/value table for plugin state that must survive restarts
@@ -379,6 +395,7 @@ export class MemoryStore {
     `)
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_ts ON folded_ranges (ts)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_session ON folded_ranges (session_id, ts)')
+    this.backfillDedupKeys()
   }
 
   /**
@@ -403,6 +420,29 @@ export class MemoryStore {
       INSERT INTO plugin_kv (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(key, value)
+  }
+
+  /**
+   * Bring every row's dedup key (`text_norm`) up to date on open.
+   *
+   * Rows written before the column existed are NULL, and rows written under an
+   * older normalization rule hold a stale key. `DEDUP_RULE_VERSION` is kept in
+   * `plugin_kv`, so a rule change rebuilds every key exactly once on the next
+   * open instead of leaving old keys behind to silently defeat dedup.
+   */
+  private backfillDedupKeys(): void {
+    if (this.kvGet(DEDUP_RULE_KEY) === DEDUP_RULE_VERSION) return
+    const rows = this.db.prepare('SELECT id, text FROM memories').all() as { id: string; text: string }[]
+    const update = this.db.prepare('UPDATE memories SET text_norm = ? WHERE id = ?')
+    this.db.exec('BEGIN')
+    try {
+      for (const row of rows) update.run(normalizeForDedup(row.text), row.id)
+      this.kvSet(DEDUP_RULE_KEY, DEDUP_RULE_VERSION)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   /**
@@ -798,8 +838,8 @@ export class MemoryStore {
     this.db.prepare(`
       INSERT INTO memories (
         id, tier, text, created_at, importance,
-        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind, text_norm
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       doc.id,
       doc.tier,
@@ -812,6 +852,7 @@ export class MemoryStore {
       doc.embedding === undefined ? null : vectorToBlob(doc.embedding),
       doc.mergedFrom === undefined ? null : JSON.stringify(doc.mergedFrom),
       doc.kind ?? null,
+      normalizeForDedup(doc.text),
     )
   }
 
@@ -824,8 +865,8 @@ export class MemoryStore {
     this.db.prepare(`
       INSERT INTO memories (
         id, tier, text, created_at, importance,
-        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind, text_norm
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         tier = excluded.tier,
         text = excluded.text,
@@ -836,7 +877,8 @@ export class MemoryStore {
         source_turn_end = excluded.source_turn_end,
         embedding = excluded.embedding,
         merged_from = excluded.merged_from,
-        kind = excluded.kind
+        kind = excluded.kind,
+        text_norm = excluded.text_norm
     `).run(
       doc.id,
       doc.tier,
@@ -849,6 +891,7 @@ export class MemoryStore {
       doc.embedding === undefined ? null : vectorToBlob(doc.embedding),
       doc.mergedFrom === undefined ? null : JSON.stringify(doc.mergedFrom),
       doc.kind ?? null,
+      normalizeForDedup(doc.text),
     )
   }
 
@@ -902,9 +945,10 @@ export class MemoryStore {
 
   /**
    * Whether any stored memory has this text after fuzzy normalization
-   * (lowercase, whitespace-collapsed, digit runs of 4+ masked). Catches repeats
-   * that differ only by timestamps/counters — too costly as an indexed query,
-   * so it scans the (bounded) store; fine for hundreds of memories.
+   * (lowercase, whitespace-collapsed, volatile number shapes masked). Catches
+   * repeats that differ only by timestamps/counters. The normalized key lives in
+   * `memories.text_norm` and is indexed, so this is one indexed lookup instead of
+   * reading and re-normalizing every stored memory per ingested chunk.
    * @param text - the raw text to normalize and look up.
    * @returns true when a memory with the same normalized text exists.
    */
@@ -912,8 +956,8 @@ export class MemoryStore {
     this.assertOpen()
     const target = normalizeForDedup(text)
     if (target.length === 0) return false
-    const rows = this.db.prepare('SELECT text FROM memories').all() as { text: string }[]
-    return rows.some(row => normalizeForDedup(row.text) === target)
+    const row = this.db.prepare('SELECT 1 FROM memories WHERE text_norm = ? LIMIT 1').get(target) as { 1?: number } | undefined
+    return row !== undefined
   }
 
   /**

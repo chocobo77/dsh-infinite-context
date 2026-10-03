@@ -205,6 +205,42 @@ describe('MemoryStore', () => {
  * replaced on the transcript by a short stub carrying a content-addressed ref,
  * and the exact text stays here so it can be handed back verbatim.
  */
+describe('MemoryStore dedup key', () => {
+  it('backfills the indexed dedup key for a legacy store', () => {
+    const dir = tempDir()
+    const file = join(dir, 'legacy.db')
+    const raw = new DatabaseSync(file)
+    raw.exec(`CREATE TABLE memories (
+      id TEXT PRIMARY KEY, tier TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL,
+      importance REAL NOT NULL, source_session_id TEXT, source_turn_start INTEGER, source_turn_end INTEGER,
+      embedding BLOB, merged_from TEXT, kind TEXT
+    )`)
+    raw.prepare('INSERT INTO memories (id, tier, text, created_at, importance) VALUES (?, ?, ?, ?, ?)')
+      .run('old1', 'mid', 'Build 2026-10-04T12:30:00Z ok', 1000, 0.5)
+    raw.close()
+
+    const store = new MemoryStore(file)
+    // The row predates `text_norm`, so the migration must have rebuilt its key.
+    expect(store.hasTextNormalized('BUILD 2026-10-05T09:00:00Z OK')).toBe(true)
+    store.close()
+
+    const check = new DatabaseSync(file)
+    const row = check.prepare('SELECT text_norm FROM memories WHERE id = ?').get('old1') as { text_norm: string }
+    expect(row.text_norm).toBe('build # ok')
+    check.close()
+  })
+
+  it('refreshes the dedup key when a memory text is upserted', () => {
+    const store = new MemoryStore(':memory:')
+    store.insert(makeDoc({ id: 'a', text: 'server listening on port 3000' }))
+    expect(store.hasTextNormalized('server listening on port 3000')).toBe(true)
+    store.upsert(makeDoc({ id: 'a', text: 'server listening on port 8080' }))
+    expect(store.hasTextNormalized('server listening on port 8080')).toBe(true)
+    expect(store.hasTextNormalized('server listening on port 3000')).toBe(false)
+    store.close()
+  })
+})
+
 describe('normalizeForDedup', () => {
   it('masks volatile dates, times and long digit runs', () => {
     expect(normalizeForDedup('Build 2026-10-04T12:30:00.123Z ok')).toBe('build # ok')
