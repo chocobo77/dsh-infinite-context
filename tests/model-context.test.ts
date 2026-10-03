@@ -105,6 +105,21 @@ describe('ModelContextTracker', () => {
   })
 })
 
+describe('ModelContextTracker probe ceiling', () => {
+  it('never caps a probe by another model\u2019s window', () => {
+    const tracker = new ModelContextTracker(94_000, true)
+    // Another model adopts a small window, so the global "last observed" slot is
+    // 32K — that must NOT become the ceiling for a different model, or the probe
+    // would under-cap it (and narrow-only + markResolved make that permanent).
+    tracker.adopt({ model: 'small-local', contextWindow: 32_000, source: 'request-context' })
+    expect(tracker.effectiveWindow).toBe(32_000)
+    expect(tracker.probeCeilingFor('big-remote', 94_000)).toBe(94_000)
+    // A model that declared its own window is capped by that declaration.
+    tracker.adopt({ model: 'big-remote', contextWindow: 200_000, source: 'request-context' })
+    expect(tracker.probeCeilingFor('big-remote', 94_000)).toBe(200_000)
+  })
+})
+
 describe('ModelContextTracker per-model registry', () => {
   it('records explicit per-model overrides without moving the global slot', () => {
     const tracker = new ModelContextTracker(94_000, false)

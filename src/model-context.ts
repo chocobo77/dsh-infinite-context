@@ -92,6 +92,18 @@ export class ModelContextTracker {
     return this.windowsByModel.get(model)?.provider
   }
 
+  /**
+   * The ceiling a live probe for `model` must respect: that model's OWN declared
+   * window when the registry knows it, otherwise `fallback`.
+   *
+   * Deliberately never the global "last observed" slot: that window may belong
+   * to a DIFFERENT model, and because probing is narrow-only and marks a model
+   * resolved, capping by it under-caps the probed model permanently.
+   */
+  probeCeilingFor(model: string, fallback: number): number {
+    return this.windowsByModel.get(model)?.contextWindow ?? fallback
+  }
+
   /** All per-model windows currently known, in insertion order. */
   perModel(): readonly ModelContextInfo[] {
     return [...this.windowsByModel.values()]
