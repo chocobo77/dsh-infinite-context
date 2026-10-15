@@ -111,6 +111,15 @@
     # short-context local models out of the slow long-context zone.
     compress_trigger_ratio: 0.75
     compress_target_ratio: 0.6   # progressive: only the oldest overflow is summarized
+    # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN and
+    # the target DEEPER as the session heats up (growth EMA) or matures (prior
+    # compressions). Trigger <= 0.92 (never overflow), >= 0.65; target >= 0.25;
+    # band 0.08..0.45. Set false to disable the steering; hard bounds still apply.
+    compress_dynamic_levels: true
+    # Unified governor: one policy (planCompaction) decides lane + water levels,
+    # and the fold executor obeys it. Off = legacy per-lane triggers (shared
+    # curves still apply). Explicit opt-in for existing configs.
+    compaction_governance: true
     # Dynamic compaction threshold: when the routed model's REAL window (live
     # probe / modelWindows) is smaller than DSH declares, force compaction from
     # a threshold derived from the REAL window instead of waiting for a

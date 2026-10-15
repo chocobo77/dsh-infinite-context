@@ -87,11 +87,24 @@ import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import {
+  GOV_GUARD_RESERVE_MIN,
+  GOV_GUARD_RESERVE_RATIO,
+  GOV_TRIGGER_CEILING,
+  ledgerView,
+  planFoldCompaction,
+  type CompactionPlan,
+  type GovernanceLedger,
+} from './compaction-governance.ts'
+import {
   COMPRESS_FAILURE_COOLDOWN,
+  SUMMARY_OUTPUT_SHARE,
   decidePressureCompaction,
+  dynamicHistoryLevels,
+  foldTokensForTarget,
   nextGrowthEma,
   shouldCompressHistory,
   shouldNudgeCompaction,
+  type HistoryLevels,
 } from './compaction-policy.ts'
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
@@ -235,7 +248,7 @@ function serializeMessagesForSummary(messages: readonly { role: string; content:
  */
 function summarizationTargetTokens(config: ResolvedConfig, inputTokens: number): number {
   const cap = Math.max(400, Math.floor((config.maxTokens ?? 4096) * 0.7))
-  return Math.min(cap, Math.max(300, Math.floor(inputTokens * 0.3)))
+  return Math.min(cap, Math.max(300, Math.floor(inputTokens * SUMMARY_OUTPUT_SHARE)))
 }
 
 /** Summarize several memories into one higher-level memory via the LLM. */
@@ -322,6 +335,14 @@ interface SessionCounter {
   growthEma?: number
   /** Estimated tokens of the surface at the previous check (growth baseline). */
   lastSizeTokens?: number
+  /** Successful history compressions so far (stage signal for dynamic levels). */
+  compressions?: number
+  /**
+   * Epoch ms of the last FORCED narrowed-window pressure compaction. Lives in
+   * the session ledger (not a separate map) so it is persisted and garbage-
+   * collected with the rest of the session state.
+   */
+  lastForceAt?: number
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
 }
@@ -343,6 +364,12 @@ export interface CompressResult {
 
 /** Options for one {@link HistoryCompressor.compress} call. */
 export interface CompressOptions {
+  /**
+   * Pre-computed decision from the unified planner. When present, the fold
+   * executor does NOT re-decide: it runs only when the plan says 'fold' and
+   * folds to the plan's target. Both lanes then obey one policy.
+   */
+  plan?: CompactionPlan
   /**
    * The session's effective model window (per-model probe/override or the
    * request context). Defaults to the globally adopted window, which may
@@ -406,6 +433,12 @@ export class HistoryCompressor {
    * when the smoothed surface growth says the next step would cross it anyway.
    */
   readonly nudge: boolean
+  /**
+   * Whether the trigger/target are steered by {@link dynamicHistoryLevels}
+   * (growth + session maturity) inside hard bounds, instead of the static
+   * triggerRatio/targetRatio.
+   */
+  readonly dynamicLevels: boolean
 
   constructor(
     ctx: Context,
@@ -417,6 +450,7 @@ export class HistoryCompressor {
     injectionBudget = 0,
     kv: PersistentKV | null = null,
     nudge = false,
+    dynamicLevels = true,
   ) {
     this.ctx = ctx
     this.config = config
@@ -427,6 +461,7 @@ export class HistoryCompressor {
     this.injectionBudget = injectionBudget
     this.kv = kv
     this.nudge = nudge
+    this.dynamicLevels = dynamicLevels
     this.loadPersistedCounters()
   }
 
@@ -511,6 +546,8 @@ export class HistoryCompressor {
               ...(typeof parsed.lastCompressedTurn === 'number'
                 ? { lastCompressedTurn: parsed.lastCompressedTurn } : {}),
               ...(typeof parsed.lastTokens === 'number' ? { lastTokens: parsed.lastTokens } : {}),
+              ...(typeof parsed.compressions === 'number' ? { compressions: parsed.compressions } : {}),
+              ...(typeof parsed.lastForceAt === 'number' ? { lastForceAt: parsed.lastForceAt } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -598,55 +635,103 @@ export class HistoryCompressor {
     entry.growthEma = growthTokens
     entry.lastSizeTokens = beforeTokens
 
-    // Token-pressure trigger with surge bypass and failure cooldown. The
-    // plugin's own per-turn RAG injection (spliced in after this check) is
-    // reserved up front so the trigger reflects the REAL request size.
     const budget = this.tokenBudget(window)
-    const triggerTokens = Math.max(0, Math.floor(budget * this.triggerRatio) - this.injectionBudget)
-    // Early-compression nudge (Strategy 8): if the surface is under the trigger
-    // but its OWN smoothed growth says the next step crosses the trigger,
-    // compressing now costs the same LLM call and lands the request under the
-    // line instead of over it. Fires at most once per turn (see the guard).
-    const nudged = shouldNudgeCompaction({
-      enabled: this.nudge,
-      tokens: beforeTokens,
-      growthTokens,
-      triggerTokens,
-      turn: currentTurn,
-      ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
-      failureCooldown: entry.failureCooldown,
-    })
-    if (nudged && !force) {
-      this.ctx.logger.info(
-        `[ContextGovernor] Compression nudge: ${beforeTokens} tokens now, ~${Math.round(growthTokens)} more by the next step, `
-        + `trigger ${triggerTokens} — compressing one step early`
-      )
-    }
-    const verdict = shouldCompressHistory({
-      force: force || nudged,
-      turn: currentTurn,
-      lastCompressedTurn: entry.lastCompressedTurn,
-      lastTokens: entry.lastTokens,
-      tokens: beforeTokens,
-      triggerTokens,
-      windowTokens: window,
-      compressInterval: this.compressInterval,
-      failureCooldown: entry.failureCooldown,
-    })
-    entry.lastTokens = beforeTokens
-    if (!verdict.compress) {
-      this.ctx.logger.debug(
-        `[ContextGovernor] Compression deferred (${verdict.reason}): ${beforeTokens} tokens, `
-        + `trigger ${triggerTokens}, window ${window}, interval ${this.compressInterval}`,
-      )
-      if (verdict.reason === 'cooldown') entry.failureCooldown--
-      return null
-    }
-    if (verdict.reason === 'surge') {
-      this.ctx.logger.info(
-        `[ContextGovernor] Compression surge trigger: single-round growth reached `
-        + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
-      )
+
+    // The unified planner (when supplied) has ALREADY decided lane/reason/target
+    // for this step, sharing the same curve and ledger as the durable lane. The
+    // fold executor obeys it verbatim; only the legacy path below re-decides.
+    const plan = options.plan
+    let levels: HistoryLevels
+    let triggerTokens: number
+    let triggerReason: string
+    let nudged = false
+    if (plan !== undefined) {
+      entry.lastTokens = beforeTokens
+      if (plan.lane !== 'fold') {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Fold deferred by plan (${plan.reason}): lane=${plan.lane}, `
+          + `${beforeTokens} tokens, trigger ${plan.surfaceTriggerTokens}`,
+        )
+        if (plan.reason === 'cooldown') entry.failureCooldown--
+        return null
+      }
+      levels = {
+        triggerRatio: plan.triggerRatio,
+        targetRatio: plan.targetRatio,
+        triggerTokens: plan.surfaceTriggerTokens,
+        targetTokens: plan.targetSurfaceTokens,
+      }
+      triggerTokens = plan.surfaceTriggerTokens
+      triggerReason = plan.reason
+      nudged = plan.reason === 'nudge'
+      if (plan.reason === 'surge') {
+        this.ctx.logger.info(
+          `[ContextGovernor] Compression surge trigger: single-round growth reached `
+          + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
+        )
+      }
+    } else {
+      // Legacy path (no planner): the fold lane owns its own curve. The
+      // plugin's own per-turn RAG injection (spliced in after this check) is
+      // reserved up front so the trigger reflects the REAL request size.
+      levels = dynamicHistoryLevels({
+        baseTriggerRatio: this.triggerRatio,
+        baseTargetRatio: this.targetRatio,
+        budgetTokens: budget,
+        growthTokens: this.dynamicLevels ? growthTokens : 0,
+        compressInterval: this.compressInterval,
+        compressions: this.dynamicLevels ? (entry.compressions ?? 0) : 0,
+        injectionBudget: this.injectionBudget,
+      })
+      triggerTokens = levels.triggerTokens
+      // Early-compression nudge (Strategy 8): if the surface is under the
+      // trigger but its OWN smoothed growth says the next step crosses it,
+      // compress now. Rate-limited to the same round interval as the ordinary
+      // trigger — otherwise a surface that settles just below the line would
+      // nudge on every single round.
+      nudged = shouldNudgeCompaction({
+        enabled: this.nudge,
+        tokens: beforeTokens,
+        growthTokens,
+        triggerTokens,
+        turn: currentTurn,
+        ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
+        compressInterval: this.compressInterval,
+        failureCooldown: entry.failureCooldown,
+      })
+      if (nudged && !force) {
+        this.ctx.logger.info(
+          `[ContextGovernor] Compression nudge: ${beforeTokens} tokens now, ~${Math.round(growthTokens)} more by the next step, `
+          + `trigger ${triggerTokens} — compressing one step early`
+        )
+      }
+      const verdict = shouldCompressHistory({
+        force: force || nudged,
+        turn: currentTurn,
+        lastCompressedTurn: entry.lastCompressedTurn,
+        lastTokens: entry.lastTokens,
+        tokens: beforeTokens,
+        triggerTokens,
+        windowTokens: window,
+        compressInterval: this.compressInterval,
+        failureCooldown: entry.failureCooldown,
+      })
+      entry.lastTokens = beforeTokens
+      if (!verdict.compress) {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Compression deferred (${verdict.reason}): ${beforeTokens} tokens, `
+          + `trigger ${triggerTokens}, window ${window}, interval ${this.compressInterval}`,
+        )
+        if (verdict.reason === 'cooldown') entry.failureCooldown--
+        return null
+      }
+      if (verdict.reason === 'surge') {
+        this.ctx.logger.info(
+          `[ContextGovernor] Compression surge trigger: single-round growth reached `
+          + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
+        )
+      }
+      triggerReason = verdict.reason
     }
 
     // Acquire recursion lock — blocks re-entrant governance during summarization
@@ -661,18 +746,24 @@ export class HistoryCompressor {
       // newer stays verbatim so recent context remains fully coherent. The
       // injection budget is reserved here too, so after the RAG splice the
       // request still lands at (not above) the target.
-      const targetTokens = Math.max(0, Math.floor(budget * this.targetRatio) - this.injectionBudget)
+      const targetTokens = levels.targetTokens
+      // (levels.targetTokens already reserved the injection budget; it is <= the
+      // trigger by at least HISTORY_MIN_BAND, so this fold always creates room.)
       const toFree = beforeTokens - targetTokens
 
       // Walk from the oldest message forward, accumulating the oldest block
-      // whose estimated tokens reach `toFree` (but never compress the recent tail).
+      // whose estimated tokens reach the fold budget (but never compress the
+      // recent tail). The budget is NOT `toFree`: the summary that replaces the
+      // fold also costs tokens, so folding exactly the overflow would land the
+      // surface above the target and re-trigger sooner. See foldTokensForTarget.
+      const foldTokens = foldTokensForTarget(beforeTokens, targetTokens)
       const compressible = messages.slice(0, -this.retainRecent)
       let cutIndex = 0
       let cutTokens = 0
       for (let i = 0; i < compressible.length; i++) {
         cutIndex = i + 1
         cutTokens += estimateContentTokens(compressible[i].content)
-        if (cutTokens >= toFree) break
+        if (cutTokens >= foldTokens) break
       }
       const oldMessages = compressible.slice(0, cutIndex)
       const keptMessages = [
@@ -760,12 +851,13 @@ export class HistoryCompressor {
       }
 
       entry.lastCompressedTurn = currentTurn
+      entry.compressions = (entry.compressions ?? 0) + 1
       entry.failureCooldown = 0
       this.persistCounter(sessionId)
       this.ctx.logger.info(
         `[ContextGovernor] Compressed history: ${oldMessages.length} messages → 1 summary. `
         + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens `
-        + `(trigger reason: ${verdict.reason})`,
+        + `(trigger reason: ${triggerReason})`,
       )
 
       // Persist the compression summary as a mid memory. The live summary
@@ -884,13 +976,54 @@ export class HistoryCompressor {
 
   /**
    * Estimate total tokens across a message array using the CJK-aware heuristic.
+   * Public so the engine can build the unified SurfaceSnapshot on the SAME
+   * basis the fold executor uses (before/after must not mix meters).
    */
-  private estimateMessageTokens(messages: readonly { role: string; content: unknown }[]): number {
+  estimateMessageTokens(messages: readonly { role: string; content: unknown }[]): number {
     let total = 0
     for (const msg of messages) {
       total += estimateContentTokens(msg.content)
     }
     return total
+  }
+
+  /**
+   * Read-only ledger view for the unified planner. `turn` is the UPCOMING turn
+   * (this step), i.e. what compress() will compute after touchSession, so the
+   * planner's rate-limit boundary matches the executor's.
+   * @param sessionId - the session to read.
+   * @param surfaceTokens - current surface estimate; omit to keep the stored EMA.
+   * @returns the planner's per-session state (never throws).
+   */
+  ledgerOf(sessionId: string, surfaceTokens?: number): GovernanceLedger {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return ledgerView(entry, surfaceTokens)
+  }
+
+  /**
+   * Record (or reject) a FORCED narrowed-window pressure compaction for one
+   * session, honouring the cooldown. Keeps the mark in the same ledger entry
+   * as the turn/growth state so it survives restarts and is cleaned with it.
+   * @param sessionId - the session requesting the force.
+   * @param cooldownMs - minimum ms between two forced compactions.
+   * @returns true when the force may proceed (and the mark was recorded).
+   */
+  markForce(sessionId: string, cooldownMs: number): boolean {
+    const now = Date.now()
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    if (entry.lastForceAt !== undefined && now - entry.lastForceAt < cooldownMs) return false
+    entry.lastForceAt = now
+    entry.lastActive = now
+    this.persistCounter(sessionId)
+    return true
   }
 
   /**
@@ -1221,8 +1354,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * which would bloat the context and accumulate contradictions.
    */
   private readonly lastInjectedIds = new WeakMap<Session, ReadonlySet<string>>()
-  /** Last forced narrowed-window pressure compaction per session (epoch ms). */
-  private readonly lastForceAt = new Map<string, number>()
+  /**
+   * Master switch for the unified governor (planCompaction). When on, both the
+   * durable and fold hooks obey one decision; when off, each lane keeps its
+   * legacy trigger (the shared P1 curves still bound both).
+   */
+  private readonly governance: boolean
   /** Whether the narrowed-window (probe/override) compaction override is on. */
   private readonly dynamicThreshold: boolean
   /** Lower bound of the dynamic trigger ratio as the real window fills. */
@@ -1266,6 +1403,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_round_interval,
       compress_trigger_ratio,
       compress_target_ratio,
+      compress_dynamic_levels,
+      compaction_governance,
       compaction_dynamic_threshold,
       compaction_dynamic_floor,
       thinking_guard_enabled,
@@ -1310,11 +1449,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // Token-pressure trigger (compress_trigger_ratio) delays compression while
     // the context is roomy; the target water level (compress_target_ratio)
     // makes compression progressive (only the oldest overflow is summarized).
+    // With compress_dynamic_levels on, both slide within hard bounds from the
+    // measured growth and the session's compression history.
     const compressInterval = compress_round_interval ?? 7
     const retainRecent = retain_recent_messages ?? 4
     const injectionBudget = rag_token_budget ?? 3000
     this.retainRecent = retainRecent
     this.injectionBudget = injectionBudget
+    // Explicit opt-in: an existing config without the key keeps the legacy
+    // per-lane trigger (the P1 shared curves still bound both). The shipped
+    // cordis.yml sets it true so the unified governor is exercised by default
+    // for new installs and can be turned off with one key.
+    this.governance = compaction_governance ?? false
+    if (this.governance) {
+      this.ctx.logger.info(
+        '[ContextGovernor] Unified compaction governance ON: one planCompaction '
+        + 'decision drives the fold lane (compress_dynamic_levels/'
+        + 'compaction_dynamic_threshold no longer gate the fold trigger).',
+      )
+    }
     this.dynamicThreshold = compaction_dynamic_threshold ?? true
     this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
     this.thinkingGuardEnabled = thinking_guard_enabled ?? true
@@ -1336,6 +1489,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         delete: (key) => ctx.memoryContext.kvDelete(key),
       },
       compress_nudge ?? true,
+      compress_dynamic_levels ?? true,
     )
 
     // Initialize the sanitizer config (Strategy 3)
@@ -1534,7 +1688,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         `[ContextGovernor] Tool-result archive full pass failed: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
-    if (trigger === 'pressure' && this.dynamicThreshold && !signal.aborted) {
+    if (trigger === 'pressure' && (this.dynamicThreshold || this.governance) && !signal.aborted) {
       const handled = await this.forceNarrowedPressure(agent, signal)
       if (handled !== undefined) return handled
     }
@@ -1559,6 +1713,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .context?.contextWindow
       if (signal.aborted) return undefined
       const measurement = this.ctx.tokenMeter.measure(agent.session)
+      // Hard fit-guard: the request is about to run out of the REAL window.
+      // Force the durable path regardless of the dynamic threshold so the
+      // plugin's own summarization always gets room — the 'ensure no overflow'
+      // backstop, reached whenever the override OR the unified governor is on.
+      // If compaction cannot shrink, the provider's own overflow path is the
+      // final backstop (the 10s force cooldown prevents a per-step storm).
+      const guardReserve = Math.max(GOV_GUARD_RESERVE_MIN, Math.floor(narrowed * GOV_GUARD_RESERVE_RATIO))
+      if (measurement.totalTokens >= narrowed - guardReserve) {
+        const key = String(agent.session.id)
+        if (!this.compressor.markForce(key, FORCED_PRESSURE_COOLDOWN_MS)) return null
+        this.ctx.logger.info(
+          `[ContextGovernor] Fit-guard: ${measurement.totalTokens} tokens >= real window ${narrowed} `
+          + `− reserve ${guardReserve} (model=${target.model}); forcing durable compaction`,
+        )
+        return await super.compactIfNeeded(agent, 'context-overflow', signal)
+      }
       const decision = decidePressureCompaction({
         declaredWindow: declared,
         narrowedWindow: narrowed,
@@ -1576,9 +1746,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       }
       if (decision.mode === 'force') {
         const key = String(agent.session.id)
-        const now = Date.now()
-        if (now - (this.lastForceAt.get(key) ?? 0) < FORCED_PRESSURE_COOLDOWN_MS) return null
-        this.lastForceAt.set(key, now)
+        if (!this.compressor.markForce(key, FORCED_PRESSURE_COOLDOWN_MS)) return null
         this.ctx.logger.info(
           `[ContextGovernor] Narrowed-window pressure: ${measurement.totalTokens} tokens >= `
           + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
@@ -1726,7 +1894,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const override = this.config.modelPolicies.find(
       policy => policy.provider === target.provider && policy.model === target.model,
     )
-    return override?.thresholdRatio ?? this.config.thresholdRatio
+    const ratio = override?.thresholdRatio ?? this.config.thresholdRatio
+    // Hard ceiling: the durable lane can never wait past GOV_TRIGGER_CEILING,
+    // even if a hand-written thresholdRatio (or model policy) says to.
+    return Math.min(ratio, GOV_TRIGGER_CEILING)
   }
 
   /**
@@ -1809,7 +1980,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     ): Promise<PreStepDecision> => {
       // Periodic cleanup of stale session counters + stale forced-pressure marks
       this.compressor.cleanupStale()
-      this.cleanupStaleForceMarks()
 
       // --- Tool-result archive (exact-text CCR) ---
       // Stub oversized tool results that appeared since the last pass BEFORE the
@@ -1870,11 +2040,53 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         let currentMessages: Message[] = decision.messages.map(m => ({ ...m }))
 
         // --- Strategy 1: History compression (recursion-locked) ---
+        // Unified governor: ONE policy decides lane + water levels. The fold
+        // lane builds the snapshot on the SAME (CJK-aware) basis the executor
+        // uses — so before/after never mix meters — and takes the envelope
+        // (fixed tokens) from the authoritative meter so the two lanes cannot
+        // disagree about the request overhead. Gated by compaction_governance.
+        let foldPlan: CompactionPlan | undefined
+        if (this.governance) {
+          try {
+            const surfaceTokens = this.compressor.estimateMessageTokens(currentMessages)
+            let fixedTokens = this.injectionBudget
+            try {
+              const meter = ctx.tokenMeter.measure(session)
+              fixedTokens = Math.max(0, meter.totalTokens - meter.surfaceTokens)
+            } catch {
+              // Meter unavailable: fall back to the injection reserve as the
+              // only known non-surface overhead.
+            }
+            // Pure helper so the wiring itself is unit-tested (see
+            // tests/compaction-governance.test.ts). It builds the snapshot on
+            // the executor's CJK basis and the effective-budget denominator.
+            foldPlan = planFoldCompaction({
+              surfaceTokens,
+              fixedTokens,
+              window: effectiveWindow,
+              ledger: this.compressor.ledgerOf(sessionId, surfaceTokens),
+              baseTriggerRatio: this.compressor.triggerRatio,
+              baseTargetRatio: this.compressor.targetRatio,
+              compressInterval: this.compressor.compressInterval,
+              budgetTokens: this.compressor.tokenBudget(effectiveWindow),
+              injectionBudget: this.compressor.injectionBudget,
+              nudge: this.compressor.nudge,
+            })
+          } catch (error) {
+            ctx.logger.warn(
+              `[ContextGovernor] Fold plan failed: ${error instanceof Error ? error.message : String(error)}`,
+            )
+          }
+        }
         const compressResult = await this.compressor.compress(
           sessionId,
           currentMessages,
           false,
-          { window: effectiveWindow, session },
+          {
+            window: effectiveWindow,
+            session,
+            ...(foldPlan === undefined ? {} : { plan: foldPlan }),
+          },
         )
         if (compressResult !== null) {
           currentMessages = [...compressResult.messages]
@@ -2049,19 +2261,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     return undefined
   }
 
-  /**
-   * Periodic cleanup of stale forced-pressure timestamps. The cooldown only
-   * ever needs each session's LATEST mark; entries idle for over an hour are
-   * pure memory-hygiene waste (sessions that long gone will re-mark on their
-   * next force anyway).
-   */
-  private cleanupStaleForceMarks(): void {
-    const staleThreshold = 3600_000
-    const now = Date.now()
-    for (const [key, at] of this.lastForceAt) {
-      if (now - at > staleThreshold) this.lastForceAt.delete(key)
-    }
-  }
 }
 
 export default MemoryCompactionEngine

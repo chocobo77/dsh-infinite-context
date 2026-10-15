@@ -405,6 +405,23 @@ export interface MemoryCompactionConfig {
    * are summarized (progressive), keeping recent context verbatim. Default 0.6.
    */
   compress_target_ratio?: number
+  /**
+   * Dynamically steer the history trigger/target from how the session is
+   * progressing (growth EMA + number of prior compressions) inside hard safety
+   * bounds (see dynamicHistoryLevels), instead of using the static
+   * compress_trigger_ratio / compress_target_ratio everywhere. The static
+   * ratios stay the anchor/shallowest values. Default true.
+   */
+  compress_dynamic_levels?: boolean
+  /**
+   * Master switch for the UNIFIED governor: one policy function
+   * (planCompaction) decides lane + water levels for both the durable-region
+   * and progressive-fold executors, and the two hooks obey that single
+   * decision. When false, each lane keeps its own legacy trigger (the P1
+   * shared curves still apply). Defaults to the OR of the two legacy dynamic
+   * switches, so existing configs behave as before.
+   */
+  compaction_governance?: boolean
   /** Number of most recent messages to keep uncompressed. */
   retain_recent_messages?: number
   /** Maximum characters for generic JSON string fields in output sanitization. */
@@ -521,6 +538,8 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   thinking_guard_ratio: z.number().min(0.5).max(0.99),
   compress_trigger_ratio: z.number().min(0).max(1),
   compress_target_ratio: z.number().min(0).max(1),
+  compress_dynamic_levels: z.boolean(),
+  compaction_governance: z.boolean(),
   retain_recent_messages: z.number().step(1).min(1),
   sanitize_max_chars: z.number().step(1).min(100),
   rag_top_k: z.number().step(1).min(1),

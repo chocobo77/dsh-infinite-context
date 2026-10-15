@@ -14,6 +14,23 @@
  * @module dsh-infinite-context/compaction-policy
  */
 
+import {
+  GOV_HOT_GROWTH,
+  GOV_MATURE_COMPRESSIONS,
+  GOV_MAX_BAND,
+  GOV_MIN_BAND,
+  GOV_SAFETY_MARGIN,
+  GOV_STAGE_BAND,
+  GOV_TARGET_FLOOR,
+  GOV_TRIGGER_CEILING,
+  GOV_TRIGGER_FLOOR,
+  clamp01,
+  compactionTriggerRatio,
+  compactionWaterLevels,
+  fillPressureOf,
+  type WaterLevelBounds,
+} from './compaction-governance.ts'
+
 /** How a pressure check should be routed. */
 export type PressureDecisionMode =
   /** Run the base compaction-basic pressure policy unchanged. */
@@ -80,14 +97,20 @@ export function dynamicCompactionRatio(
   floor: number,
   fillRatio: number,
 ): number {
-  const t = Math.max(0, Math.min(1, (fillRatio - 0.5) / 0.4))
   // The floor may only LOWER the trigger. A floor at/above the base would raise
-  // it past the configured threshold (0.7 base + 0.9 floor → 0.9), and a
-  // non-finite or non-positive floor would collapse it to "always compress";
-  // both are unusable, so the base ratio applies unchanged instead.
+  // it past the configured threshold, and a non-finite or non-positive floor
+  // would collapse it to "always compress"; both are unusable, so the base
+  // ratio applies unchanged instead. Then delegate to the ONE shared curve —
+  // this function is now the durable lane's view of it.
   const boundedFloor = Number.isFinite(floor) && floor > 0 ? Math.min(floor, baseRatio) : baseRatio
-  const effective = baseRatio - (baseRatio - boundedFloor) * t
-  return Math.max(boundedFloor, Math.min(baseRatio, effective))
+  return compactionTriggerRatio({
+    anchor: baseRatio,
+    floor: boundedFloor,
+    ceiling: 1,
+    fillPressure: fillPressureOf(fillRatio),
+    growthPressure: 0,
+    stagePressure: 0,
+  })
 }
 
 /**
@@ -134,6 +157,147 @@ export const SURGE_RATIO = 0.2
 /** Rounds to wait after a failed (non-shrinking) history compression. */
 export const COMPRESS_FAILURE_COOLDOWN = 3
 
+/**
+ * The output share the summarizer is asked for (see
+ * {@link summarizationTargetTokens} in memory-compaction): ~30% of its input.
+ * Used to invert the compression ratio when planning how much history to fold.
+ */
+export const SUMMARY_OUTPUT_SHARE = 0.3
+
+/**
+ * Tokens of old history to fold so the surface lands ON the target water level
+ * after the replacement summary is inserted.
+ *
+ * The summarizer is asked to emit roughly {@link SUMMARY_OUTPUT_SHARE} of its
+ * input, so folding F tokens frees only about F * (1 - share) NET: the summary
+ * that replaces the fold consumes the rest. Choosing the fold as exactly
+ * before - target (the naive "free the overflow" rule) therefore lands at
+ * target + summaryTokens, systematically short of the target. That leftover
+ * shrinks the headroom before the next trigger — and with a verbose summarizer
+ * the post-compaction surface creeps back up to the trigger, so the compressor
+ * re-fires every round and oscillates just under the line.
+ *
+ * Inverting the ratio here makes the net saving reach the target.
+ *
+ * @param beforeTokens - estimated tokens on the surface before compression.
+ * @param targetTokens - the post-compression water level in tokens.
+ * @param summaryShare - expected summary size as a fraction of the folded
+ *   input; clamped to [0, 0.9] so a misconfiguration cannot request an
+ *   infinite fold.
+ * @returns the folded-token budget (>= 0).
+ */
+export function foldTokensForTarget(
+  beforeTokens: number,
+  targetTokens: number,
+  summaryShare: number = SUMMARY_OUTPUT_SHARE,
+): number {
+  const gap = beforeTokens - targetTokens
+  if (!Number.isFinite(gap) || gap <= 0) return 0
+  const share = Number.isFinite(summaryShare) ? Math.min(0.9, Math.max(0, summaryShare)) : 0
+  return Math.ceil(gap / (1 - share))
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Dynamic history water levels                                               */
+/*  Turn the trigger/target from fixed fractions into a bounded controller     */
+/*  driven by how the session is actually progressing.                         */
+/* -------------------------------------------------------------------------- */
+
+/** Hard-ceiling alias of the unified governance bound. */
+export const HISTORY_TRIGGER_CEILING = GOV_TRIGGER_CEILING
+/** Hard-floor alias of the unified governance bound. */
+export const HISTORY_TRIGGER_FLOOR = GOV_TRIGGER_FLOOR
+/** Target-floor alias of the unified governance bound. */
+export const HISTORY_TARGET_FLOOR = GOV_TARGET_FLOOR
+/** Minimum-band alias of the unified governance bound. */
+export const HISTORY_MIN_BAND = GOV_MIN_BAND
+/** Maximum-band alias of the unified governance bound. */
+export const HISTORY_MAX_BAND = GOV_MAX_BAND
+/** Safety-margin alias of the unified governance bound. */
+export const HISTORY_SAFETY_MARGIN = GOV_SAFETY_MARGIN
+/** Stage-band alias of the unified governance bound. */
+export const HISTORY_STAGE_BAND = GOV_STAGE_BAND
+/** Hot-growth alias of the unified governance bound. */
+export const HISTORY_HOT_GROWTH = GOV_HOT_GROWTH
+/** Mature-compressions alias of the unified governance bound. */
+export const HISTORY_MATURE_COMPRESSIONS = GOV_MATURE_COMPRESSIONS
+
+/** Input for {@link dynamicHistoryLevels}. */
+export interface HistoryLevelInput {
+  /** Configured trigger ratio (the LAZIEST point; dynamic slides down from it). */
+  readonly baseTriggerRatio: number
+  /** Configured target ratio (the SHALLOWEST compression; dynamic goes deeper). */
+  readonly baseTargetRatio: number
+  /** Effective token budget (window minus headroom). */
+  readonly budgetTokens: number
+  /** Smoothed per-step growth in tokens (0 = unknown/steady). */
+  readonly growthTokens: number
+  /** Rounds between two compressions (cadence the band must cover). */
+  readonly compressInterval: number
+  /** Successful history compressions so far this session. */
+  readonly compressions: number
+  /** Tokens reserved for the plugin's own per-turn injection. */
+  readonly injectionBudget: number
+}
+
+/** Bounded water levels for one compression check. */
+export interface HistoryLevels {
+  readonly triggerRatio: number
+  readonly targetRatio: number
+  readonly triggerTokens: number
+  readonly targetTokens: number
+}
+
+/**
+ * Pick the trigger and target water levels for this check, bounded by hard
+ * limits and steered by how the session is progressing.
+ *
+ * Timing: start from the configured trigger (the laziest allowed) and slide
+ * DOWN as risk rises, so a hot (fast-growing) or mature (many prior folds)
+ * session compresses earlier. The hard ceiling caps the trigger even when the
+ * config or the anchor would sit higher.
+ *
+ * Magnitude: the trigger-to-target band is at least the configured gap, and
+ * grows to cover one full cadence of measured growth plus a safety margin and
+ * a maturity allowance. That is what keeps a compression from being undone by
+ * ordinary progress a round later: the deeper the band, the longer the surface
+ * stays under the trigger. It is clamped between {@link HISTORY_MIN_BAND} and
+ * {@link HISTORY_MAX_BAND}, and the target never drops below
+ * {@link HISTORY_TARGET_FLOOR}.
+ *
+ * Everything is monotonic and bounded: non-finite inputs degrade to the
+ * safest (most conservative) level rather than producing NaN.
+ * @param input - configured base ratios, budget, growth, interval, and the
+ *   session's compression history.
+ * @returns the bounded ratios plus their token forms.
+ */
+export function dynamicHistoryLevels(input: HistoryLevelInput): HistoryLevels {
+  // The fold lane's view of the ONE shared curve. No fill term here: this lane
+  // has historically been driven by growth + maturity only, so omitting the
+  // fill ratio keeps its behaviour identical while sourcing the math from
+  // compactionWaterLevels (which the durable lane also uses).
+  const bounds: WaterLevelBounds = {
+    triggerCeiling: HISTORY_TRIGGER_CEILING,
+    triggerFloor: HISTORY_TRIGGER_FLOOR,
+    targetFloor: HISTORY_TARGET_FLOOR,
+    minBand: HISTORY_MIN_BAND,
+    maxBand: HISTORY_MAX_BAND,
+    safetyMargin: HISTORY_SAFETY_MARGIN,
+    stageBand: HISTORY_STAGE_BAND,
+    hotGrowth: HISTORY_HOT_GROWTH,
+    matureCompressions: HISTORY_MATURE_COMPRESSIONS,
+  }
+  return compactionWaterLevels({
+    baseTriggerRatio: input.baseTriggerRatio,
+    baseTargetRatio: input.baseTargetRatio,
+    budgetTokens: input.budgetTokens,
+    growthTokens: input.growthTokens,
+    compressInterval: input.compressInterval,
+    compressions: input.compressions,
+    injectionBudget: input.injectionBudget,
+    bounds,
+  })
+}
 /** Why the history compression trigger decided the way it did. */
 export type HistoryTriggerReason =
   | 'forced'
@@ -233,6 +397,14 @@ export interface NudgeInput {
   readonly turn: number
   /** Index of the last successful compression (undefined = never). */
   readonly lastCompressedTurn?: number | undefined
+  /**
+   * Minimum rounds between compressions (the same rate limit the ordinary
+   * pressure path honours). A nudge forces the trigger, which bypasses the
+   * interval inside {@link shouldCompressHistory}, so it must gate itself on
+   * this or a surface that keeps landing just under the trigger would nudge
+   * every single round.
+   */
+  readonly compressInterval: number
   /** Remaining failure-cooldown rounds; a nudge must never bypass it. */
   readonly failureCooldown: number
 }
@@ -248,22 +420,31 @@ export interface NudgeInput {
  * and paid for. A nudge forces the compression at the step boundary BEFORE that
  * request, using the measured per-step growth as the reserve.
  *
- * Deliberately narrow: it never fires without measured growth, and never while
- * already over the line (the ordinary pressure path owns that case, together
- * with its rate limit and failure cooldown — bypassing both from here would
- * compress every single step of a session that cannot shrink below the line).
+ * Deliberately narrow: it never fires without measured growth, never while
+ * already over the line (the ordinary pressure path owns that case), never
+ * during a failure cooldown, and never inside the round rate limit. It forces
+ * the trigger only to pull one round forward; it must not become a second,
+ * unthrottled trigger that re-fires every round on a surface sitting just below
+ * the line (the pathological "compress every turn" loop).
  * @param input - sizes, growth, and session state.
  * @returns true when the compressor should treat this step as forced.
  */
 export function shouldNudgeCompaction(input: NudgeInput): boolean {
   const {
-    enabled, tokens, growthTokens, triggerTokens, turn, lastCompressedTurn, failureCooldown,
+    enabled, tokens, growthTokens, triggerTokens, turn, lastCompressedTurn,
+    compressInterval, failureCooldown,
   } = input
   if (!enabled) return false
   if (!Number.isFinite(growthTokens) || growthTokens <= 0) return false
   if (tokens >= triggerTokens) return false
   if (tokens + growthTokens < triggerTokens) return false
   if (failureCooldown > 0) return false
-  if (lastCompressedTurn !== undefined && turn - lastCompressedTurn < 1) return false
+  // The nudge FORCES the compression, which skips the ordinary interval inside
+  // shouldCompressHistory. Gate it on the same interval here, otherwise a
+  // surface that settles just under the trigger nudges on every single round
+  // instead of once per cadence — the pathological "compress every turn just
+  // below the line" loop.
+  if (lastCompressedTurn !== undefined
+    && turn - lastCompressedTurn < Math.max(1, compressInterval)) return false
   return true
 }

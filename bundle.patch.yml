@@ -120,7 +120,14 @@
         # keeping short-context local models out of the slow long-context zone.
         compress_trigger_ratio: 0.75
         compress_target_ratio: 0.6
-        # Track the routed model's REAL context window (probe / modelWindows):
+        # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN
+        # and the target DEEPER as the session heats up (growth EMA) or matures
+        # (prior compressions). Trigger <= 0.92 / >= 0.65; target >= 0.25;
+        # band 0.08..0.45. Set false to disable steering; hard bounds still apply.
+        compress_dynamic_levels: true
+        # Unified governor: one policy decides lane + water levels; the fold
+        # executor obeys it. Off = legacy per-lane triggers.
+        compaction_governance: true        # Track the routed model's REAL context window (probe / modelWindows):
         # when it is smaller than the declared window, force durable-history
         # compaction at a threshold derived from the REAL window instead of
         # waiting for a declared-window threshold the model can never reach.
