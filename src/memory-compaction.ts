@@ -102,6 +102,7 @@ import {
   dynamicHistoryLevels,
   foldTokensForTarget,
   nextGrowthEma,
+  orderFoldedMessages,
   shouldCompressHistory,
   shouldNudgeCompaction,
   type HistoryLevels,
@@ -757,19 +758,30 @@ export class HistoryCompressor {
       // fold also costs tokens, so folding exactly the overflow would land the
       // surface above the target and re-trigger sooner. See foldTokensForTarget.
       const foldTokens = foldTokensForTarget(beforeTokens, targetTokens)
-      const compressible = messages.slice(0, -this.retainRecent)
-      let cutIndex = 0
+      // Pin the first message (the task statement) and fold only AFTER it, so
+      // the provider prefix cache survives the fold. billion-context #2733
+      // measured the alternative (summary ahead of the pinned first user
+      // message) at 56% of all uncached tokens in a 12-hour log.
+      const pinCount = messages.length > 0 ? 1 : 0
+      // `Math.max(0, ...)` instead of `slice(0, -retainRecent)`: retainRecent=0
+      // must not collapse the surface through the `-0 === 0` footgun.
+      const compressible = messages.slice(0, Math.max(0, messages.length - this.retainRecent))
+      if (compressible.length <= pinCount) {
+        this.ctx.logger.debug('[ContextGovernor] Compression skipped: nothing foldable after the pinned prefix')
+        return null
+      }
+      let cutIndex = pinCount
       let cutTokens = 0
-      for (let i = 0; i < compressible.length; i++) {
+      for (let i = pinCount; i < compressible.length; i++) {
         cutIndex = i + 1
         cutTokens += estimateContentTokens(compressible[i].content)
         if (cutTokens >= foldTokens) break
       }
-      const oldMessages = compressible.slice(0, cutIndex)
-      const keptMessages = [
-        ...compressible.slice(cutIndex),
-        ...messages.slice(-this.retainRecent),
-      ]
+      const oldMessages = compressible.slice(pinCount, cutIndex)
+      if (oldMessages.length === 0) {
+        this.ctx.logger.debug('[ContextGovernor] Compression skipped: fold budget fits nothing after the pinned prefix')
+        return null
+      }
       if (toFree <= 0) {
         // Unreachable with the documented ordering (trigger ratio > target
         // ratio puts the trigger above the target), but a misconfiguration
@@ -829,7 +841,16 @@ export class HistoryCompressor {
         }],
         source: { kind: 'plugin:' + PLUGIN } as any,
       })
-      const newMessages: Message[] = [summaryMessage, ...keptMessages.map(m => ({ ...m }))]
+      // Insert the summary AT the fold cut (billion-context #2733): the pinned
+      // prefix stays byte-identical, so the cached prefix extends to the fold
+      // point and only the suffix after it is re-warmed.
+      const newMessages: Message[] = orderFoldedMessages({
+        messages,
+        summary: summaryMessage,
+        cutIndex,
+        retainRecent: this.retainRecent,
+        pinCount,
+      }).map(m => ({ ...m }))
 
       const afterTokens = this.estimateMessageTokens(newMessages)
       const saved = beforeTokens - afterTokens

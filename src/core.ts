@@ -60,6 +60,7 @@ export {
   dynamicCompactionRatio,
   dynamicHistoryLevels,
   foldTokensForTarget,
+  orderFoldedMessages,
   nextGrowthEma,
   shouldCompressHistory,
   shouldNudgeCompaction,

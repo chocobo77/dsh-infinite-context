@@ -197,6 +197,46 @@ export function foldTokensForTarget(
   return Math.ceil(gap / (1 - share))
 }
 
+/**
+ * Reassemble the surface after a fold WITHOUT breaking the pinned prefix.
+ *
+ * billion-context #2733 measured the cost of prepending the summary ahead of
+ * the pinned first user message: after every fold the next request matched only
+ * the constant instructions+tools head, and the double re-warm was 56% of all
+ * uncached tokens in a 12-hour log. Keeping the leading messages byte-identical
+ * and inserting the summary at the fold cut lets the cached prefix extend to the
+ * fold point, so only the suffix after it is new.
+ *
+ * @param input.messages - the full surface, oldest first.
+ * @param input.summary - the replacement summary message.
+ * @param input.cutIndex - absolute index of the first KEPT message; everything
+ *   in `[pinCount, cutIndex)` is folded away.
+ * @param input.retainRecent - trailing messages that are never folded.
+ * @param input.pinCount - leading messages kept byte-identical (>= 1 pins the
+ *   first user message).
+ * @returns the recomposed message list.
+ */
+export function orderFoldedMessages<T>(input: {
+  readonly messages: readonly T[]
+  readonly summary: T
+  readonly cutIndex: number
+  readonly retainRecent: number
+  readonly pinCount: number
+}): T[] {
+  const total = input.messages.length
+  const pin = Math.max(0, Math.min(input.pinCount, total))
+  // `total - retainRecent` (not `slice(0, -retainRecent)`) so retainRecent=0
+  // does not collapse the whole surface through the `-0 === 0` footgun.
+  const tailStart = Math.max(pin, total - Math.max(0, input.retainRecent))
+  const cut = Math.max(pin, Math.min(input.cutIndex, tailStart))
+  return [
+    ...input.messages.slice(0, pin),
+    input.summary,
+    ...input.messages.slice(cut, tailStart),
+    ...input.messages.slice(tailStart),
+  ]
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Dynamic history water levels                                               */
 /*  Turn the trigger/target from fixed fractions into a bounded controller     */
