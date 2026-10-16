@@ -21,13 +21,36 @@ export type SummarizationConfig = {
   readonly summarizationModel: string
 }
 
-/** Read the provider/model durably routed for the session's latest request. */
+/**
+ * Read the provider/model durably routed for the session's latest request.
+ *
+ * Prefers the folded `request/header` (the envelope the NEXT request is
+ * compared against) and falls back to the latest `request/context` route.
+ * The fallback is what makes the pre-step path work: `agent/pre-step` runs
+ * BEFORE the next request envelope is snapshotted, so `requestHeader()` can
+ * still be undefined (or lag a route switch) while `requestContext()` already
+ * carries the live route. Without it, the fold lane and the narrowed-window
+ * override resolved no target and silently skipped — exactly the symptom seen
+ * in production (turn counters frozen, zero folded ranges).
+ * @param session - the session to read the route from.
+ * @returns the routed provider/model, or undefined when the session has none yet.
+ */
 export function routedTargetOf(session: Session): SummarizationTarget | undefined {
   const config = session.requestHeader()?.config
-  if (config === undefined || config.provider.length === 0 || config.model.length === 0) {
-    return undefined
+  if (config !== undefined && config.provider.length > 0 && config.model.length > 0) {
+    return { provider: config.provider, model: config.model }
   }
-  return { provider: config.provider, model: config.model }
+  // request/context is the live route; guard the call so a partial session
+  // object (older mock, forked session) can never make resolution throw.
+  try {
+    const context = session.requestContext()
+    if (context !== undefined && context.provider.length > 0 && context.model.length > 0) {
+      return { provider: context.provider, model: context.model }
+    }
+  } catch {
+    // request/context unavailable — fall through to undefined
+  }
+  return undefined
 }
 
 /**
