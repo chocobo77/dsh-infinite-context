@@ -356,6 +356,11 @@ export interface PersistentKV {
   get(key: string): string | undefined
   set(key: string, value: string): void
   delete(key: string): void
+  /**
+   * Delete prefixed keys whose last write is older than `cutoffMs`.
+   * Optional so lightweight test doubles need not implement retention.
+   */
+  deleteOlderThan?(prefix: string, cutoffMs: number): number
 }
 
 /** Result of a compression operation. */
@@ -444,6 +449,13 @@ export function selectFoldRange(
   return start === undefined || end === undefined ? null : { start, end }
 }
 
+/** In-memory session counters idle this long are evicted (RAM only). */
+const SESSION_COUNTER_IDLE_MS = 3600_000
+/** Persisted session counters are retained this long across idle gaps. */
+const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
+/** Persisted-retention sweep is throttled to this cadence. */
+const SESSION_KV_PRUNE_INTERVAL_MS = 3600_000
+
 export class HistoryCompressor {
   // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
   // process restarts — without persistence a DSH restart reset the counters to
@@ -454,6 +466,8 @@ export class HistoryCompressor {
   private readonly compressLocks = new Set<string>()
 
   /** Optional persistent KV backing (survives restarts); null disables persistence. */
+  /** When the persisted-counter retention sweep last ran (epoch ms). */
+  private lastKvPruneAt = 0
   private readonly kv: PersistentKV | null
 
   private readonly ctx: Context
@@ -511,9 +525,12 @@ export class HistoryCompressor {
     this.loadPersistedCounters()
   }
 
+  /** KV prefix shared by every per-session compression counter. */
+  private static readonly KV_PREFIX = 'compression:'
+
   /** KV key under which a session's counter is persisted. */
   private static kvKey(sessionId: string): string {
-    return `compression:${sessionId}`
+    return HistoryCompressor.KV_PREFIX + sessionId
   }
 
   /** Restore persisted counters for all sessions after a restart. */
@@ -1071,6 +1088,62 @@ export class HistoryCompressor {
   }
 
   /**
+   * Advance the fold-lane turn for one session and return the planner's view.
+   *
+   * The fold lane no longer runs `compress()`, so this is what keeps the
+   * rate-limit/stage/growth state moving: it increments the turn, folds the
+   * current surface into the growth EMA, and persists the entry. Without it the
+   * planner would see a frozen turn and re-fold on every step.
+   * @param sessionId - the session being checked.
+   * @param surfaceTokens - current surface estimate (meter basis).
+   * @returns the planner's ledger for THIS turn.
+   */
+  beginFoldCheck(sessionId: string, surfaceTokens: number): GovernanceLedger {
+    const entry = this.touchSession(sessionId)
+    const delta = entry.lastSizeTokens === undefined ? 0 : surfaceTokens - entry.lastSizeTokens
+    entry.growthEma = nextGrowthEma(entry.growthEma, delta)
+    entry.lastSizeTokens = surfaceTokens
+    this.persistCounter(sessionId)
+    return {
+      turn: entry.turn,
+      ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
+      ...(entry.lastTokens === undefined ? {} : { lastTokens: entry.lastTokens }),
+      failureCooldown: entry.failureCooldown,
+      compressions: entry.compressions ?? 0,
+      growthTokens: entry.growthEma ?? 0,
+    }
+  }
+
+  /**
+   * Record a successful fold: stamp lastCompressedTurn/lastTokens, reset the
+   * growth delta and failure cooldown, and bump the maturity counter.
+   * @param sessionId - the folded session.
+   * @param beforeTokens - surface size before the fold.
+   */
+  recordFold(sessionId: string, beforeTokens: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.lastCompressedTurn = entry.turn
+    entry.lastTokens = beforeTokens
+    entry.lastSizeTokens = beforeTokens
+    entry.growthEma = 0
+    entry.compressions = (entry.compressions ?? 0) + 1
+    entry.failureCooldown = 0
+    this.persistCounter(sessionId)
+  }
+
+  /**
+   * Record a failed fold so the planner backs off instead of retrying every step.
+   * @param sessionId - the session whose fold failed.
+   */
+  recordFoldFailure(sessionId: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
+    this.persistCounter(sessionId)
+  }
+
+  /**
    * Record (or reject) a FORCED narrowed-window pressure compaction for one
    * session, honouring the cooldown. Keeps the mark in the same ledger entry
    * as the turn/growth state so it survives restarts and is cleaned with it.
@@ -1093,19 +1166,39 @@ export class HistoryCompressor {
   }
 
   /**
-   * Periodic cleanup: remove stale session counters (>1 hour inactive).
-   * Call from the pre-step hook to prevent unbounded memory growth.
+   * Periodic cleanup: evict idle session counters from MEMORY and, far less
+   * often, prune PERSISTED counters past their long retention.
+   *
+   * The two lifetimes are deliberately different. Eviction only bounds RAM
+   * after an hour of idleness, but it used to delete the persisted entry too —
+   * so a long session with a multi-hour gap lost its lastCompressedTurn,
+   * compressions, growth EMA and failure cooldown and recompressed the moment
+   * it resumed. Persisted state is now retained for
+   * {@link SESSION_COUNTER_RETENTION_MS} and restored lazily by
+   * {@link restoreCounter}. Call from the pre-step hook.
    */
   cleanupStale(): void {
     const now = Date.now()
-    const staleThreshold = 3600_000 // 1 hour
     for (const [sessionId, entry] of this.turnCounters) {
-      if (now - entry.lastActive > staleThreshold) {
+      if (now - entry.lastActive > SESSION_COUNTER_IDLE_MS) {
         this.turnCounters.delete(sessionId)
-        if (this.kv !== null) {
-          try { this.kv.delete(HistoryCompressor.kvKey(sessionId)) } catch { /* best-effort */ }
-        }
       }
+    }
+    if (this.kv?.deleteOlderThan === undefined) return
+    if (now - this.lastKvPruneAt < SESSION_KV_PRUNE_INTERVAL_MS) return
+    this.lastKvPruneAt = now
+    try {
+      const removed = this.kv.deleteOlderThan(
+        HistoryCompressor.KV_PREFIX,
+        now - SESSION_COUNTER_RETENTION_MS,
+      )
+      if (removed > 0) {
+        this.ctx.logger.info(`[ContextGovernor] Pruned ${removed} stale session counter(s)`)
+      }
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Session-counter retention sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
     }
   }
 
@@ -1558,6 +1651,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         get: (key) => ctx.memoryContext.kvGet(key),
         set: (key, value) => ctx.memoryContext.kvSet(key, value),
         delete: (key) => ctx.memoryContext.kvDelete(key),
+        deleteOlderThan: (prefix, cutoffMs) => ctx.memoryContext.kvDeleteOlderThan(prefix, cutoffMs),
       },
       compress_nudge ?? true,
       compress_dynamic_levels ?? true,
@@ -1826,7 +1920,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       surfaceTokens: snapshot.surfaceTokens,
       fixedTokens: snapshot.fixedTokens,
       window,
-      ledger: this.compressor.ledgerOf(sessionId, snapshot.surfaceTokens),
+      ledger: this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens),
       baseTriggerRatio: this.compressor.triggerRatio,
       baseTargetRatio: this.compressor.targetRatio,
       compressInterval: this.compressor.compressInterval,
@@ -1842,12 +1936,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       `[ContextGovernor] Fold (${plan.reason}): surface ${snapshot.surfaceTokens}/${window}, `
       + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
     )
-    const result = await this.compactRegion(range.start, range.end, agent, signal)
-    // The fold lane is a real compaction now: record its saving in the ledger
-    // (the heuristic price of the shadowed content) so effectiveness is visible.
-    this.usage.record(USAGE_KIND.compactionSaved, result.shadowedTokenCount, { sessionId })
-    if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
-    return result
+    try {
+      const result = await this.compactRegion(range.start, range.end, agent, signal)
+      this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
+      // The fold lane is a real compaction now: record its saving in the ledger
+      // (the heuristic price of the shadowed content) so effectiveness is visible.
+      this.usage.record(USAGE_KIND.compactionSaved, result.shadowedTokenCount, { sessionId })
+      if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
+      return result
+    } catch (error) {
+      this.compressor.recordFoldFailure(sessionId)
+      throw error
+    }
   }
 
   /**

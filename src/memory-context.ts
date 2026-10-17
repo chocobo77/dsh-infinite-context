@@ -386,6 +386,17 @@ export class MemoryContext extends Service {
   }
 
   /**
+   * Delete prefixed KV keys whose last write is older than `cutoffMs`.
+   * @param prefix - key prefix, e.g. `compression:`.
+   * @param cutoffMs - epoch-ms cutoff.
+   * @returns the number of rows deleted (0 without a store).
+   */
+  kvDeleteOlderThan(prefix: string, cutoffMs: number): number {
+    this.requireEngine()
+    return this.store?.kvDeleteOlderThan(prefix, cutoffMs) ?? 0
+  }
+
+  /**
    * Archive one oversized tool result verbatim (tool-result CCR).
    * @param record - the archived payload (content-addressed by ref).
    * @returns true when a new row was inserted.

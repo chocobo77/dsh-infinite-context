@@ -334,10 +334,20 @@ export class MemoryStore {
     // from the memories table so it never pollutes retrieval.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS plugin_kv (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT 0
       )
     `)
+    // Migration: stores created before `updated_at` existed. Stamp existing
+    // rows with the current time so the age-based sweep cannot delete a
+    // counter that is merely old by creation order.
+    const kvColumns = this.db.prepare('PRAGMA table_info(plugin_kv)').all() as { name: string }[]
+    if (!kvColumns.some(col => col.name === 'updated_at')) {
+      this.db.exec('ALTER TABLE plugin_kv ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0')
+      this.db.prepare('UPDATE plugin_kv SET updated_at = ? WHERE updated_at = 0').run(Date.now())
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_plugin_kv_updated ON plugin_kv (updated_at)')
     // Exact-text archive for oversized tool results. The transcript keeps only
     // a short stub carrying `ref`; the full text stays here so `memory_expand`
     // can hand it back verbatim after the built-in pruner (or a compaction) has
@@ -417,9 +427,9 @@ export class MemoryStore {
   kvSet(key: string, value: string): void {
     this.assertOpen()
     this.db.prepare(`
-      INSERT INTO plugin_kv (key, value) VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(key, value)
+      INSERT INTO plugin_kv (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(key, value, Date.now())
   }
 
   /**
@@ -452,6 +462,25 @@ export class MemoryStore {
   kvDelete(key: string): void {
     this.assertOpen()
     this.db.prepare('DELETE FROM plugin_kv WHERE key = ?').run(key)
+  }
+
+  /**
+   * Delete prefixed keys whose last write is older than `cutoffMs`.
+   *
+   * Session counters are evicted from memory after an hour of idleness but
+   * must SURVIVE that eviction: a long session with a multi-hour gap would
+   * otherwise lose its rate-limit/stage/growth state and recompress the moment
+   * it resumes. Retention is therefore long (see HistoryCompressor).
+   * @param prefix - key prefix, e.g. `compression:`.
+   * @param cutoffMs - epoch-ms cutoff; rows last written before it are removed.
+   * @returns the number of rows deleted.
+   */
+  kvDeleteOlderThan(prefix: string, cutoffMs: number): number {
+    this.assertOpen()
+    const info = this.db.prepare(
+      'DELETE FROM plugin_kv WHERE key LIKE ? AND updated_at < ?',
+    ).run(`${prefix}%`, cutoffMs)
+    return Number(info.changes)
   }
 
   /**
