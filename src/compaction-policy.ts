@@ -237,6 +237,41 @@ export function orderFoldedMessages<T>(input: {
   ]
 }
 
+/**
+ * Index of the first foldable SURFACE node: skip a leading `system/message`
+ * head, then pin the first user message (billion-context #2733 — a fold
+ * summary must never precede it). Pure over the event-type list so it is
+ * unit-testable without a Session.
+ * @param types - surface event types, head to tail.
+ * @returns the index the fold range may start at.
+ */
+export function firstFoldableIndex(types: readonly string[]): number {
+  let index = types[0] === 'system/message' ? 1 : 0
+  if (types[index] === 'user/message') index += 1
+  return index
+}
+
+/**
+ * Find the head index of the tail kept verbatim by a fold: walk the priced
+ * surface from the tail until `retainTokens` is covered.
+ * @param tokens - per-node token prices, head to tail.
+ * @param retainTokens - tail budget to keep.
+ * @returns the keep-from index (`tokens.length` for an empty surface).
+ */
+export function retainedTailStart(tokens: readonly number[], retainTokens: number): number {
+  if (tokens.length === 0) return 0
+  const budget = Number.isFinite(retainTokens) ? Math.max(0, retainTokens) : 0
+  let accumulated = 0
+  let keepFromIdx = tokens.length
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const price = tokens[index]
+    accumulated += Number.isFinite(price) ? Math.max(0, price as number) : 0
+    keepFromIdx = index
+    if (accumulated >= budget) break
+  }
+  return keepFromIdx
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Dynamic history water levels                                               */
 /*  Turn the trigger/target from fixed fractions into a bounded controller     */

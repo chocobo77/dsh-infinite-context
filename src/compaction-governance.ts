@@ -605,6 +605,8 @@ export interface FoldPlanInput {
   readonly budgetTokens: number
   readonly injectionBudget: number
   readonly nudge: boolean
+  /** Manual/forced fold: bypass the trigger and rate-limit gates. */
+  readonly force?: boolean
   readonly declaredWindow?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
@@ -634,7 +636,7 @@ export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
     baseTargetRatio: input.baseTargetRatio,
     compressInterval: input.compressInterval,
     incomingTrigger: 'fold',
-    force: false,
+    force: input.force === true,
     nudge: input.nudge,
     basisTokens: input.budgetTokens,
     measuredTokens: surface,

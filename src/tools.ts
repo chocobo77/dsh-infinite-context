@@ -7,8 +7,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { sanitizeToolResult } from './OutputSanitizer.ts'
 import { oneLine } from './strings.ts'
 
@@ -279,7 +278,7 @@ export function apply(ctx: Context) {
 
   ctx.tools.register(defineTool({
     name: 'memory_force_compress',
-    description: 'Force a history compression for the current session, bypassing the round-interval check. Calls the compressor directly.',
+    description: 'Force one SURFACE compaction for a session now, bypassing the trigger/interval. Rewrites the session surface (system head and first user message pinned); returns the committed compaction.',
     parameters: {
       sessionId: { type: 'string', required: true, description: 'The session ID to compress.' },
     },
@@ -287,24 +286,30 @@ export function apply(ctx: Context) {
       schema: { type: 'string' },
       render: (_args, value: string) => [{ type: 'text', text: value }],
     },
-    async execute(args: { sessionId: string }) {
+    async execute(args: { sessionId: string }, exec: ToolRunContext) {
       try {
         const engine = ctx.memoryContext.compactionEngine
-        if (engine != null) {
-          const session = ctx.sessions.get(SessionId(args.sessionId))
-          if (session != null) {
-            const messages = typeof session.deriveMessages === 'function' ? session.deriveMessages() : []
-            const result = await engine.compressor.compressForce(args.sessionId, messages, { session })
-            return `Force compressed session ${args.sessionId}: freed ${result.tokensSaved} tokens.`
-          }
-          return `Session ${args.sessionId} not found.`
+        if (engine == null) {
+          return 'Force compression unavailable: memory-compaction engine not loaded.'
         }
-        return `Force compression unavailable: memory-compaction engine not loaded.`
+        const agent = engine.agentFor(args.sessionId)
+        if (agent === undefined) {
+          return `Force compression skipped: session ${args.sessionId} has no active agent yet; `
+            + 'run at least one step, or let the automatic fold/durable lane compact.'
+        }
+        // The fold runs as a SURFACE rewrite via compaction-basic's compactRegion.
+        // The old implementation computed a summary from deriveMessages() but the
+        // tool discarded the returned messages, so it reported a saving it never applied.
+        const result = await engine.foldNow(agent, exec.signal, true)
+        if (result === null) {
+          return `Force compression found no safe foldable range for session ${args.sessionId}.`
+        }
+        return `Force compressed session ${args.sessionId}: shadowed ${result.shadowedSeqs.length} node(s), `
+          + `~${result.shadowedTokenCount} tokens (compaction ${String(result.compactionId)}).`
       } catch (err) {
         return `Force compression failed: ${err instanceof Error ? err.message : String(err)}`
       }
     },
-    presentCall: args => ({ card: 'generic', title: 'Memory force compress', kind: 'other', rawInput: args }),
   }))
   ctx.tools.register(defineTool({
     name: 'memory_expand',

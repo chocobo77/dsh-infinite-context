@@ -9,6 +9,8 @@
  * @module dsh-infinite-context/memory-context
  */
 
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import { existsSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -649,6 +651,10 @@ export class MemoryContext extends Service {
         options?: { session?: Session },
       ) => Promise<{ messages: readonly any[]; tokensSaved: number }>
     }
+    /** The Agent that last owned a session (manual surface compaction). */
+    agentFor: (sessionId: string) => Agent | undefined
+    /** Fold the session SURFACE to the unified fold target. */
+    foldNow: (agent: Agent, signal: AbortSignal, force?: boolean) => Promise<CompactionResult | null>
     /** The compaction engine's sanitizer cap, reused by the memory_ingest tool. */
     sanitizerConfig: SanitizerConfig | null
   } | null = null

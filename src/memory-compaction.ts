@@ -35,11 +35,11 @@ import type {
   UserMessage,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { SessionId, type Session } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session, type SessionSeq } from '@deepseek-ai/dsh-session'
 import { toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only: brings the `ctx.tokenMeter` service declaration into scope.
-import type {} from '@deepseek-ai/dsh-token-meter'
+import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 
 /**
@@ -92,6 +92,7 @@ import {
   GOV_TRIGGER_CEILING,
   ledgerView,
   planFoldCompaction,
+  toSurfaceSnapshot,
   type CompactionPlan,
   type GovernanceLedger,
 } from './compaction-governance.ts'
@@ -100,7 +101,9 @@ import {
   SUMMARY_OUTPUT_SHARE,
   decidePressureCompaction,
   dynamicHistoryLevels,
+  firstFoldableIndex,
   foldTokensForTarget,
+  retainedTailStart,
   nextGrowthEma,
   orderFoldedMessages,
   shouldCompressHistory,
@@ -399,6 +402,48 @@ export interface CompressOptions {
  *
  * @module HistoryCompressor
  */
+/**
+ * Choose the oldest SURFACE span to fold.
+ *
+ * The fold runs as a surface rewrite (compaction-basic's `compactRegion`), not
+ * as a pre-step message rewrite: `agent/pre-step` only carries the step's inbox
+ * delta, so a fold there could never see history (and would drop the step's real
+ * messages). The range mirrors compaction-basic's own selector and adds the two
+ * billion-context pins: never fold the system head, never fold the first user
+ * message (#2733 — the summary must not precede it).
+ * @param session - session whose surface is folded.
+ * @param measurement - current meter reading (nodes must match the surface).
+ * @param retainTokens - tail budget kept verbatim.
+ * @returns the inclusive seq range, or null when nothing safe is foldable.
+ * @throws when the meter's node list no longer matches the session surface.
+ */
+export function selectFoldRange(
+  session: Session,
+  measurement: TokenMeasurement,
+  retainTokens: number,
+): { start: SessionSeq; end: SessionSeq } | null {
+  const priced = measurement.nodes
+  if (priced.length === 0) return null
+  const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== priced.length
+    || surfaceNodes.some((seq, index) => seq !== priced[index]?.seq)) {
+    throw new Error('fold: token-meter surface does not match the current session surface')
+  }
+  const types = surfaceNodes.map(seq => session.eventAt(seq)?.type ?? '')
+  const firstIdx = firstFoldableIndex(types)
+  let keepFromIdx = retainedTailStart(priced.map(node => node.tokens), retainTokens)
+  if (keepFromIdx <= firstIdx) return null
+  while (keepFromIdx > firstIdx) {
+    const seq = surfaceNodes[keepFromIdx]
+    if (seq === undefined || toolPairingBalancedBefore(session, seq)) break
+    keepFromIdx -= 1
+  }
+  if (keepFromIdx <= firstIdx) return null
+  const start = surfaceNodes[firstIdx]
+  const end = surfaceNodes[keepFromIdx - 1]
+  return start === undefined || end === undefined ? null : { start, end }
+}
+
 export class HistoryCompressor {
   // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
   // process restarts — without persistence a DSH restart reset the counters to
@@ -1370,6 +1415,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly retrieval: ResolvedRetrievalOptions
   private readonly lastInjectedTurn = new WeakMap<Session, number>()
   /**
+   * Last Agent seen for each session. The manual `memory_force_compress` tool
+   * only receives a session id, but the surface-rewrite API needs an Agent.
+   */
+  private readonly lastAgentBySession = new Map<string, Agent>()
+  /**
    * Per-session set of memory ids injected in the most recent turn. Used to
    * avoid re-injecting the same memories every turn (cross-turn de-dup),
    * which would bloat the context and accumulate contradictions.
@@ -1567,6 +1617,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // reuse the configured sanitizer cap instead of a hard-coded one.
     ctx.memoryContext.compactionEngine = {
       compressor: this.compressor,
+      agentFor: (id: string) => this.agentFor(id),
+      foldNow: (agent, signal, force) => this.foldNow(agent, signal, force),
       sanitizerConfig: this.sanitizerConfig,
     }
     ctx.memoryContext.retriever = { ingest: (text, source) => this.retriever.ingest(text, source) }
@@ -1709,11 +1761,93 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         `[ContextGovernor] Tool-result archive full pass failed: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
+    this.lastAgentBySession.set(String(agent.session.id), agent)
     if (trigger === 'pressure' && (this.dynamicThreshold || this.governance) && !signal.aborted) {
       const handled = await this.forceNarrowedPressure(agent, signal)
       if (handled !== undefined) return handled
     }
-    return super.compactIfNeeded(agent, trigger, signal)
+    const durable = await super.compactIfNeeded(agent, trigger, signal)
+    if (durable !== null) return durable
+    // Durable lane stayed below its threshold: the unified fold lane may still
+    // be due (its trigger is lower). The fold is a SURFACE REWRITE, never a
+    // rewrite of the step's inbox delta.
+    if (this.governance && trigger === 'pressure' && !signal.aborted) {
+      try {
+        return await this.foldNow(agent, signal)
+      } catch (error) {
+        this.ctx.logger.warn(
+          `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return null
+      }
+    }
+    return durable
+  }
+
+  /**
+   * The Agent that last owned a session (manual tool path).
+   * @param sessionId - session id to look up.
+   * @returns the agent, or undefined before the session ran a step.
+   */
+  agentFor(sessionId: string): Agent | undefined {
+    return this.lastAgentBySession.get(sessionId)
+  }
+
+  /**
+   * Fold the session SURFACE to the unified fold target.
+   *
+   * This is the fold lane's ONLY executor. `agent/pre-step` carries just the
+   * step's inbox delta, so folding there could never see history (and would
+   * drop the step's real messages). The fold therefore rewrites the surface
+   * exactly like the durable lane, via compaction-basic's `compactRegion`,
+   * with the system head and first user message pinned (billion-context #2733).
+   * @param agent - owner of the session to fold.
+   * @param signal - cancellation signal.
+   * @param force - bypass the trigger/rate-limit gates (manual tool use).
+   * @returns the committed compaction result, or null when no safe fold is due.
+   */
+  async foldNow(agent: Agent, signal: AbortSignal, force = false): Promise<CompactionResult | null> {
+    if (signal.aborted) return null
+    const session = agent.session
+    const sessionId = String(session.id)
+    const requestContext = session.requestContext()
+    const window = this.ctx.memoryContext.windowForModel(requestContext?.model ?? '')
+      ?? requestContext?.contextWindow
+      ?? this.ctx.memoryContext.contextWindow
+    if (!(Number.isFinite(window) && window > 0)) return null
+    const meter = this.ctx.tokenMeter.measure(session)
+    if (meter.totalTokens <= 0) return null
+    const snapshot = toSurfaceSnapshot({
+      totalTokens: meter.totalTokens,
+      surfaceTokens: meter.surfaceTokens,
+      window,
+    })
+    const plan = planFoldCompaction({
+      surfaceTokens: snapshot.surfaceTokens,
+      fixedTokens: snapshot.fixedTokens,
+      window,
+      ledger: this.compressor.ledgerOf(sessionId, snapshot.surfaceTokens),
+      baseTriggerRatio: this.compressor.triggerRatio,
+      baseTargetRatio: this.compressor.targetRatio,
+      compressInterval: this.compressor.compressInterval,
+      budgetTokens: this.compressor.tokenBudget(window),
+      injectionBudget: this.compressor.injectionBudget,
+      nudge: this.compressor.nudge,
+      force,
+    })
+    if (plan.lane !== 'fold') return null
+    const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
+    if (range === null) return null
+    this.ctx.logger.info(
+      `[ContextGovernor] Fold (${plan.reason}): surface ${snapshot.surfaceTokens}/${window}, `
+      + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
+    )
+    const result = await this.compactRegion(range.start, range.end, agent, signal)
+    // The fold lane is a real compaction now: record its saving in the ledger
+    // (the heuristic price of the shadowed content) so effectiveness is visible.
+    this.usage.record(USAGE_KIND.compactionSaved, result.shadowedTokenCount, { sessionId })
+    if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
+    return result
   }
 
   /**
@@ -2060,63 +2194,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // message we keep or inject is user-role by construction.
         let currentMessages: Message[] = decision.messages.map(m => ({ ...m }))
 
-        // --- Strategy 1: History compression (recursion-locked) ---
-        // Unified governor: ONE policy decides lane + water levels. The fold
-        // lane builds the snapshot on the SAME (CJK-aware) basis the executor
-        // uses — so before/after never mix meters — and takes the envelope
-        // (fixed tokens) from the authoritative meter so the two lanes cannot
-        // disagree about the request overhead. Gated by compaction_governance.
-        let foldPlan: CompactionPlan | undefined
-        if (this.governance) {
-          try {
-            const surfaceTokens = this.compressor.estimateMessageTokens(currentMessages)
-            let fixedTokens = this.injectionBudget
-            try {
-              const meter = ctx.tokenMeter.measure(session)
-              fixedTokens = Math.max(0, meter.totalTokens - meter.surfaceTokens)
-            } catch {
-              // Meter unavailable: fall back to the injection reserve as the
-              // only known non-surface overhead.
-            }
-            // Pure helper so the wiring itself is unit-tested (see
-            // tests/compaction-governance.test.ts). It builds the snapshot on
-            // the executor's CJK basis and the effective-budget denominator.
-            foldPlan = planFoldCompaction({
-              surfaceTokens,
-              fixedTokens,
-              window: effectiveWindow,
-              ledger: this.compressor.ledgerOf(sessionId, surfaceTokens),
-              baseTriggerRatio: this.compressor.triggerRatio,
-              baseTargetRatio: this.compressor.targetRatio,
-              compressInterval: this.compressor.compressInterval,
-              budgetTokens: this.compressor.tokenBudget(effectiveWindow),
-              injectionBudget: this.compressor.injectionBudget,
-              nudge: this.compressor.nudge,
-            })
-          } catch (error) {
-            ctx.logger.warn(
-              `[ContextGovernor] Fold plan failed: ${error instanceof Error ? error.message : String(error)}`,
-            )
-          }
-        }
-        const compressResult = await this.compressor.compress(
-          sessionId,
-          currentMessages,
-          false,
-          {
-            window: effectiveWindow,
-            session,
-            ...(foldPlan === undefined ? {} : { plan: foldPlan }),
-          },
-        )
-        if (compressResult !== null) {
-          currentMessages = [...compressResult.messages]
-          this.usage.record(USAGE_KIND.compactionSaved, compressResult.tokensSaved, { sessionId })
-          if (compressResult.nudged === true) this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
-        }
-
+        // --- History compression is a SURFACE rewrite, not a pre-step rewrite ---
+        // `decision.messages` here is only the step's inbox delta (DSH appends
+        // it to the session surface). Folding it could never see history and,
+        // if it ever fired, would drop the step's real messages. The fold lane
+        // now runs in `compactIfNeeded` via `foldNow()` → compaction-basic's
+        // `compactRegion`, exactly like the durable lane.
         // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
-        // compression and CTX adoption above stay active regardless) ---
+        // CTX adoption above stays active regardless) ---
         // The active surface — the text of every message the model is about to
         // read — is materialized lazily: the surface-aware retrieval de-dup and
         // the conciseness directive both need it, but a step where neither
