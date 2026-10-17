@@ -9,8 +9,8 @@
  *      memories are forgotten (via `ctx.memoryContext`).
  *   3. On each new turn, the most relevant memories are retrieved for the
  *      latest user message and spliced into the request as background.
- *   4. History compression: every N rounds, old messages are summarized into
- *      a compact background context (recursion-locked to prevent re-entrancy).
+ *   4. Surface folding: a due fold rewrites the session surface through
+ *      compaction-basic's `compactRegion` (never the pre-step message delta).
  *   5. Output sanitization: tool results are cleaned before entering the
  *      vector memory (the live tool result still reaches the current turn's
  *      context as-is — tools/result is a post-hoc event and cannot rewrite it).
@@ -93,22 +93,15 @@ import {
   ledgerView,
   planFoldCompaction,
   toSurfaceSnapshot,
-  type CompactionPlan,
   type GovernanceLedger,
 } from './compaction-governance.ts'
 import {
   COMPRESS_FAILURE_COOLDOWN,
   SUMMARY_OUTPUT_SHARE,
   decidePressureCompaction,
-  dynamicHistoryLevels,
   firstFoldableIndex,
-  foldTokensForTarget,
   retainedTailStart,
   nextGrowthEma,
-  orderFoldedMessages,
-  shouldCompressHistory,
-  shouldNudgeCompaction,
-  type HistoryLevels,
 } from './compaction-policy.ts'
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
@@ -363,44 +356,11 @@ export interface PersistentKV {
   deleteOlderThan?(prefix: string, cutoffMs: number): number
 }
 
-/** Result of a compression operation. */
-export interface CompressResult {
-  messages: readonly Message[]
-  tokensSaved: number
-  /** Set when the run was pulled forward by the growth nudge, not the trigger. */
-  readonly nudged?: boolean
-}
-
-/** Options for one {@link HistoryCompressor.compress} call. */
-export interface CompressOptions {
-  /**
-   * Pre-computed decision from the unified planner. When present, the fold
-   * executor does NOT re-decide: it runs only when the plan says 'fold' and
-   * folds to the plan's target. Both lanes then obey one policy.
-   */
-  plan?: CompactionPlan
-  /**
-   * The session's effective model window (per-model probe/override or the
-   * request context). Defaults to the globally adopted window, which may
-   * belong to a different model when several sessions share the runtime.
-   */
-  window?: number
-  /**
-   * The session whose summarization is being computed. Used to resolve the
-   * summarization target (provider/model) when `summarizationProvider`/
-   * `summarizationModel` are not configured — the summarization then follows
-   * the session's own routed model.
-   */
-  session?: Session
-}
-
 /**
  * HistoryCompressor: proactively compresses old conversation history every N
  * rounds (configurable) by summarizing via the LLM.
  *
  * Key safety features:
- *   - Recursion lock (KV-based, auto-expiring) prevents re-entrancy during
- *     the summarization LLM call.
  *   - Turn counter persisted per session (in-memory Map; survives within a
  *     process but resets on restart — acceptable since compression is
  *     idempotent and will simply re-trigger on the next interval).
@@ -462,9 +422,6 @@ export class HistoryCompressor {
   // zero and triggered an immediate, unnecessary compression on the next turn.
   private readonly turnCounters = new Map<string, SessionCounter>()
 
-  /** Recursion lock: sessionId → true while LLM summarization is in-flight. */
-  private readonly compressLocks = new Set<string>()
-
   /** Optional persistent KV backing (survives restarts); null disables persistence. */
   /** When the persisted-counter retention sweep last ran (epoch ms). */
   private lastKvPruneAt = 0
@@ -493,12 +450,6 @@ export class HistoryCompressor {
    * when the smoothed surface growth says the next step would cross it anyway.
    */
   readonly nudge: boolean
-  /**
-   * Whether the trigger/target are steered by {@link dynamicHistoryLevels}
-   * (growth + session maturity) inside hard bounds, instead of the static
-   * triggerRatio/targetRatio.
-   */
-  readonly dynamicLevels: boolean
 
   constructor(
     ctx: Context,
@@ -510,7 +461,6 @@ export class HistoryCompressor {
     injectionBudget = 0,
     kv: PersistentKV | null = null,
     nudge = false,
-    dynamicLevels = true,
   ) {
     this.ctx = ctx
     this.config = config
@@ -521,7 +471,6 @@ export class HistoryCompressor {
     this.injectionBudget = injectionBudget
     this.kv = kv
     this.nudge = nudge
-    this.dynamicLevels = dynamicLevels
     this.loadPersistedCounters()
   }
 
@@ -624,440 +573,6 @@ export class HistoryCompressor {
   }
 
   /**
-   * Acquire the recursion lock for a session.
-   * Returns true if acquired (safe to proceed), false if already locked.
-   */
-  private acquireLock(sessionId: string): boolean {
-    if (this.compressLocks.has(sessionId)) return false
-    this.compressLocks.add(sessionId)
-    return true
-  }
-
-  /**
-   * Release the recursion lock for a session.
-   */
-  private releaseLock(sessionId: string): void {
-    this.compressLocks.delete(sessionId)
-  }
-
-  /**
-   * Compress old messages when token pressure warrants it.
-   *
-   * Trigger policy (see {@link shouldCompressHistory}): the token-pressure
-   * condition dominates — once over the trigger water level the compression
-   * runs as soon as the round rate limit allows, and a single-round token surge
-   * (e.g. one very long thinking turn) bypasses the rate limit entirely so a
-   * short-window model gets relief on the very next step.
-   *
-   * Uses a detail-preserving extraction strategy:
-   *   - Short conversations (< 20 messages): single-pass with extractive prompt.
-   *   - Long conversations (>= 20 messages): batch extraction (20/batch, 5 overlap)
-   *     followed by a merge pass to combine batch summaries.
-   *
-   * CRITICAL: The recursion lock must surround the LLM call. Without it, the
-   * summarization call itself would pass through the agent loop and re-trigger
-   * governance (including another compression attempt), causing infinite
-   * recursion → stack overflow → process crash.
-   *
-   * @param sessionId - the current session identifier.
-   * @param messages  - the full message array (will NOT be mutated).
-   * @param force - skip the trigger gates (for manual/force compress).
-   * @param options - `window`: the session's effective model window (defaults
-   *   to the globally adopted window); `session`: the session whose routed
-   *   model resolves the summarization target.
-   * @returns compressed messages + tokens saved, or null if no compression.
-   */
-  async compress(
-    sessionId: string,
-    messages: readonly Message[],
-    force = false,
-    options: CompressOptions = {},
-  ): Promise<CompressResult | null> {
-    const target = resolveSummarizationTarget(this.config, options.session)
-    if (target === undefined) {
-      this.ctx.logger.info(
-        '[ContextGovernor] Compression skipped: no summarization target '
-        + '(configure summarizationProvider/Model or route a request first)',
-      )
-      return null
-    }
-
-    const entry = this.touchSession(sessionId)
-    const currentTurn = entry.turn
-    if (messages.length <= this.retainRecent) return null
-    const window = options.window ?? this.ctx.memoryContext.contextWindow
-    const beforeTokens = this.estimateMessageTokens(messages)
-
-    // Growth tracking for the early-compression nudge: the distance the
-    // surface travelled since the previous check, smoothed (see nextGrowthEma)
-    // so one unusual step cannot trigger a premature compression.
-    const growthTokens = nextGrowthEma(
-      entry.growthEma,
-      entry.lastSizeTokens === undefined ? 0 : beforeTokens - entry.lastSizeTokens,
-    )
-    entry.growthEma = growthTokens
-    entry.lastSizeTokens = beforeTokens
-
-    const budget = this.tokenBudget(window)
-
-    // The unified planner (when supplied) has ALREADY decided lane/reason/target
-    // for this step, sharing the same curve and ledger as the durable lane. The
-    // fold executor obeys it verbatim; only the legacy path below re-decides.
-    const plan = options.plan
-    let levels: HistoryLevels
-    let triggerTokens: number
-    let triggerReason: string
-    let nudged = false
-    if (plan !== undefined) {
-      entry.lastTokens = beforeTokens
-      if (plan.lane !== 'fold') {
-        this.ctx.logger.debug(
-          `[ContextGovernor] Fold deferred by plan (${plan.reason}): lane=${plan.lane}, `
-          + `${beforeTokens} tokens, trigger ${plan.surfaceTriggerTokens}`,
-        )
-        if (plan.reason === 'cooldown') entry.failureCooldown--
-        return null
-      }
-      levels = {
-        triggerRatio: plan.triggerRatio,
-        targetRatio: plan.targetRatio,
-        triggerTokens: plan.surfaceTriggerTokens,
-        targetTokens: plan.targetSurfaceTokens,
-      }
-      triggerTokens = plan.surfaceTriggerTokens
-      triggerReason = plan.reason
-      nudged = plan.reason === 'nudge'
-      if (plan.reason === 'surge') {
-        this.ctx.logger.info(
-          `[ContextGovernor] Compression surge trigger: single-round growth reached `
-          + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
-        )
-      }
-    } else {
-      // Legacy path (no planner): the fold lane owns its own curve. The
-      // plugin's own per-turn RAG injection (spliced in after this check) is
-      // reserved up front so the trigger reflects the REAL request size.
-      levels = dynamicHistoryLevels({
-        baseTriggerRatio: this.triggerRatio,
-        baseTargetRatio: this.targetRatio,
-        budgetTokens: budget,
-        growthTokens: this.dynamicLevels ? growthTokens : 0,
-        compressInterval: this.compressInterval,
-        compressions: this.dynamicLevels ? (entry.compressions ?? 0) : 0,
-        injectionBudget: this.injectionBudget,
-      })
-      triggerTokens = levels.triggerTokens
-      // Early-compression nudge (Strategy 8): if the surface is under the
-      // trigger but its OWN smoothed growth says the next step crosses it,
-      // compress now. Rate-limited to the same round interval as the ordinary
-      // trigger — otherwise a surface that settles just below the line would
-      // nudge on every single round.
-      nudged = shouldNudgeCompaction({
-        enabled: this.nudge,
-        tokens: beforeTokens,
-        growthTokens,
-        triggerTokens,
-        turn: currentTurn,
-        ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
-        compressInterval: this.compressInterval,
-        failureCooldown: entry.failureCooldown,
-      })
-      if (nudged && !force) {
-        this.ctx.logger.info(
-          `[ContextGovernor] Compression nudge: ${beforeTokens} tokens now, ~${Math.round(growthTokens)} more by the next step, `
-          + `trigger ${triggerTokens} — compressing one step early`
-        )
-      }
-      const verdict = shouldCompressHistory({
-        force: force || nudged,
-        turn: currentTurn,
-        lastCompressedTurn: entry.lastCompressedTurn,
-        lastTokens: entry.lastTokens,
-        tokens: beforeTokens,
-        triggerTokens,
-        windowTokens: window,
-        compressInterval: this.compressInterval,
-        failureCooldown: entry.failureCooldown,
-      })
-      entry.lastTokens = beforeTokens
-      if (!verdict.compress) {
-        this.ctx.logger.debug(
-          `[ContextGovernor] Compression deferred (${verdict.reason}): ${beforeTokens} tokens, `
-          + `trigger ${triggerTokens}, window ${window}, interval ${this.compressInterval}`,
-        )
-        if (verdict.reason === 'cooldown') entry.failureCooldown--
-        return null
-      }
-      if (verdict.reason === 'surge') {
-        this.ctx.logger.info(
-          `[ContextGovernor] Compression surge trigger: single-round growth reached `
-          + `${Math.floor(window * 0.2)}+ tokens of window ${window} — compressing off-interval`,
-        )
-      }
-      triggerReason = verdict.reason
-    }
-
-    // Acquire recursion lock — blocks re-entrant governance during summarization
-    if (!this.acquireLock(sessionId)) {
-      this.ctx.logger.info('[ContextGovernor] Skipping compression — lock held (recursive call)')
-      return null
-    }
-
-    try {
-      // Progressive compression: only the OLDEST messages needed to bring the
-      // context back down to the target water level are summarized; everything
-      // newer stays verbatim so recent context remains fully coherent. The
-      // injection budget is reserved here too, so after the RAG splice the
-      // request still lands at (not above) the target.
-      const targetTokens = levels.targetTokens
-      // (levels.targetTokens already reserved the injection budget; it is <= the
-      // trigger by at least HISTORY_MIN_BAND, so this fold always creates room.)
-      const toFree = beforeTokens - targetTokens
-
-      // Walk from the oldest message forward, accumulating the oldest block
-      // whose estimated tokens reach the fold budget (but never compress the
-      // recent tail). The budget is NOT `toFree`: the summary that replaces the
-      // fold also costs tokens, so folding exactly the overflow would land the
-      // surface above the target and re-trigger sooner. See foldTokensForTarget.
-      const foldTokens = foldTokensForTarget(beforeTokens, targetTokens)
-      // Pin the first message (the task statement) and fold only AFTER it, so
-      // the provider prefix cache survives the fold. billion-context #2733
-      // measured the alternative (summary ahead of the pinned first user
-      // message) at 56% of all uncached tokens in a 12-hour log.
-      const pinCount = messages.length > 0 ? 1 : 0
-      // `Math.max(0, ...)` instead of `slice(0, -retainRecent)`: retainRecent=0
-      // must not collapse the surface through the `-0 === 0` footgun.
-      const compressible = messages.slice(0, Math.max(0, messages.length - this.retainRecent))
-      if (compressible.length <= pinCount) {
-        this.ctx.logger.debug('[ContextGovernor] Compression skipped: nothing foldable after the pinned prefix')
-        return null
-      }
-      let cutIndex = pinCount
-      let cutTokens = 0
-      for (let i = pinCount; i < compressible.length; i++) {
-        cutIndex = i + 1
-        cutTokens += estimateContentTokens(compressible[i].content)
-        if (cutTokens >= foldTokens) break
-      }
-      const oldMessages = compressible.slice(pinCount, cutIndex)
-      if (oldMessages.length === 0) {
-        this.ctx.logger.debug('[ContextGovernor] Compression skipped: fold budget fits nothing after the pinned prefix')
-        return null
-      }
-      if (toFree <= 0) {
-        // Unreachable with the documented ordering (trigger ratio > target
-        // ratio puts the trigger above the target), but a misconfiguration
-        // (trigger < target) would otherwise burn an LLM call summarizing a
-        // single message that frees nothing.
-        this.ctx.logger.info(
-          `[ContextGovernor] Compression skipped: nothing over the ${Math.floor(budget * this.targetRatio)}-token target`,
-        )
-        return null
-      }
-
-      let summaryText: string
-
-      if (oldMessages.length <= 20) {
-        // Short block: single-pass extraction
-        summaryText = await this.extractBatch(oldMessages, false, target)
-      } else {
-        // Long block: batch extraction with overlap, then merge
-        const BATCH_SIZE = 20
-        const OVERLAP = 5
-        const batchSummaries: string[] = []
-
-        for (let i = 0; i < oldMessages.length; i += BATCH_SIZE - OVERLAP) {
-          const batch = oldMessages.slice(i, i + BATCH_SIZE)
-          if (batch.length === 0) break
-          const batchSummary = await this.extractBatch(batch, true, target)
-          batchSummaries.push(batchSummary)
-        }
-
-        if (batchSummaries.length === 1) {
-          summaryText = batchSummaries[0]
-        } else {
-          summaryText = await this.mergeBatches(batchSummaries, target)
-        }
-      }
-
-      if (summaryText.length === 0) {
-        this.ctx.logger.warn('[ContextGovernor] History compression produced empty summary')
-        return null
-      }
-
-      // Build compressed message array:
-      //   [summary as user message] + [kept messages verbatim]
-      // DSH contract: PreStepDecision.enter requires UserMessage[] and every
-      // message must carry id/content(ContentBlock[])/source — construct via
-      // createUserMessage (never a bare { role, content: string } object).
-      // Reverse compaction: archive the exact messages before they are
-      // replaced, and put the ref in the header so the model can pull the
-      // literal text back with memory_expand (upstream's `decompress`).
-      // A rejected compression may leave an unused archive row; retention
-      // prunes it, and nothing else references it.
-      const foldHeader = this.archiveFoldedRange(sessionId, oldMessages, summaryText)
-      const summaryMessage = createUserMessage({
-        content: [{
-          type: 'text',
-          text: `${foldHeader}\n\n${summaryText}`,
-        }],
-        source: { kind: 'plugin:' + PLUGIN } as any,
-      })
-      // Insert the summary AT the fold cut (billion-context #2733): the pinned
-      // prefix stays byte-identical, so the cached prefix extends to the fold
-      // point and only the suffix after it is re-warmed.
-      const newMessages: Message[] = orderFoldedMessages({
-        messages,
-        summary: summaryMessage,
-        cutIndex,
-        retainRecent: this.retainRecent,
-        pinCount,
-      }).map(m => ({ ...m }))
-
-      const afterTokens = this.estimateMessageTokens(newMessages)
-      const saved = beforeTokens - afterTokens
-
-      // Hard guard (mirrors compaction-basic's "summary not smaller" check):
-      // a summary that does not actually shrink the context is useless and
-      // only wastes an LLM call — treat it as a failed compression and cool
-      // down so the next steps do not burn an LLM call per turn on the same
-      // unshrinkable retained tail.
-      if (saved <= 0) {
-        entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
-        this.persistCounter(sessionId)
-        this.ctx.logger.warn(
-          `[ContextGovernor] Compression rejected: summary is not smaller `
-          + `(Before: ${beforeTokens}, After: ${afterTokens} tokens); `
-          + `cooling down for ${COMPRESS_FAILURE_COOLDOWN} rounds`,
-        )
-        return null
-      }
-
-      entry.lastCompressedTurn = currentTurn
-      entry.compressions = (entry.compressions ?? 0) + 1
-      entry.failureCooldown = 0
-      this.persistCounter(sessionId)
-      this.ctx.logger.info(
-        `[ContextGovernor] Compressed history: ${oldMessages.length} messages → 1 summary. `
-        + `Before: ${beforeTokens} tokens, After: ${afterTokens} tokens, Freed: ${saved} tokens `
-        + `(trigger reason: ${triggerReason})`,
-      )
-
-      // Persist the compression summary as a mid memory. The live summary
-      // message can still be dropped by fallback truncation later, so the
-      // compressed span must remain retrievable from the memory system.
-      // Best-effort: persistence failure must not fail the compression itself.
-      try {
-        await this.ctx.memoryContext.storeMemory(summaryText, 'mid', {
-          sourceSessionId: sessionId,
-          importance: 0.6,
-          kind: 'project',
-        })
-      } catch (persistErr) {
-        this.ctx.logger.warn(
-          `[ContextGovernor] Compression summary persistence failed: `
-          + `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
-        )
-      }
-
-      return { messages: newMessages, tokensSaved: saved, ...(nudged && !force ? { nudged: true } : {}) }
-    } catch (err) {
-      entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
-      this.persistCounter(sessionId)
-      this.ctx.logger.warn(
-        `[ContextGovernor] History compression error: ${err instanceof Error ? err.message : String(err)}`,
-      )
-      return null
-    } finally {
-      this.releaseLock(sessionId)
-    }
-  }
-
-  /**
-   * Force-compress with full error propagation (for tool use).
-   * Unlike compress(), this never silently returns null — it throws on failure.
-   */
-  async compressForce(
-    sessionId: string,
-    messages: readonly Message[],
-    options: CompressOptions = {},
-  ): Promise<CompressResult> {
-    const target = resolveSummarizationTarget(this.config, options.session)
-    if (target === undefined) {
-      throw new Error(
-        'Summarizer not available: configure summarizationProvider/Model or route a request first '
-        + '(the summarization target is resolved from the session model otherwise)',
-      )
-    }
-    if (messages.length <= this.retainRecent) {
-      throw new Error(`Not enough messages: ${messages.length} <= retainRecent(${this.retainRecent})`)
-    }
-    if (!this.acquireLock(sessionId)) {
-      throw new Error('Compression lock held (another compression in progress)')
-    }
-
-    try {
-      const beforeTokens = this.estimateMessageTokens(messages)
-      const oldMessages = messages.slice(0, -this.retainRecent)
-      const recentMessages = messages.slice(-this.retainRecent)
-
-      let summaryText: string
-      if (oldMessages.length <= 20) {
-        summaryText = await this.extractBatch(oldMessages, false, target)
-      } else {
-        const BATCH_SIZE = 20
-        const OVERLAP = 5
-        const batchSummaries: string[] = []
-        for (let i = 0; i < oldMessages.length; i += BATCH_SIZE - OVERLAP) {
-          const batch = oldMessages.slice(i, i + BATCH_SIZE)
-          if (batch.length === 0) break
-          batchSummaries.push(await this.extractBatch(batch, true, target))
-        }
-        summaryText = batchSummaries.length === 1
-          ? batchSummaries[0]
-          : await this.mergeBatches(batchSummaries, target)
-      }
-
-      if (summaryText.length === 0) {
-        throw new Error('LLM produced empty summary')
-      }
-
-      // Reverse compaction: archive the exact messages before they are
-      // replaced, and put the ref in the header so the model can pull the
-      // literal text back with memory_expand (upstream's `decompress`).
-      // A rejected compression may leave an unused archive row; retention
-      // prunes it, and nothing else references it.
-      const foldHeader = this.archiveFoldedRange(sessionId, oldMessages, summaryText)
-      const summaryMessage = createUserMessage({
-        content: [{
-          type: 'text',
-          text: `${foldHeader}\n\n${summaryText}`,
-        }],
-        source: { kind: 'plugin:' + PLUGIN } as any,
-      })
-      const newMessages: Message[] = [summaryMessage, ...recentMessages.map(m => ({ ...m }))]
-      const afterTokens = this.estimateMessageTokens(newMessages)
-      const saved = beforeTokens - afterTokens
-
-      // Hard guard (mirrors compaction-basic's "summary not smaller" check):
-      // a summary that does not actually shrink the context is useless — fail
-      // loudly so the caller (tool) sees why compression did not help.
-      if (saved <= 0) {
-        throw new Error(
-          `Compression rejected: summary is not smaller (Before: ${beforeTokens}, After: ${afterTokens} tokens)`,
-        )
-      }
-
-      this.ctx.logger.info(
-        `[ContextGovernor] Force compressed: ${oldMessages.length} msgs → 1 summary. Before: ${beforeTokens}, After: ${afterTokens}, Freed: ${saved}`,
-      )
-      return { messages: newMessages, tokensSaved: saved }
-    } finally {
-      this.releaseLock(sessionId)
-    }
-  }
-
-  /**
    * Estimate total tokens across a message array using the CJK-aware heuristic.
    * Public so the engine can build the unified SurfaceSnapshot on the SAME
    * basis the fold executor uses (before/after must not mix meters).
@@ -1072,8 +587,7 @@ export class HistoryCompressor {
 
   /**
    * Read-only ledger view for the unified planner. `turn` is the UPCOMING turn
-   * (this step), i.e. what compress() will compute after touchSession, so the
-   * planner's rate-limit boundary matches the executor's.
+   * (this step) that the fold planner evaluates; beginFoldCheck() advances it.
    * @param sessionId - the session to read.
    * @param surfaceTokens - current surface estimate; omit to keep the stored EMA.
    * @returns the planner's per-session state (never throws).
@@ -1567,7 +1081,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_round_interval,
       compress_trigger_ratio,
       compress_target_ratio,
-      compress_dynamic_levels,
       compaction_governance,
       compaction_dynamic_threshold,
       compaction_dynamic_floor,
@@ -1613,7 +1126,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // Token-pressure trigger (compress_trigger_ratio) delays compression while
     // the context is roomy; the target water level (compress_target_ratio)
     // makes compression progressive (only the oldest overflow is summarized).
-    // With compress_dynamic_levels on, both slide within hard bounds from the
+    // Inside hard bounds, the unified planner slides both water levels from the
     // measured growth and the session's compression history.
     const compressInterval = compress_round_interval ?? 7
     const retainRecent = retain_recent_messages ?? 4
@@ -1628,8 +1141,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (this.governance) {
       this.ctx.logger.info(
         '[ContextGovernor] Unified compaction governance ON: one planCompaction '
-        + 'decision drives the fold lane (compress_dynamic_levels/'
-        + 'compaction_dynamic_threshold no longer gate the fold trigger).',
+        + 'decision drives the fold lane; compaction_dynamic_threshold still gates '
+        + 'the durable lane.',
       )
     }
     this.dynamicThreshold = compaction_dynamic_threshold ?? true
@@ -1654,7 +1167,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         deleteOlderThan: (prefix, cutoffMs) => ctx.memoryContext.kvDeleteOlderThan(prefix, cutoffMs),
       },
       compress_nudge ?? true,
-      compress_dynamic_levels ?? true,
     )
 
     // Initialize the sanitizer config (Strategy 3)
@@ -1710,7 +1222,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // reuse the configured retriever for ingestion (single config source), and
     // reuse the configured sanitizer cap instead of a hard-coded one.
     ctx.memoryContext.compactionEngine = {
-      compressor: this.compressor,
       agentFor: (id: string) => this.agentFor(id),
       foldNow: (agent, signal, force) => this.foldNow(agent, signal, force),
       sanitizerConfig: this.sanitizerConfig,

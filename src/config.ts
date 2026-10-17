@@ -406,11 +406,9 @@ export interface MemoryCompactionConfig {
    */
   compress_target_ratio?: number
   /**
-   * Dynamically steer the history trigger/target from how the session is
-   * progressing (growth EMA + number of prior compressions) inside hard safety
-   * bounds (see dynamicHistoryLevels), instead of using the static
-   * compress_trigger_ratio / compress_target_ratio everywhere. The static
-   * ratios stay the anchor/shallowest values. Default true.
+   * @deprecated The unified fold planner (`planFoldCompaction`) always steers
+   * within the hard bounds; this key is accepted for backward compatibility
+   * and has no effect. Use `compaction_governance` to switch the planner.
    */
   compress_dynamic_levels?: boolean
   /**

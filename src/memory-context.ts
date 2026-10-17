@@ -649,19 +649,6 @@ export class MemoryContext extends Service {
    * class lives in memory-compaction.ts (avoiding a circular import here).
    */
   compactionEngine: {
-    compressor: {
-      compress: (
-        sid: string,
-        msgs: readonly any[],
-        force?: boolean,
-        options?: { window?: number },
-      ) => Promise<{ messages: readonly any[]; tokensSaved: number } | null>
-      compressForce: (
-        sid: string,
-        msgs: readonly any[],
-        options?: { session?: Session },
-      ) => Promise<{ messages: readonly any[]; tokensSaved: number }>
-    }
     /** The Agent that last owned a session (manual surface compaction). */
     agentFor: (sessionId: string) => Agent | undefined
     /** Fold the session SURFACE to the unified fold target. */
