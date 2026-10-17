@@ -1191,7 +1191,7 @@ export class HistoryCompressor {
    * @param summaryText - the summary that will replace them.
    * @returns the header line for the summary message.
    */
-  private archiveFoldedRange(
+  archiveFoldedRange(
     sessionId: string,
     messages: readonly Message[],
     summaryText: string,
@@ -2072,6 +2072,27 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .join('\n')
         .trim()
       if (text.length > 0) {
+        // Reverse compaction for the SURFACE-rewrite lanes too: archive the
+        // shadowed region and put its ref in the committed summary so
+        // memory_expand ref=fl_ still recovers the literal text. The derived
+        // system head (when present) is never part of the folded range.
+        const shadowed = input.messages[0]?.role === 'system'
+          ? input.messages.slice(1)
+          : input.messages
+        const header = this.compressor.archiveFoldedRange(
+          String(agent.session.id),
+          shadowed,
+          text,
+        )
+        if (header.includes('fl_')) {
+          let inserted = false
+          result.summary = result.summary.map(block => {
+            if (inserted || block.type !== 'text') return block
+            inserted = true
+            return { ...block, text: `${header}\n\n${block.text}` }
+          })
+          if (!inserted) result.summary = [{ type: 'text', text: header }, ...result.summary]
+        }
         // Mid-tier summaries are higher-value than raw tool results
         // (importance 0.6 vs 0.3) so the forgetting policy keeps them longer.
         await this.ctx.memoryContext.storeMemory(text, 'mid', {
