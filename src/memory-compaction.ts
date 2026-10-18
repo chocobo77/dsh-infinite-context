@@ -1420,6 +1420,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       ?? requestContext?.contextWindow
       ?? this.ctx.memoryContext.contextWindow
     if (!(Number.isFinite(window) && window > 0)) return null
+    // Use the SAME pressure budget as the durable lane: the window minus the
+    // reserved completion tokens (the provider charges them to the same
+    // window) minus the plugin headroom. Without the completion reserve the
+    // fold trigger sat ABOVE the durable threshold and the durable lane always
+    // won the race.
+    let reservedCompletion = session.requestHeader()?.config.maxTokens ?? 0
+    if (reservedCompletion <= 0) {
+      try {
+        const info = await this.ctx.llm.resolveModelInfo(
+          requestContext?.provider ?? '',
+          requestContext?.model ?? '',
+          signal,
+        )
+        reservedCompletion = info.defaultMaxTokens ?? 0
+      } catch {
+        // Unknown reserve: fall back to the headroom-only budget.
+      }
+    }
+    const headroom = Math.max(0, window - this.compressor.tokenBudget(window))
+    const pressureBudget = Math.max(1, Math.floor(window - reservedCompletion - headroom))
     const meter = this.ctx.tokenMeter.measure(session)
     if (meter.totalTokens <= 0) return null
     const snapshot = toSurfaceSnapshot({
@@ -1435,7 +1455,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       baseTriggerRatio: this.compressor.triggerRatio,
       baseTargetRatio: this.compressor.targetRatio,
       compressInterval: this.compressor.compressInterval,
-      budgetTokens: this.compressor.tokenBudget(window),
+      budgetTokens: pressureBudget,
       injectionBudget: this.compressor.injectionBudget,
       nudge: this.compressor.nudge,
       force,
@@ -1450,9 +1470,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     try {
       const result = await this.compactRegion(range.start, range.end, agent, signal)
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
-      // The fold lane is a real compaction now: record its saving in the ledger
-      // (the heuristic price of the shadowed content) so effectiveness is visible.
-      this.usage.record(USAGE_KIND.compactionSaved, result.shadowedTokenCount, { sessionId })
+      // Savings are recorded centrally in summarize() (both lanes pass there),
+      // so the ledger does not double count the fold.
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
       return result
     } catch (error) {
@@ -1690,6 +1709,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         const shadowed = input.messages[0]?.role === 'system'
           ? input.messages.slice(1)
           : input.messages
+        // One place records compaction savings for BOTH lanes (durable and
+        // fold), using the plugin's CJK-aware surface estimate.
+        const shadowedTokens = this.compressor.estimateMessageTokens(shadowed)
+        if (shadowedTokens > 0) {
+          this.usage.record(USAGE_KIND.compactionSaved, shadowedTokens, {
+            sessionId: String(agent.session.id),
+          })
+        }
         const header = this.compressor.archiveFoldedRange(
           String(agent.session.id),
           shadowed,
