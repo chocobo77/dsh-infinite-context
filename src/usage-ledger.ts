@@ -68,6 +68,8 @@ export const USAGE_KIND = {
   absorbChars: 'absorb_digest_chars',
   /** One scheduled (nudged) compression. */
   nudge: 'nudge_forced',
+  /** One fold-lane diagnostic sample (detail carries the outcome + numbers). */
+  foldCheck: 'fold_check',
   /** Tokens saved by a history compression. */
   compactionSaved: 'compaction_saved_tokens',
   /** Model requests that reported usage. */

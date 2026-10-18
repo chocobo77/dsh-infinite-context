@@ -1026,6 +1026,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * only receives a session id, but the surface-rewrite API needs an Agent.
    */
   private readonly lastAgentBySession = new Map<string, Agent>()
+  /** Last time a fold-check diagnostic was sampled per session (epoch ms). */
+  private readonly lastFoldCheckAt = new Map<string, number>()
   /**
    * Per-session set of memory ids injected in the most recent turn. Used to
    * avoid re-injecting the same memories every turn (cross-turn de-dup),
@@ -1371,22 +1373,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const handled = await this.forceNarrowedPressure(agent, signal)
       if (handled !== undefined) return handled
     }
-    const durable = await super.compactIfNeeded(agent, trigger, signal)
-    if (durable !== null) return durable
-    // Durable lane stayed below its threshold: the unified fold lane may still
-    // be due (its trigger is lower). The fold is a SURFACE REWRITE, never a
-    // rewrite of the step's inbox delta.
+    // The fold lane gets FIRST REFUSAL: its trigger is below the durable
+    // threshold, so asking the durable lane first starves it forever. The fold
+    // is a surface rewrite with the same semantics as durable; only when it is
+    // not due does the durable lane (and its overflow path) run.
     if (this.governance && trigger === 'pressure' && !signal.aborted) {
       try {
-        return await this.foldNow(agent, signal)
+        const folded = await this.foldNow(agent, signal)
+        if (folded !== null) return folded
       } catch (error) {
         this.ctx.logger.warn(
-          `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}`,
+          `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}; `
+          + 'falling through to the durable lane',
         )
-        return null
       }
     }
-    return durable
+    return await super.compactIfNeeded(agent, trigger, signal)
   }
 
   /**
@@ -1416,10 +1418,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const session = agent.session
     const sessionId = String(session.id)
     const requestContext = session.requestContext()
+    // Diagnostic channel: the DSH logger sink is not observable from here, so
+    // fold outcomes land in the usage ledger (kind=fold_check, detail=outcome).
+    const diag = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Diagnostics must never break governance.
+      }
+    }
     const window = this.ctx.memoryContext.windowForModel(requestContext?.model ?? '')
       ?? requestContext?.contextWindow
       ?? this.ctx.memoryContext.contextWindow
-    if (!(Number.isFinite(window) && window > 0)) return null
+    if (!(Number.isFinite(window) && window > 0)) { diag('no-window'); return null }
     // Use the SAME pressure budget as the durable lane: the window minus the
     // reserved completion tokens (the provider charges them to the same
     // window) minus the plugin headroom. Without the completion reserve the
@@ -1441,7 +1452,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const headroom = Math.max(0, window - this.compressor.tokenBudget(window))
     const pressureBudget = Math.max(1, Math.floor(window - reservedCompletion - headroom))
     const meter = this.ctx.tokenMeter.measure(session)
-    if (meter.totalTokens <= 0) return null
+    if (meter.totalTokens <= 0) { diag('no-meter'); return null }
     const snapshot = toSurfaceSnapshot({
       totalTokens: meter.totalTokens,
       surfaceTokens: meter.surfaceTokens,
@@ -1460,9 +1471,24 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       nudge: this.compressor.nudge,
       force,
     })
-    if (plan.lane !== 'fold') return null
+    if (plan.lane !== 'fold') {
+      const now = Date.now()
+      const last = this.lastFoldCheckAt.get(sessionId) ?? 0
+      // Sample normally once per 10 min, but always when close to the trigger.
+      const near = snapshot.surfaceTokens >= plan.surfaceTriggerTokens * 0.85
+      if (near || now - last >= 10 * 60_000) {
+        this.lastFoldCheckAt.set(sessionId, now)
+        diag(`plan:${plan.lane}:${plan.reason};surf=${snapshot.surfaceTokens};`
+          + `trigger=${plan.surfaceTriggerTokens};budget=${pressureBudget}`)
+      }
+      return null
+    }
     const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
-    if (range === null) return null
+    if (range === null) {
+      diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
+        + `target=${plan.targetSurfaceTokens}`)
+      return null
+    }
     this.ctx.logger.info(
       `[ContextGovernor] Fold (${plan.reason}): surface ${snapshot.surfaceTokens}/${window}, `
       + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
@@ -1472,10 +1498,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
+      diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens}`)
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
       return result
     } catch (error) {
       this.compressor.recordFoldFailure(sessionId)
+      diag(`error:${error instanceof Error ? error.message : String(error)}`)
       throw error
     }
   }
