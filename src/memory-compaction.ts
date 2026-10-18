@@ -1371,24 +1371,43 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.lastAgentBySession.set(String(agent.session.id), agent)
     if (trigger === 'pressure' && (this.dynamicThreshold || this.governance) && !signal.aborted) {
       const handled = await this.forceNarrowedPressure(agent, signal)
+      if (handled === null) {
+        // The narrowed-window override said "skip" (authoritative for the
+        // DURABLE lane). It must NOT short-circuit the fold lane: the fold is a
+        // separate surface rewrite with its own real-window budget. Try it, but
+        // keep the durable lane suppressed.
+        return await this.tryFold(agent, signal)
+      }
       if (handled !== undefined) return handled
     }
-    // The fold lane gets FIRST REFUSAL: its trigger is below the durable
-    // threshold, so asking the durable lane first starves it forever. The fold
-    // is a surface rewrite with the same semantics as durable; only when it is
-    // not due does the durable lane (and its overflow path) run.
-    if (this.governance && trigger === 'pressure' && !signal.aborted) {
-      try {
-        const folded = await this.foldNow(agent, signal)
-        if (folded !== null) return folded
-      } catch (error) {
-        this.ctx.logger.warn(
-          `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}; `
-          + 'falling through to the durable lane',
-        )
-      }
+    // Fold FIRST: its trigger is below the durable threshold, so asking the
+    // durable lane first starves it forever. The fold is a surface rewrite with
+    // the same semantics as durable; only when it is not due does the durable
+    // lane (and its overflow path) run.
+    if (trigger === 'pressure') {
+      const folded = await this.tryFold(agent, signal)
+      if (folded !== null) return folded
     }
     return await super.compactIfNeeded(agent, trigger, signal)
+  }
+
+  /**
+   * Run the fold lane with error containment.
+   * @param agent - owner of the session.
+   * @param signal - cancellation signal.
+   * @returns the fold result, or null when not due / failed.
+   */
+  private async tryFold(agent: Agent, signal: AbortSignal): Promise<CompactionResult | null> {
+    if (!this.governance || signal.aborted) return null
+    try {
+      return await this.foldNow(agent, signal)
+    } catch (error) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}; `
+        + 'falling through to the durable lane',
+      )
+      return null
+    }
   }
 
   /**
