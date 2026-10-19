@@ -1,2 +1,9 @@
+# pnpm 11 reads project settings from this file. .npmrc is reserved for auth
+# and registry settings, and the "pnpm" key in package.json is no longer read.
+# esbuild ships a platform binary through an install script, so allow it here.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
+
+# Do not auto-install peer dependencies. The DSH runtime already provides the
+# @deepseek-ai/* peers; the unit tests need only the dev tooling above.
+autoInstallPeers: false
