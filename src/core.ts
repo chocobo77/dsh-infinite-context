@@ -118,6 +118,16 @@ export {
   type WaterLevels,
 } from './compaction-governance.ts'
 export {
+  OPP_BONUS_MAX,
+  OPP_EARLY_PENALTY,
+  OPP_MATURE_TURNS,
+  OPP_NUDGE_MIN,
+  evaluateOpportunity,
+  type CompactionOpportunity,
+  type SessionPhase,
+  type SessionPhaseSignals,
+} from './compaction-opportunity.ts'
+export {
   DEFAULT_FOLD_OPTIONS,
   foldedRangeHeader,
   type FoldOptions,

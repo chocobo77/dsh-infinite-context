@@ -106,6 +106,10 @@ import {
 import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
 import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
 import {
+  evaluateOpportunity,
+  type CompactionOpportunity,
+} from './compaction-opportunity.ts'
+import {
   DEFAULT_CONCISE_DIRECTIVE,
   createConciseMessage,
   hasConciseDirective,
@@ -1420,6 +1424,61 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * Evaluate whether NOW is a good moment to fold.
+   *
+   * Compaction timing is not just pressure: a fold rewrites the request
+   * prefix, so a mid-tool-loop step pays the summary cost and invalidates the
+   * cache for a request that is about to grow again, while a turn boundary
+   * lands on a clean seam. The planner receives this score and only modulates
+   * its trigger inside the hard water-level bounds.
+   * @param session - session whose surface tail is inspected.
+   * @returns the phase, opportunity score and session maturity.
+   */
+  private compactionOpportunity(session: Session, compressions: number): CompactionOpportunity {
+    const nodes = session.surface.nodes
+    let turnCount = 0
+    let stepsSinceUser = 0
+    let lastEventType = ''
+    let lastEventHadToolCalls = false
+    let toolResults = 0
+    let assistantMessages = 0
+    let sawUser = false
+    const scan = Math.min(nodes.length, 200)
+    for (let i = nodes.length - 1; i >= nodes.length - scan; i -= 1) {
+      const seq = nodes[i]
+      if (seq === undefined) continue
+      const event = session.eventAt(seq)
+      if (event === undefined) continue
+      const type = event.type
+      if (type === 'compaction/start' || type === 'compaction/summary' || type === 'compaction/end') continue
+      if (lastEventType === '') {
+        lastEventType = type
+        if (type === 'assistant/message') {
+          const data = event.data as { message?: { content?: readonly { type?: string }[] } }
+          lastEventHadToolCalls = data.message?.content?.some(block => block.type === 'tool-call') === true
+        }
+      }
+      if (type === 'user/message') {
+        turnCount += 1
+        sawUser = true
+      } else {
+        if (!sawUser) stepsSinceUser += 1
+        if (type === 'tool/result') toolResults += 1
+        else if (type === 'assistant/message') assistantMessages += 1
+      }
+    }
+    const toolAndAssistant = toolResults + assistantMessages
+    return evaluateOpportunity({
+      turnCount,
+      stepsSinceUser,
+      lastEventType,
+      lastEventHadToolCalls,
+      recentToolRatio: toolAndAssistant === 0 ? 0 : toolResults / toolAndAssistant,
+      compressions,
+    })
+  }
+
+  /**
    * Fold the session SURFACE to the unified fold target.
    *
    * This is the fold lane's ONLY executor. `agent/pre-step` carries just the
@@ -1477,11 +1536,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       surfaceTokens: meter.surfaceTokens,
       window,
     })
+    const ledger = this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens)
+    const opportunity = this.compactionOpportunity(session, ledger.compressions)
     const plan = planFoldCompaction({
       surfaceTokens: snapshot.surfaceTokens,
       fixedTokens: snapshot.fixedTokens,
       window,
-      ledger: this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens),
+      ledger,
       baseTriggerRatio: this.compressor.triggerRatio,
       baseTargetRatio: this.compressor.targetRatio,
       compressInterval: this.compressor.compressInterval,
@@ -1489,6 +1550,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       injectionBudget: this.compressor.injectionBudget,
       nudge: this.compressor.nudge,
       force,
+      opportunity,
     })
     if (plan.lane !== 'fold') {
       const now = Date.now()
@@ -1498,14 +1560,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (near || now - last >= 10 * 60_000) {
         this.lastFoldCheckAt.set(sessionId, now)
         diag(`plan:${plan.lane}:${plan.reason};surf=${snapshot.surfaceTokens};`
-          + `trigger=${plan.surfaceTriggerTokens};budget=${pressureBudget}`)
+          + `trigger=${plan.surfaceTriggerTokens};budget=${pressureBudget};`
+          + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
       }
       return null
     }
     const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
-        + `target=${plan.targetSurfaceTokens}`)
+        + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
       return null
     }
     this.ctx.logger.info(
@@ -1517,7 +1580,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
-      diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens}`)
+      diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
+        + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
       return result
     } catch (error) {

@@ -15,6 +15,13 @@
  * @module dsh-infinite-context/compaction-governance
  */
 
+import {
+  OPP_BONUS_MAX,
+  OPP_EARLY_PENALTY,
+  OPP_NUDGE_MIN,
+  type CompactionOpportunity,
+} from './compaction-opportunity.ts'
+
 /** Hard ceiling on the trigger (fraction of the basis). Nothing may raise it. */
 export const GOV_TRIGGER_CEILING = 0.92
 /**
@@ -402,6 +409,8 @@ export interface GovernanceInput {
   readonly fillRatio?: number
   /** Tokens reserved for the plugin's own per-turn injection (fold lane). */
   readonly injectionBudget?: number
+  /** Session-phase opportunity; omitted means neutral (score 0.5, mature). */
+  readonly opportunity?: CompactionOpportunity
   readonly bounds?: Partial<GovernanceBounds>
 }
 
@@ -423,6 +432,10 @@ export interface CompactionPlan {
     readonly growth: number
     readonly stage: number
     readonly urgency: number
+    /** Session-phase opportunity score (0..1). */
+    readonly opportunity: number
+    /** Session phase the score came from. */
+    readonly phase: string
   }
 }
 
@@ -470,8 +483,28 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
   // In the caller's basis, 'trigger' and 'target' are exactly the water levels;
   // the surface-basis fields are the same numbers for the fold lane (whose
   // basis IS the surface budget) and are advisory for the durable lane.
-  const triggerTokens = Math.max(1, levels.triggerTokens)
-  const targetTokens = Math.max(0, levels.targetTokens)
+  // Opportunity modulation: a good seam lowers the trigger (compact now), a
+  // bad one raises it (defer), always inside the hard water-level bounds.
+  const opp = input.opportunity
+  const oppScore = opp === undefined ? 0.5 : clamp01(opp.score)
+  const maturity = opp === undefined ? 1 : clamp01(opp.maturity)
+  // Symmetric modulation around a neutral 0.5: a good seam lowers the
+  // trigger (compact now), a bad one raises it (defer), and no signal at all
+  // (legacy callers/tests) leaves the plan untouched. Hard bounds always win.
+  const swing = opp === undefined ? 0 : (0.5 - oppScore) * (OPP_BONUS_MAX * 2)
+  const earlyPenalty = opp === undefined ? 0 : (1 - maturity) * OPP_EARLY_PENALTY
+  const triggerRatio = clampRange(
+    levels.triggerRatio + swing + earlyPenalty,
+    b.triggerFloor,
+    b.triggerCeiling,
+  )
+  const targetRatio = clampRange(
+    levels.targetRatio - (levels.triggerRatio - triggerRatio),
+    b.targetFloor,
+    Math.max(b.targetFloor, triggerRatio - b.minBand),
+  )
+  const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - injection)
+  const targetTokens = Math.max(0, Math.floor(basis * targetRatio) - injection)
   const surfaceTriggerTokens = triggerTokens
   const targetSurfaceTokens = targetTokens
 
@@ -489,12 +522,19 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     return {
       lane: effective,
       reason,
-      triggerRatio: levels.triggerRatio,
-      targetRatio: levels.targetRatio,
+      triggerRatio,
+      targetRatio,
       triggerTokens,
       surfaceTriggerTokens,
       targetSurfaceTokens,
-      drivers: { fill: fillPressure, growth: growthPressure, stage: stagePressure, urgency },
+      drivers: {
+        fill: fillPressure,
+        growth: growthPressure,
+        stage: stagePressure,
+        urgency,
+        opportunity: oppScore,
+        phase: opp?.phase ?? 'unspecified',
+      },
     }
   }
 
@@ -521,6 +561,7 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
   // elapsed).
   if (
     input.nudge
+    && oppScore >= OPP_NUDGE_MIN
     && ledger.growthTokens > 0
     && measured < triggerTokens
     && measured + ledger.growthTokens >= triggerTokens
@@ -607,6 +648,8 @@ export interface FoldPlanInput {
   readonly nudge: boolean
   /** Manual/forced fold: bypass the trigger and rate-limit gates. */
   readonly force?: boolean
+  /** Session-phase opportunity, forwarded to the planner. */
+  readonly opportunity?: CompactionOpportunity
   readonly declaredWindow?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
@@ -642,6 +685,7 @@ export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
     measuredTokens: surface,
     fillRatio: 0,
     injectionBudget: input.injectionBudget,
+    ...(input.opportunity === undefined ? {} : { opportunity: input.opportunity }),
     ...(input.bounds === undefined ? {} : { bounds: input.bounds }),
   })
 }
