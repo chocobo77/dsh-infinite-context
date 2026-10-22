@@ -93,6 +93,8 @@ import {
   failureCooldownFor,
   foldPressureBudget,
   ledgerView,
+  minimumFoldTokens,
+  summaryCharBudget,
   planFoldCompaction,
   toSurfaceSnapshot,
   type GovernanceLedger,
@@ -1399,6 +1401,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // lane (and its overflow path) run.
     if (trigger === 'pressure') {
       const folded = await this.tryFold(agent, signal)
+      // Under the unified governor the fold lane is the SOLE pressure
+      // executor. Falling through to the durable lane here would compact
+      // again at its own (often lower) threshold right after the fold and
+      // produce churn. Overflow/context-overflow still delegates below.
+      if (this.governance) return folded
       if (folded !== null) return folded
     }
     return await super.compactIfNeeded(agent, trigger, signal)
@@ -1585,6 +1592,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
         + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
+      return null
+    }
+    // A fold that is smaller than the summarizer's own output cannot net a
+    // saving (compaction-basic rejects it). Skip it instead of churning.
+    let foldTokens = 0
+    for (const node of meter.nodes) {
+      if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
+    }
+    const minFoldTokens = minimumFoldTokens(pressureBudget)
+    if (foldTokens < minFoldTokens) {
+      diag(`small-fold:${foldTokens}<${minFoldTokens};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens}`)
       return null
     }
     this.ctx.logger.info(
@@ -1823,22 +1841,35 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   ): Promise<SummaryResult> {
     const result = await super.summarize(input, agent, signal)
     try {
+      // The summarizer is asked for ~30% of its input, but local models often
+      // over-produce; a summary that is not smaller than the folded content is
+      // rejected by compaction-basic. Cap the committed summary to the planned
+      // share so the fold always nets a saving.
+      const shadowed = input.messages[0]?.role === 'system'
+        ? input.messages.slice(1)
+        : input.messages
+      const shadowedTokens = this.compressor.estimateMessageTokens(shadowed)
+      const maxChars = summaryCharBudget(shadowedTokens, SUMMARY_OUTPUT_SHARE)
+      let remaining = maxChars
+      result.summary = result.summary.map(block => {
+        if (block.type !== 'text') return block
+        if (remaining <= 0) return { ...block, text: '' }
+        if (block.text.length <= remaining) {
+          remaining -= block.text.length
+          return block
+        }
+        const clipped = block.text.slice(0, Math.max(0, remaining - 14)) + '\n…[truncated]'
+        remaining = 0
+        return { ...block, text: clipped }
+      })
       const text = result.summary
         .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
         .map(block => block.text)
         .join('\n')
         .trim()
       if (text.length > 0) {
-        // Reverse compaction for the SURFACE-rewrite lanes too: archive the
-        // shadowed region and put its ref in the committed summary so
-        // memory_expand ref=fl_ still recovers the literal text. The derived
-        // system head (when present) is never part of the folded range.
-        const shadowed = input.messages[0]?.role === 'system'
-          ? input.messages.slice(1)
-          : input.messages
         // One place records compaction savings for BOTH lanes (durable and
         // fold), using the plugin's CJK-aware surface estimate.
-        const shadowedTokens = this.compressor.estimateMessageTokens(shadowed)
         if (shadowedTokens > 0) {
           this.usage.record(USAGE_KIND.compactionSaved, shadowedTokens, {
             sessionId: String(agent.session.id),

@@ -366,6 +366,30 @@ export function foldPressureBudget(input: FoldBudgetInput): number {
  * @param transientCooldown - rounds to wait for a transient error.
  * @returns the next cooldown (>= 1).
  */
+/**
+ * Minimum shadowed tokens worth folding: a fold must be able to beat its own
+ * summary, so tiny 1–3 message folds are skipped instead of churning.
+ * @param budgetTokens - the fold pressure budget.
+ * @returns the minimum fold size in tokens.
+ */
+export function minimumFoldTokens(budgetTokens: number): number {
+  const budget = Number.isFinite(budgetTokens) && budgetTokens > 0 ? budgetTokens : 1
+  return Math.max(2048, Math.floor(budget * 0.1))
+}
+
+/**
+ * Character budget for a summary that must stay below the folded content.
+ * Local models often over-produce; the commit is capped to the planned share.
+ * @param shadowedTokens - tokens in the folded region.
+ * @param share - expected summary share of the input (default 0.3).
+ * @returns the summary character budget (>= 1024).
+ */
+export function summaryCharBudget(shadowedTokens: number, share = 0.3): number {
+  const tokens = Number.isFinite(shadowedTokens) && shadowedTokens > 0 ? shadowedTokens : 0
+  const s = Number.isFinite(share) ? Math.min(0.9, Math.max(0.05, share)) : 0.3
+  return Math.max(1024, Math.floor(tokens * s) * 4)
+}
+
 export function failureCooldownFor(current: number, errorMessage: string, transientCooldown = 3): number {
   const configError = /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort|TargetPressureConfigError|no message budget|leaving no pressure budget/i
     .test(errorMessage)

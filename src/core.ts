@@ -120,6 +120,8 @@ export {
   GOV_CONFIG_ERROR_COOLDOWN,
   failureCooldownFor,
   foldPressureBudget,
+  minimumFoldTokens,
+  summaryCharBudget,
   type FoldBudgetInput,
 } from './compaction-governance.ts'
 export {
