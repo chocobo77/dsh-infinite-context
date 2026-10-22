@@ -374,7 +374,9 @@ export function foldPressureBudget(input: FoldBudgetInput): number {
  */
 export function minimumFoldTokens(budgetTokens: number): number {
   const budget = Number.isFinite(budgetTokens) && budgetTokens > 0 ? budgetTokens : 1
-  return Math.max(2048, Math.floor(budget * 0.1))
+  // Cap the floor: a 1M window must not demand 50k-token folds (a normal
+  // 75k fold would clear it, but a 30k fold is still worth doing).
+  return Math.min(16_384, Math.max(2048, Math.floor(budget * 0.1)))
 }
 
 /**

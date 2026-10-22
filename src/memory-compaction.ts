@@ -1601,7 +1601,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
     }
     const minFoldTokens = minimumFoldTokens(pressureBudget)
-    if (foldTokens < minFoldTokens) {
+    // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
+    // node); treat it as unknown and let compaction-basic's own size check decide.
+    if (foldTokens > 0 && foldTokens < minFoldTokens) {
       diag(`small-fold:${foldTokens}<${minFoldTokens};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens}`)
       return null
     }
@@ -1692,6 +1694,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // window equals its probed window (e.g. qwen3 at 167936) would otherwise
       // run into the slow long-context zone before the static 0.7 line fires.
       // Fire the base-style balanced compaction at the DYNAMIC line instead.
+      // Under the unified governor the fold lane owns routine pressure, so the
+      // dynamic-line durable path would be a second compaction at a different
+      // threshold (the churn seen on a 64k local model). Only the real-window
+      // force/fit-guard above still bypasses the fold.
+      if (this.governance) return undefined
       const baseThresholdTokens = Math.max(1, Math.floor(
         (declared ?? narrowed) * this.thresholdRatioFor(target),
       ))
