@@ -56,3 +56,11 @@ DSH插件开发经验.md
 # === Machine-specific (install script persistence) ===
 scripts/install-dsh-plugin.cfg
 
+
+# === Local development only (not published) ===
+docs/
+tests/
+scripts/
+ARCHITECTURE.md
+vitest.config.ts
+tsconfig.typecheck.json
