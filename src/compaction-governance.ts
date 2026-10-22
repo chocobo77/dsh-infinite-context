@@ -315,6 +315,63 @@ export function toSurfaceSnapshot(input: SurfaceSnapshotInput): SurfaceSnapshot 
 export const GOV_GUARD_RESERVE_RATIO = 0.08
 /** Absolute minimum fit-guard reserve. */
 export const GOV_GUARD_RESERVE_MIN = 1024
+
+/** Minimum share of the window the fold planner keeps for the prompt. */
+export const GOV_MIN_PROMPT_SHARE = 0.5
+/** Fold checks to wait after a configuration-class summarization error. */
+export const GOV_CONFIG_ERROR_COOLDOWN = 60
+
+export interface FoldBudgetInput {
+  readonly window: number
+  readonly reservedCompletion: number
+  readonly headroom: number
+  /** Override the minimum prompt share (default {@link GOV_MIN_PROMPT_SHARE}). */
+  readonly minPromptShare?: number
+}
+
+/**
+ * The fold lane's pressure budget, hardened against degenerate request caps.
+ *
+ * A request cap that reserves (almost) the whole window would otherwise
+ * collapse the budget to one token, which is not a plan: the fold trigger and
+ * target both become meaningless. Keep a minimum prompt share, clamp the
+ * completion reserve to what the window can actually spare, and never return
+ * less than one token.
+ * @param input - window, requested completion reserve and plugin headroom.
+ * @returns the usable prompt budget in tokens (>= 1).
+ */
+export function foldPressureBudget(input: FoldBudgetInput): number {
+  const window = Number.isFinite(input.window) && input.window > 0 ? input.window : 1
+  const headroom = Number.isFinite(input.headroom) ? Math.max(0, input.headroom) : 0
+  const share = Number.isFinite(input.minPromptShare)
+    ? Math.min(0.9, Math.max(0.1, input.minPromptShare as number))
+    : GOV_MIN_PROMPT_SHARE
+  const minBudget = Math.max(2048, Math.floor(window * share))
+  const maxReserve = Math.max(0, window - headroom - minBudget)
+  const requested = Number.isFinite(input.reservedCompletion)
+    ? Math.max(0, input.reservedCompletion)
+    : 0
+  const reserve = Math.min(requested, maxReserve)
+  return Math.max(1, Math.floor(window - reserve - headroom))
+}
+
+/**
+ * Cooldown after a failed summarization, classified by error kind.
+ *
+ * A configuration error (unsupported reasoning effort, impossible completion
+ * reserve) will not heal by retrying every few rounds, so it backs off much
+ * longer than a transient failure; the planner still retries eventually.
+ * @param current - the session's existing cooldown.
+ * @param errorMessage - the failure message.
+ * @param transientCooldown - rounds to wait for a transient error.
+ * @returns the next cooldown (>= 1).
+ */
+export function failureCooldownFor(current: number, errorMessage: string, transientCooldown = 3): number {
+  const configError = /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort|TargetPressureConfigError|no message budget|leaving no pressure budget/i
+    .test(errorMessage)
+  if (configError) return Math.max(Number.isFinite(current) ? current : 0, GOV_CONFIG_ERROR_COOLDOWN)
+  return Math.max(1, Math.floor(transientCooldown))
+}
 /** Single-round growth (share of window) that bypasses the round rate limit. */
 export const GOV_SURGE_RATIO = 0.2
 

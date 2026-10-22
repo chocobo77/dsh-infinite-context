@@ -116,6 +116,11 @@ export {
   type SurfaceSnapshot,
   type SurfaceSnapshotInput,
   type WaterLevels,
+  GOV_MIN_PROMPT_SHARE,
+  GOV_CONFIG_ERROR_COOLDOWN,
+  failureCooldownFor,
+  foldPressureBudget,
+  type FoldBudgetInput,
 } from './compaction-governance.ts'
 export {
   OPP_BONUS_MAX,

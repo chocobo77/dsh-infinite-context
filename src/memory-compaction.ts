@@ -90,6 +90,8 @@ import {
   GOV_GUARD_RESERVE_MIN,
   GOV_GUARD_RESERVE_RATIO,
   GOV_TRIGGER_CEILING,
+  failureCooldownFor,
+  foldPressureBudget,
   ledgerView,
   planFoldCompaction,
   toSurfaceSnapshot,
@@ -618,6 +620,9 @@ export class HistoryCompressor {
    */
   beginFoldCheck(sessionId: string, surfaceTokens: number): GovernanceLedger {
     const entry = this.touchSession(sessionId)
+    // Count the cooldown down on every fold check so a transient failure
+    // cannot disable the lane for the rest of the session.
+    if (entry.failureCooldown > 0) entry.failureCooldown -= 1
     const delta = entry.lastSizeTokens === undefined ? 0 : surfaceTokens - entry.lastSizeTokens
     entry.growthEma = nextGrowthEma(entry.growthEma, delta)
     entry.lastSizeTokens = surfaceTokens
@@ -654,10 +659,11 @@ export class HistoryCompressor {
    * Record a failed fold so the planner backs off instead of retrying every step.
    * @param sessionId - the session whose fold failed.
    */
-  recordFoldFailure(sessionId: string): void {
+  recordFoldFailure(sessionId: string, error?: unknown): void {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) return
-    entry.failureCooldown = COMPRESS_FAILURE_COOLDOWN
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    entry.failureCooldown = failureCooldownFor(entry.failureCooldown, message, COMPRESS_FAILURE_COOLDOWN)
     this.persistCounter(sessionId)
   }
 
@@ -1032,6 +1038,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly lastAgentBySession = new Map<string, Agent>()
   /** Last time a fold-check diagnostic was sampled per session (epoch ms). */
   private readonly lastFoldCheckAt = new Map<string, number>()
+  /** Supported reasoning effort per provider/model (compaction-call fallback). */
+  private readonly modelEfforts = new Map<string, NonNullable<GenerateOptions['reasoningEffort']>>()
   /**
    * Per-session set of memory ids injected in the most recent turn. Used to
    * avoid re-injecting the same memories every turn (cross-turn de-dup),
@@ -1293,6 +1301,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
     this.registerUsage(ctx)
+    this.registerCompactionEffort(ctx)
 
     // Mid-thinking context guard: wrap the agent's LLM stream and inject a
     // CONTEXT_WINDOW_EXCEEDED finish when input + output-so-far approaches the
@@ -1523,12 +1532,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           signal,
         )
         reservedCompletion = info.defaultMaxTokens ?? 0
+        const effort = info.reasoning?.efforts?.[0]?.id ?? info.reasoning?.defaultEffort
+        if (effort !== undefined) {
+          this.modelEfforts.set(`${requestContext?.provider ?? ''}/${requestContext?.model ?? ''}`, effort)
+        }
       } catch {
         // Unknown reserve: fall back to the headroom-only budget.
       }
     }
     const headroom = Math.max(0, window - this.compressor.tokenBudget(window))
-    const pressureBudget = Math.max(1, Math.floor(window - reservedCompletion - headroom))
+    // A request cap that reserves (almost) the whole window must not collapse
+    // the fold budget to one token: clamp the reserve to what the window can
+    // spare and keep a minimum prompt share.
+    const pressureBudget = foldPressureBudget({ window, reservedCompletion, headroom })
     const meter = this.ctx.tokenMeter.measure(session)
     if (meter.totalTokens <= 0) { diag('no-meter'); return null }
     const snapshot = toSurfaceSnapshot({
@@ -1585,7 +1601,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
       return result
     } catch (error) {
-      this.compressor.recordFoldFailure(sessionId)
+      this.compressor.recordFoldFailure(sessionId, error)
       diag(`error:${error instanceof Error ? error.message : String(error)}`)
       throw error
     }
@@ -2098,6 +2114,55 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    *
    * @param ctx - the plugin context.
    */
+  /**
+   * Make auxiliary compaction calls use the session's own reasoning effort.
+   *
+   * compaction-basic's summarizer omits `reasoningEffort`, so the LLM service
+   * falls back to the model's declared default. Local providers commonly
+   * declare a default the served model rejects (e.g. default "high" while the
+   * GGUF template only accepts "medium"), which fails every summarization.
+   * Wrapping `stream` for `purpose: 'compaction'` passes the routed effort (or
+   * the first effort the model actually declares) without forking the base.
+   * @param ctx - the plugin context.
+   */
+  private registerCompactionEffort(ctx: Context): void {
+    const llm = ctx.llm
+    const marker = Symbol.for('dsh-infinite-context.compaction-effort')
+    const record = llm as unknown as Record<PropertyKey, unknown>
+    if (record[marker] === true) return
+    const original = llm.stream.bind(llm)
+    try {
+      llm.stream = (options: GenerateOptions) => {
+        if (options.purpose === 'compaction' && options.reasoningEffort === undefined) {
+          const effort = this.compactionEffortFor(options)
+          if (effort !== undefined) return original({ ...options, reasoningEffort: effort })
+        }
+        return original(options)
+      }
+      record[marker] = true
+    } catch (error) {
+      // A frozen/proxied service must not break plugin loading; the
+      // summarizer simply keeps the provider default in that case.
+      this.ctx.logger.warn(
+        `[ContextGovernor] Could not pass reasoning effort to compaction calls: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    // The wrapper is idempotent and the plugin lives for the process.
+  }
+
+  /**
+   * Resolve the reasoning effort for one auxiliary call.
+   * @param options - the outgoing LLM call.
+   * @returns the routed session effort, else the first effort the model declares.
+   */
+  private compactionEffortFor(options: GenerateOptions): NonNullable<GenerateOptions['reasoningEffort']> | undefined {
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    const session = sessionId === undefined ? undefined : this.lastAgentBySession.get(sessionId)?.session
+    const routed = session?.requestHeader()?.config.reasoningEffort
+    if (routed !== undefined) return routed
+    return this.modelEfforts.get(`${options.provider}/${options.model}`)
+  }
+
   private registerUsage(ctx: Context): void {
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'assistant/message') return
