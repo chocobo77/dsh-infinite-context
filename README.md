@@ -34,6 +34,7 @@ dsh plugin --profile <profile> add ./dsh-infinite-context-<version>.tgz
 - 压缩通过 `compaction-basic` 的 `compactRegion` 重写会话表面。
 - 本地模型只支持特定推理档位时，压缩调用沿用会话当前的 `reasoningEffort`。
 - `maxTokens` 接近窗口时，预算会保留至少 50% 的提示空间。
+- 默认使用内置 lightweight embedder，不依赖第三方包；如需语义 embedder，请手动安装 `@huggingface/transformers` 并把 `embedder.kind` 设为 `transformers`。
 
 ### 许可
 
@@ -73,6 +74,7 @@ Settings live in `cordis.yml`. `compaction_governance` is on by default; `compre
 - Compaction rewrites the session surface through `compaction-basic`'s `compactRegion`.
 - When a local model only accepts specific reasoning levels, compaction calls use the session's current `reasoningEffort`.
 - When `maxTokens` is close to the window, the budget keeps at least 50% of the window for the prompt.
+- The default lightweight embedder has no third-party dependencies. For the semantic embedder, install `@huggingface/transformers` manually and set `embedder.kind` to `transformers`.
 
 ### License
 
