@@ -34,6 +34,12 @@ export const GOV_TRIGGER_CEILING = 0.92
 export const GOV_TRIGGER_FLOOR = 0.65
 /** Hard floor on the post-compression target. */
 export const GOV_TARGET_FLOOR = 0.25
+/**
+ * Memory floor for the retained tail: never fold the surface below this share
+ * of the budget. The tail is what the agent keeps verbatim, and a mature
+ * session used to widen its band until the tail was gone.
+ */
+export const GOV_TARGET_MEMORY_FLOOR = 0.55
 /** Minimum trigger-to-target band so every compression creates real headroom. */
 export const GOV_MIN_BAND = 0.08
 /** Maximum band so a pathological growth estimate cannot empty the context. */
@@ -419,6 +425,8 @@ export type GovernanceReason =
 
 /** Hard bounds for the planner (water-level bounds plus routing margins). */
 export interface GovernanceBounds extends WaterLevelBounds {
+  /** Minimum retained share of the budget (see {@link GOV_TARGET_MEMORY_FLOOR}). */
+  readonly memoryTargetFloor: number
   readonly guardReserveRatio: number
   readonly guardReserveMin: number
   readonly surgeRatio: number
@@ -427,6 +435,7 @@ export interface GovernanceBounds extends WaterLevelBounds {
 /** Shipped planner bounds. */
 export const DEFAULT_GOVERNANCE_BOUNDS: GovernanceBounds = {
   ...DEFAULT_WATER_LEVEL_BOUNDS,
+  memoryTargetFloor: GOV_TARGET_MEMORY_FLOOR,
   guardReserveRatio: GOV_GUARD_RESERVE_RATIO,
   guardReserveMin: GOV_GUARD_RESERVE_MIN,
   surgeRatio: GOV_SURGE_RATIO,
@@ -581,11 +590,19 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     b.triggerFloor,
     b.triggerCeiling,
   )
-  const targetRatio = clampRange(
+  const rawTargetRatio = clampRange(
     levels.targetRatio - (levels.triggerRatio - triggerRatio),
     b.targetFloor,
     Math.max(b.targetFloor, triggerRatio - b.minBand),
   )
+  // The retained tail is what the agent keeps verbatim. A mature session used
+  // to widen its band until the tail was almost gone, so keep a memory floor.
+  const memoryFloor = clampRange(
+    b.memoryTargetFloor,
+    b.targetFloor,
+    Math.max(b.targetFloor, triggerRatio - b.minBand),
+  )
+  const targetRatio = Math.max(rawTargetRatio, memoryFloor)
   const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - injection)
   const targetTokens = Math.max(0, Math.floor(basis * targetRatio) - injection)
   const surfaceTriggerTokens = triggerTokens

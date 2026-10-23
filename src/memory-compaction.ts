@@ -1869,11 +1869,24 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         remaining = 0
         return { ...block, text: clipped }
       })
-      const text = result.summary
+      const modelText = result.summary
         .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
         .map(block => block.text)
         .join('\n')
         .trim()
+      // Keep the user's own words in the folded range. A model summary can
+      // drop instructions and identifiers; this digest is deterministic and
+      // survives whatever the summarizer decides to keep.
+      const userInstructions = shadowed
+        .filter(message => message.role === 'user')
+        .map(message => messageText(message).trim())
+        .filter(value => value.length > 0)
+        .slice(-12)
+        .map(value => `- ${value.length > 300 ? `${value.slice(0, 300)}…` : value}`)
+      const digest = userInstructions.length === 0
+        ? ''
+        : `## 折叠区用户指令 / User instructions in the folded range\n${userInstructions.join('\n')}`
+      const text = [digest, modelText].filter(Boolean).join('\n\n')
       if (text.length > 0) {
         // One place records compaction savings for BOTH lanes (durable and
         // fold), using the plugin's CJK-aware surface estimate.
@@ -1887,14 +1900,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           shadowed,
           text,
         )
-        if (header.includes('fl_')) {
+        const prefix = [header.includes('fl_') ? header : '', digest]
+          .filter(Boolean)
+          .join('\n\n')
+        if (prefix.length > 0) {
           let inserted = false
           result.summary = result.summary.map(block => {
             if (inserted || block.type !== 'text') return block
             inserted = true
-            return { ...block, text: `${header}\n\n${block.text}` }
+            return { ...block, text: `${prefix}\n\n${block.text}` }
           })
-          if (!inserted) result.summary = [{ type: 'text', text: header }, ...result.summary]
+          if (!inserted) result.summary = [{ type: 'text', text: prefix }, ...result.summary]
         }
         // Mid-tier summaries are higher-value than raw tool results
         // (importance 0.6 vs 0.3) so the forgetting policy keeps them longer.
