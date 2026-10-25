@@ -94,6 +94,7 @@ import {
   GOV_TRIGGER_CEILING,
   failureCooldownFor,
   foldPressureBudget,
+  isThinFold,
   ledgerView,
   minimumFoldTokens,
   nextTargetDeviationEma,
@@ -1735,6 +1736,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
       return null
     }
+    // Thin-fold gate: a ROUTINE fold must net more than its own summarizer
+    // output plus the cost of the call and the post-fold cache refill (≈8%
+    // of the budget). On a small window the memory floor caps the band so
+    // the closed loop cannot deepen its way out - without this gate the
+    // session churned at a median 3-minute cadence for a ~6% sliver each
+    // time. Force, surge and the fit-guard bypass it: their occasion is not
+    // optional, and a thin emergency fold still beats an overflow.
+    if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
+      && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget)) {
+      diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
+        + `budget=${pressureBudget};surf=${snapshot.surfaceTokens};timing=${plan.drivers.timing.toFixed(2)};`
+        + `mag=${plan.drivers.magnitude.toFixed(2)}`)
+      return null
+    }
     this.ctx.logger.info(
       `[ContextGovernor] Fold (${plan.reason}): surface ${snapshot.surfaceTokens}/${window}, `
       + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
@@ -1751,10 +1766,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // landings are not observed here, so a summary-overhead change seen
       // only by durable compactions reaches this EMA one fold later.
       const landed = this.ctx.tokenMeter.measure(session).surfaceTokens
-      const deviation = this.compressor.recordFoldLanding(
-        sessionId,
-        landed - plan.targetSurfaceTokens,
-      )
+      // Forced folds (manual tool call) have atypical range shapes and
+      // overhead, so they OBSERVE without TEACHING: the diagnosis still
+      // reports the current EMA, but the average only learns from routine
+      // cadence folds.
+      const deviation = plan.reason === 'forced'
+        ? (this.compressor.targetDeviationOf(sessionId) ?? 0)
+        : this.compressor.recordFoldLanding(
+            sessionId,
+            landed - plan.targetSurfaceTokens,
+          )
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
       diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`

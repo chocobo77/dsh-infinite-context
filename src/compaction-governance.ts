@@ -59,6 +59,17 @@ export const GOV_STAGE_TRIGGER_CAP = 0
 export const GOV_HOT_GROWTH = 0.05
 /** Successful compressions at which a session counts as fully mature. */
 export const GOV_MATURE_COMPRESSIONS = 8
+/**
+ * Minimum NET saving of a routine fold, as a share of the fold budget: the
+ * folded tokens minus the summarizer's own expected output. A fold that nets
+ * less costs a summarizer call plus a post-fold cache refill for a sliver of
+ * headroom - on a small window the memory floor caps the band so the closed
+ * loop cannot deepen its way out, and only this gate stops the churn. Force,
+ * surge and the fit-guard bypass it (their occasion is not optional). The
+ * opportunity cost of a fold is ≈5-7% of the budget; 8% leaves margin.
+ * Set 0 to disable the gate.
+ */
+export const GOV_MIN_NET_SAVING_RATIO = 0.08
 
 /* -------------------------------------------------------------------------- */
 /*  Closed-loop target band (landing-deviation feedback)                       */
@@ -510,6 +521,38 @@ export function minimumFoldTokens(budgetTokens: number): number {
   // Cap the floor: a 1M window must not demand 50k-token folds (a normal
   // 75k fold would clear it, but a 30k fold is still worth doing).
   return Math.min(16_384, Math.max(2048, Math.floor(budget * 0.1)))
+}
+
+/**
+ * The thin-fold gate: is this fold's NET saving (folded tokens minus the
+ * summarizer's own expected output) below its share of the budget?
+ *
+ * Complements {@link minimumFoldTokens}: that floor prices the fold against
+ * the SUMMARY mechanism, this one prices the fold against the BUDGET it is
+ * supposed to relieve. On a small window both floors bind and only a deep
+ * occasion (nudge, fit-guard) is worth the summarizer call.
+ * @param foldTokens - tokens the range selector would fold.
+ * @param expectedSummaryTokens - the summarizer's expected output for them.
+ * @param budgetTokens - the fold lane's pressure budget.
+ * @param minRatio - minimum net saving as a share of the budget
+ *   (default {@link GOV_MIN_NET_SAVING_RATIO}; 0 disables the gate).
+ * @returns true when the fold should be skipped as not worth its cost.
+ *   Non-finite input conservatively reads as thin (skip).
+ */
+export function isThinFold(
+  foldTokens: number,
+  expectedSummaryTokens: number,
+  budgetTokens: number,
+  minRatio: number = GOV_MIN_NET_SAVING_RATIO,
+): boolean {
+  // Unknown ANY input term means the saving cannot be priced: conservatively
+  // thin (skip) rather than fold blind.
+  if (!Number.isFinite(budgetTokens) || budgetTokens <= 0) return true
+  if (!Number.isFinite(foldTokens)) return true
+  if (!Number.isFinite(expectedSummaryTokens)) return true
+  const saving = Math.max(0, foldTokens) - Math.max(0, expectedSummaryTokens)
+  const ratio = Number.isFinite(minRatio) ? Math.max(0, minRatio) : GOV_MIN_NET_SAVING_RATIO
+  return saving < budgetTokens * ratio
 }
 
 /**

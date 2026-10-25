@@ -130,6 +130,8 @@ export {
   GOV_DEEP_PROBE_MAX_WINDOW_FILL,
   GOV_DEEP_PROBE_MIN_MAGNITUDE,
   GOV_DEEP_PROBE_MEMORY_FLOOR,
+  GOV_MIN_NET_SAVING_RATIO,
+  isThinFold,
   nextTargetDeviationEma,
   targetDeviationCorrection,
 } from './compaction-governance.ts'
