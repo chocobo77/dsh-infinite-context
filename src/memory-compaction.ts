@@ -76,11 +76,13 @@ import {
   resolveAbsorbOptions,
   resolveFoldOptions,
   resolveRetrievalOptions,
+  resolveSummarizationTimeoutMs,
   resolveToolArchiveOptions,
   resolveUsageOptions,
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
+import { extractiveSummary, summarizeWithResilience } from './extractive-summary.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
@@ -94,6 +96,7 @@ import {
   foldPressureBudget,
   ledgerView,
   minimumFoldTokens,
+  nextTargetDeviationEma,
   summaryCharBudget,
   planFoldCompaction,
   toSurfaceSnapshot,
@@ -355,6 +358,13 @@ interface SessionCounter {
   lastForceAt?: number
   /** Epoch ms of the last successful fold (frequency gate). */
   lastCompressedAt?: number
+  /**
+   * Signed EMA of `post-fold landing − planned target`, in tokens. Feeds the
+   * closed-loop target band: folds land above the plan (summary overhead +
+   * unfoldable tail), and the learned shortfall widens the next band. Lives in
+   * the session ledger so it is persisted and garbage-collected with it.
+   */
+  targetDeviationEma?: number
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
 }
@@ -687,6 +697,31 @@ export class HistoryCompressor {
     const message = error instanceof Error ? error.message : String(error ?? '')
     entry.failureCooldown = failureCooldownFor(entry.failureCooldown, message, COMPRESS_FAILURE_COOLDOWN)
     this.persistCounter(sessionId)
+  }
+
+  /**
+   * The session's learned landing-deviation EMA, in tokens. `undefined` means
+   * no fold has landed yet, so no closed-loop correction applies.
+   * @param sessionId - the session to query.
+   */
+  targetDeviationOf(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.targetDeviationEma
+  }
+
+  /**
+   * Fold one landing observation into the per-session deviation EMA (signed:
+   * `landing − target`), persisting it with the rest of the session state.
+   * @param sessionId - the session that just committed a fold.
+   * @param landingDelta - `post-fold landing − planned target`, in tokens on
+   * the meter's surface basis.
+   * @returns the updated EMA (for diagnostics; 0 for an unknown session).
+   */
+  recordFoldLanding(sessionId: string, landingDelta: number): number {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return 0
+    entry.targetDeviationEma = nextTargetDeviationEma(entry.targetDeviationEma, landingDelta)
+    this.persistCounter(sessionId)
+    return entry.targetDeviationEma
   }
 
   /**
@@ -1615,6 +1650,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const ledger = this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens)
     const opportunity = this.compactionOpportunity(session, ledger.compressions)
     const intent = this.contextIntent(session, meter)
+    const deviationEma = this.compressor.targetDeviationOf(sessionId)
     const plan = planFoldCompaction({
       surfaceTokens: snapshot.surfaceTokens,
       fixedTokens: snapshot.fixedTokens,
@@ -1628,6 +1664,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       nudge: this.compressor.nudge,
       force,
       opportunity,
+      ...(deviationEma === undefined ? {} : { deviationEmaTokens: deviationEma }),
       ...(intent === undefined ? {} : { intent }),
     })
     if (plan.lane !== 'fold') {
@@ -1681,9 +1718,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     try {
       const result = await this.compactRegion(range.start, range.end, agent, signal)
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
+      // Closed-loop band: observe where the fold actually landed versus the
+      // plan's target and feed the signed shortfall into the next plan. The
+      // meter re-reads the rewritten surface, so `landed` shares the target's
+      // basis (meter surface tokens on the same estimator).
+      const landed = this.ctx.tokenMeter.measure(session).surfaceTokens
+      const deviation = this.compressor.recordFoldLanding(
+        sessionId,
+        landed - plan.targetSurfaceTokens,
+      )
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
       diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
+        + `landed=${landed};dev=${Math.round(deviation)};`
         + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
@@ -1906,6 +1953,63 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * The summarizer call under a bounded deadline, with a degradation path.
+   *
+   * Telemetry (2026-10) showed the call hanging until the provider's own
+   * 300s stream-idle limit — blocking the whole fold — and local configs
+   * failing every call outright; either failure used to ABANDON the fold, so
+   * the context kept growing exactly when the model could least afford it.
+   * Now: one hard timeout per attempt (a fresh timer each), a single retry,
+   * then a deterministic extractive summary. The fold always completes; the
+   * degraded path is observable as kind=fold_check detail=degraded:extractive.
+   * A CALLER cancellation still rethrows (a cancelled step must not fabricate
+   * a result), and `summarization_timeout_ms: 0` disables the wrapper.
+   */
+  private async summarizeResilient(
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    const timeoutMs = resolveSummarizationTimeoutMs(this.config)
+    if (timeoutMs <= 0) return super.summarize(input, agent, signal)
+    const shadowed = input.messages[0]?.role === 'system'
+      ? input.messages.slice(1)
+      : input.messages
+    const outcome = await summarizeWithResilience(
+      combined => super.summarize(input, agent, combined),
+      error => {
+        const reason = error instanceof Error ? error.message : String(error ?? 'unknown')
+        const text = extractiveSummary(
+          shadowed.map(message => ({ role: message.role, text: messageText(message) })),
+          { reason },
+        )
+        return {
+          summary: [{ type: 'text', text }],
+          provider: 'extractive',
+          model: 'extractive',
+        } satisfies SummaryResult
+      },
+      { timeoutMs, retries: 1, ...(signal === undefined ? {} : { outerSignal: signal }) },
+    )
+    if (outcome.degraded) {
+      const reason = outcome.error instanceof Error
+        ? outcome.error.message
+        : String(outcome.error ?? 'unknown')
+      const brief = reason.replace(/\s+/g, ' ').trim().slice(0, 160)
+      this.ctx.logger.warn('[ContextGovernor] summarizer degraded to extractive: ' + brief)
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, {
+          sessionId: String(agent.session.id),
+          detail: 'degraded:extractive:' + brief,
+        })
+      } catch {
+        // Diagnostics must never break the degraded path.
+      }
+    }
+    return outcome.value
+  }
+
+  /**
    * Summarize a compacted region and then persist it as a mid-term memory,
    * rebalance the memory pyramid, and run the forgetting sweep.
    */
@@ -1914,7 +2018,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
-    const result = await super.summarize(input, agent, signal)
+    // Spread once: the resilience wrapper's declared type keeps the summary
+    // read-only, while the clipping below rewrites it in place.
+    const result = { ...(await this.summarizeResilient(input, agent, signal)) }
     try {
       // The summarizer is asked for ~30% of its input, but local models often
       // over-produce; a summary that is not smaller than the folded content is

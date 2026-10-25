@@ -420,6 +420,15 @@ export interface MemoryCompactionConfig {
    * switches, so existing configs behave as before.
    */
   compaction_governance?: boolean
+  /**
+   * Hard timeout for ONE summarizer LLM call during a compaction, in ms.
+   * Each attempt gets a fresh timer; after one retry the fold degrades to a
+   * deterministic extractive summary instead of being abandoned. Production
+   * saw the call hang until the provider's own 300s stream-idle limit while
+   * the whole fold waited. 0 disables the wrapper (provider defaults apply).
+   * Clamped to [15000, 300000] otherwise. Default 90000.
+   */
+  summarization_timeout_ms?: number
   /** Number of most recent messages to keep uncompressed. */
   retain_recent_messages?: number
   /** Maximum characters for generic JSON string fields in output sanitization. */
@@ -538,6 +547,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   compress_target_ratio: z.number().min(0).max(1),
   compress_dynamic_levels: z.boolean(),
   compaction_governance: z.boolean(),
+  summarization_timeout_ms: z.number().step(1).min(0),
   retain_recent_messages: z.number().step(1).min(1),
   sanitize_max_chars: z.number().step(1).min(100),
   rag_top_k: z.number().step(1).min(1),
@@ -686,6 +696,31 @@ export function resolveAbsorbOptions(
       ceiling,
     ),
   }
+}
+
+/** Default hard timeout for ONE summarizer LLM call, in ms. */
+export const DEFAULT_SUMMARIZATION_TIMEOUT_MS = 90_000
+/** Smallest useful summarizer timeout; below this a hang outlives the retry. */
+export const MIN_SUMMARIZATION_TIMEOUT_MS = 15_000
+/** Largest summarizer timeout; the provider's own stream-idle limit is 300s. */
+export const MAX_SUMMARIZATION_TIMEOUT_MS = 300_000
+
+/**
+ * Resolve `summarization_timeout_ms`. 0 disables the resilience wrapper (the
+ * provider's own defaults then bound the call); any other value is clamped
+ * into {@link MIN_SUMMARIZATION_TIMEOUT_MS}..{@link MAX_SUMMARIZATION_TIMEOUT_MS}.
+ * Non-finite input takes the default rather than producing a broken timer.
+ * @param raw - the config from cordis.yml.
+ * @returns the resolved timeout in ms (0 = disabled).
+ */
+export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig): number {
+  const value = raw.summarization_timeout_ms
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_SUMMARIZATION_TIMEOUT_MS
+  if (value <= 0) return 0
+  return Math.min(
+    MAX_SUMMARIZATION_TIMEOUT_MS,
+    Math.max(MIN_SUMMARIZATION_TIMEOUT_MS, Math.floor(value)),
+  )
 }
 
 /**

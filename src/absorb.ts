@@ -75,6 +75,24 @@ function isSignal(line: string): boolean {
 }
 
 /**
+ * Public alias of the signal-line test, for sibling modules that reuse the
+ * same outcome-line heuristics (e.g. the extractive fold summary).
+ */
+export function isSignalLine(line: string): boolean {
+  return isSignal(line)
+}
+
+/**
+ * Clip one line to `maxChars` CODE POINTS (surrogate-pair safe): a UTF-16
+ * slice can cut an astral character in half and leave a lone surrogate in
+ * persisted text and model-facing stubs.
+ */
+export function clipLineByCodePoints(line: string, maxChars: number): string {
+  const points = Array.from(line)
+  return points.length <= maxChars ? line : points.slice(0, maxChars).join('')
+}
+
+/**
  * Distill one tool result into a digest of its signal lines, head, and tail.
  *
  * Best-effort and bounded: the result is never longer than

@@ -120,6 +120,12 @@
     # and the fold executor obeys it. Off = legacy per-lane triggers (shared
     # curves still apply). Explicit opt-in for existing configs.
     compaction_governance: true
+    # Hard timeout (ms) for ONE summarizer LLM call during a compaction. Each
+    # attempt gets a fresh timer; after one retry the fold degrades to a
+    # deterministic extractive summary instead of being abandoned (production
+    # saw the call hang to the provider's 300s stream-idle limit while the
+    # fold waited). 0 disables the wrapper; clamped to [15000, 300000].
+    summarization_timeout_ms: 90000
     # Dynamic compaction threshold: when the routed model's REAL window (live
     # probe / modelWindows) is smaller than DSH declares, force compaction from
     # a threshold derived from the REAL window instead of waiting for a
