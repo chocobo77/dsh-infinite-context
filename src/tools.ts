@@ -437,9 +437,6 @@ export function apply(ctx: Context) {
         // (upstream billion-context calls this `decompress`).
         original = folded.original
         archiveSessionId = folded.sessionId
-        // Read-back telemetry, track 1 of 2: the per-range counter surfaced by
-        // the listing above ("read back Nx"). Works only for fl_ refs.
-        ctx.memoryContext.markFoldedRangeRestored(folded.ref)
         header = 'Folded history range ' + folded.ref + ' (' + folded.messages + ' messages, '
           + Array.from(folded.original).length + ' code points, folded '
           + new Date(folded.createdAt).toISOString() + ').\n'
@@ -449,10 +446,15 @@ export function apply(ctx: Context) {
         return 'Unknown archive ref: ' + ref + '. Call memory_expand without a ref to list recent entries.'
       }
       const points = Array.from(original)
-      // Read-back telemetry, track 2 of 2: one usage-ledger event per
-      // successful expansion (both tr_ and fl_ refs — this is the only counter
-      // the tr_ path has). Recorded only when archived text actually came back.
+      // Read-back telemetry, both tracks in ONE place, called only when
+      // archived text actually came back — a failed read (offset past the
+      // end, no match) counts on neither track.
+      // Track 1 of 2: the fl_-only per-range counter surfaced by the listing
+      // above ("read back Nx").
+      // Track 2 of 2: one usage-ledger event per expansion (both tr_ and fl_
+      // refs — this is the only counter the tr_ path has).
       const reportRestore = (returnedPoints: number, truncated: boolean): void => {
+        if (folded !== undefined) ctx.memoryContext.markFoldedRangeRestored(folded.ref)
         ctx.memoryContext.recordExpandRestore({
           ref,
           returnedChars: returnedPoints,

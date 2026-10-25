@@ -192,6 +192,16 @@ function messageText(message: { role: string; content: unknown }): string {
   return ''
 }
 
+/**
+ * The folded messages proper: a SummarizationInput leads with the summarizer's
+ * own system prompt, which is NOT part of the archived range. Both the
+ * degradation fallback and the post-processing digest strip it, and they must
+ * agree — a change to the system-message convention happens here once.
+ */
+function shadowedMessages(input: SummarizationInput): readonly Message[] {
+  return input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
+}
+
 /** Whether an unknown entry is a content block carrying text. */
 function isTextBlock(block: unknown): block is { type: 'text'; text: string } {
   return typeof block === 'object' && block !== null
@@ -1720,8 +1730,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
       // Closed-loop band: observe where the fold actually landed versus the
       // plan's target and feed the signed shortfall into the next plan. The
-      // meter re-reads the rewritten surface, so `landed` shares the target's
-      // basis (meter surface tokens on the same estimator).
+      // meter re-reads the rewritten surface (measure() re-syncs the session
+      // each call), so `landed` shares the target's basis (meter surface
+      // tokens on the same estimator). Scope: the FOLD lane feeds the loop —
+      // the durable lane shares the same planCompaction targets but its
+      // landings are not observed here, so a summary-overhead change seen
+      // only by durable compactions reaches this EMA one fold later.
       const landed = this.ctx.tokenMeter.measure(session).surfaceTokens
       const deviation = this.compressor.recordFoldLanding(
         sessionId,
@@ -1964,6 +1978,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * degraded path is observable as kind=fold_check detail=degraded:extractive.
    * A CALLER cancellation still rethrows (a cancelled step must not fabricate
    * a result), and `summarization_timeout_ms: 0` disables the wrapper.
+   *
+   * Known boundary: the race settles the CALL on time, but a backend that
+   * ignores the abort signal may keep its underlying stream open — the retry
+   * then runs concurrently with the abandoned attempt until the provider's
+   * own idle limit reaps it. Worst case is a briefly duplicated in-flight
+   * request, never a duplicated summary (the loser's result is discarded).
    */
   private async summarizeResilient(
     input: SummarizationInput,
@@ -1972,9 +1992,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   ): Promise<SummaryResult> {
     const timeoutMs = resolveSummarizationTimeoutMs(this.config)
     if (timeoutMs <= 0) return super.summarize(input, agent, signal)
-    const shadowed = input.messages[0]?.role === 'system'
-      ? input.messages.slice(1)
-      : input.messages
+    const shadowed = shadowedMessages(input)
     const outcome = await summarizeWithResilience(
       combined => super.summarize(input, agent, combined),
       error => {
@@ -2026,9 +2044,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // over-produce; a summary that is not smaller than the folded content is
       // rejected by compaction-basic. Cap the committed summary to the planned
       // share so the fold always nets a saving.
-      const shadowed = input.messages[0]?.role === 'system'
-        ? input.messages.slice(1)
-        : input.messages
+      const shadowed = shadowedMessages(input)
       const shadowedTokens = this.compressor.estimateMessageTokens(shadowed)
       const maxChars = summaryCharBudget(shadowedTokens, SUMMARY_OUTPUT_SHARE)
       let remaining = maxChars

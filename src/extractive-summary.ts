@@ -103,10 +103,16 @@ export function extractiveSummary(
   section('Assistant turns (first line)', assistants, o.maxAssistantItems)
   section('Tool signal lines', toolSignals, o.maxToolItems)
 
+  // Budget accounting in CODE POINTS (matching maxChars' documented unit and
+  // the final clip); a UTF-16 length here would overcount astral text and
+  // stop a section early.
   let text = header
+  let used = Array.from(header).length
   for (const body of sections) {
-    if (text.length + body.length + 2 > o.maxChars) break
+    const cost = Array.from(body).length + 2
+    if (used + cost > o.maxChars) break
     text += '\n\n' + body
+    used += cost
   }
   return clipLineByCodePoints(text, o.maxChars)
 }
