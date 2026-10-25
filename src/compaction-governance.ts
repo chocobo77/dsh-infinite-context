@@ -48,6 +48,12 @@ export const GOV_MAX_BAND = 0.45
 export const GOV_SAFETY_MARGIN = 0.03
 /** Extra band added as the session matures, to amortize compressions. */
 export const GOV_STAGE_BAND = 0.08
+/**
+ * Cap on the maturity (compression-count) term of the trigger curve. Mature
+ * sessions used to fold at the floor because stage pressure reached 1; the
+ * fold lane now keeps the anchor unless fill/growth actually demand earlier.
+ */
+export const GOV_STAGE_TRIGGER_CAP = 0
 /** Growth (fraction of budget per step) that counts as fully 'hot'. */
 export const GOV_HOT_GROWTH = 0.05
 /** Successful compressions at which a session counts as fully mature. */
@@ -127,6 +133,8 @@ export interface WaterLevelBounds {
   readonly maxBand: number
   readonly safetyMargin: number
   readonly stageBand: number
+  /** Cap on the stage (maturity) pressure; omit for legacy behaviour. */
+  readonly stageTriggerCap?: number
   readonly hotGrowth: number
   readonly matureCompressions: number
 }
@@ -205,7 +213,8 @@ export function compactionWaterLevels(input: WaterLevelInput): WaterLevels {
   const mature = Number.isFinite(b.matureCompressions) && b.matureCompressions > 0
     ? b.matureCompressions
     : GOV_MATURE_COMPRESSIONS
-  const stage = clamp01(input.compressions / mature)
+  const stageCap = Number.isFinite(b.stageTriggerCap) ? clamp01(b.stageTriggerCap as number) : 1
+  const stage = Math.min(clamp01(input.compressions / mature), stageCap)
   const hot = Number.isFinite(b.hotGrowth) && b.hotGrowth > 0 ? b.hotGrowth : GOV_HOT_GROWTH
 
   const triggerRatio = compactionTriggerRatio({
@@ -435,6 +444,7 @@ export interface GovernanceBounds extends WaterLevelBounds {
 /** Shipped planner bounds. */
 export const DEFAULT_GOVERNANCE_BOUNDS: GovernanceBounds = {
   ...DEFAULT_WATER_LEVEL_BOUNDS,
+  stageTriggerCap: GOV_STAGE_TRIGGER_CAP,
   memoryTargetFloor: GOV_TARGET_MEMORY_FLOOR,
   guardReserveRatio: GOV_GUARD_RESERVE_RATIO,
   guardReserveMin: GOV_GUARD_RESERVE_MIN,

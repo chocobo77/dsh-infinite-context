@@ -348,6 +348,8 @@ interface SessionCounter {
    * collected with the rest of the session state.
    */
   lastForceAt?: number
+  /** Epoch ms of the last successful fold (frequency gate). */
+  lastCompressedAt?: number
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
 }
@@ -418,6 +420,8 @@ export function selectFoldRange(
 }
 
 /** In-memory session counters idle this long are evicted (RAM only). */
+/** Minimum wall-clock gap between routine folds (force/fit-guard bypass). */
+const MIN_FOLD_INTERVAL_MS = 20 * 60_000
 const SESSION_COUNTER_IDLE_MS = 3600_000
 /** Persisted session counters are retained this long across idle gaps. */
 const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
@@ -568,6 +572,7 @@ export class HistoryCompressor {
               ...(typeof parsed.lastTokens === 'number' ? { lastTokens: parsed.lastTokens } : {}),
               ...(typeof parsed.compressions === 'number' ? { compressions: parsed.compressions } : {}),
               ...(typeof parsed.lastForceAt === 'number' ? { lastForceAt: parsed.lastForceAt } : {}),
+              ...(typeof parsed.lastCompressedAt === 'number' ? { lastCompressedAt: parsed.lastCompressedAt } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -645,6 +650,15 @@ export class HistoryCompressor {
    * @param sessionId - the folded session.
    * @param beforeTokens - surface size before the fold.
    */
+  /**
+   * Epoch ms of the session's last successful fold.
+   * @param sessionId - the session to query.
+   * @returns the timestamp, or undefined when the session never folded.
+   */
+  lastFoldAt(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.lastCompressedAt
+  }
+
   recordFold(sessionId: string, beforeTokens: number): void {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) return
@@ -653,6 +667,7 @@ export class HistoryCompressor {
     entry.lastSizeTokens = beforeTokens
     entry.growthEma = 0
     entry.compressions = (entry.compressions ?? 0) + 1
+    entry.lastCompressedAt = Date.now()
     entry.failureCooldown = 0
     this.persistCounter(sessionId)
   }
@@ -1587,6 +1602,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
       }
       return null
+    }
+    // Frequency gate: a routine fold must not fire again within a short
+    // window. Force, surge and the fit-guard still bypass it.
+    if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
+      const last = this.compressor.lastFoldAt(sessionId)
+      if (last !== undefined && Date.now() - last < MIN_FOLD_INTERVAL_MS) {
+        diag(`min-interval:${Math.round((Date.now() - last) / 1000)}s;surf=${snapshot.surfaceTokens}`)
+        return null
+      }
     }
     const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
     if (range === null) {

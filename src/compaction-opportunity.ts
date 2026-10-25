@@ -45,7 +45,7 @@ export interface CompactionOpportunity {
 }
 
 /** Trigger-ratio swing granted to a perfect opportunity. */
-export const OPP_BONUS_MAX = 0.1
+export const OPP_BONUS_MAX = 0.04
 /** Extra trigger headroom demanded while the session is still young. */
 export const OPP_EARLY_PENALTY = 0.08
 /** Turns at which a session counts as fully mature. */
