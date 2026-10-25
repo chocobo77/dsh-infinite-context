@@ -59,6 +59,123 @@ export const GOV_STAGE_TRIGGER_CAP = 0
 export const GOV_HOT_GROWTH = 0.05
 /** Successful compressions at which a session counts as fully mature. */
 export const GOV_MATURE_COMPRESSIONS = 8
+
+/* -------------------------------------------------------------------------- */
+/*  Closed-loop target band (landing-deviation feedback)                       */
+/*                                                                              */
+/*  Production telemetry (1M-window sessions, 2026-10) showed folds landing    */
+/*  systematically ABOVE the target band and drifting worse day over day: the  */
+/*  retained tail handed to the range selector is the plan's target, but the   */
+/*  summary's own tokens, the pinned head and the unfoldable leftovers are     */
+/*  added ON TOP of it, and nothing fed that shortfall back into the next      */
+/*  plan. The planner therefore keeps a per-session EMA of                     */
+/*  `landing − target` (same meter basis) and pre-compensates the next target  */
+/*  by it, so the LANDING — not the retain handed downstream — reaches the     */
+/*  nominal band.                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * EMA weight of the newest landing observation. Matches the growth EMA's 0.5
+ * convention (one-fold half-life), so a day-over-day overhead drift is tracked
+ * within a couple of cadences without thrashing on a single outlier fold.
+ */
+export const GOV_TARGET_DEVIATION_ALPHA = 0.5
+/**
+ * Cap on the learned correction, as a share of the basis. 0.12 keeps the
+ * pre-compensated retain at ≥ 0.43×basis on the normal 0.55 memory floor and
+ * bottoms out at {@link GOV_TARGET_FLOOR} (0.25) even on the deep-probe floor
+ * (0.35), so the feedback can only WIDEN the effective band inside the hard
+ * bounds — it never crosses the watermark envelope or empties the memory.
+ */
+export const GOV_TARGET_DEVIATION_MAX = 0.12
+
+/**
+ * Fold the latest landing observation into the per-session deviation EMA.
+ *
+ * The delta is SIGNED (landing − planned target): a persistent overshoot grows
+ * the correction, and an over-correction (landing below target) shrinks it
+ * back, so the loop is a stable negative-feedback controller around zero
+ * residual error rather than a ratchet.
+ * @param previous - the previous EMA in tokens, `undefined` on first fold.
+ * @param landingDelta - `landing − target` of the fold that just committed.
+ * @param alpha - EMA weight of the newest observation (default
+ *   {@link GOV_TARGET_DEVIATION_ALPHA}).
+ * @returns the new EMA in tokens (non-finite input keeps the previous value).
+ */
+export function nextTargetDeviationEma(
+  previous: number | undefined,
+  landingDelta: number,
+  alpha: number = GOV_TARGET_DEVIATION_ALPHA,
+): number {
+  if (!Number.isFinite(landingDelta)) return previous === undefined ? 0 : previous
+  if (previous === undefined) return landingDelta
+  const a = Number.isFinite(alpha) ? Math.min(1, Math.max(0, alpha)) : GOV_TARGET_DEVIATION_ALPHA
+  return previous * (1 - a) + landingDelta * a
+}
+
+/**
+ * The bounded correction the planner applies to the target ratio: the learned
+ * deviation as a share of the basis, clamped to `[0, max]`.
+ *
+ * Clamping at 0 (never negative) means the loop can only widen the band — the
+ * nominal target stays the shallowest compression the planner will pick, so a
+ * stale negative EMA cannot make the planner lazier than its configured band.
+ * @param deviationTokens - the per-session deviation EMA in tokens.
+ * @param basisTokens - the lane's basis (fold pressure budget / window).
+ * @param max - cap as a share of the basis (default
+ *   {@link GOV_TARGET_DEVIATION_MAX}).
+ * @returns the correction ratio in `[0, max]` (0 for unknown input).
+ */
+export function targetDeviationCorrection(
+  deviationTokens: number | undefined,
+  basisTokens: number,
+  max: number = GOV_TARGET_DEVIATION_MAX,
+): number {
+  if (deviationTokens === undefined || !Number.isFinite(deviationTokens)) return 0
+  if (!Number.isFinite(basisTokens) || basisTokens <= 0) return 0
+  const cap = Number.isFinite(max) ? Math.max(0, max) : GOV_TARGET_DEVIATION_MAX
+  return clampRange(deviationTokens / basisTokens, 0, cap)
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Large-window deep probe (magnitude-driven floor relaxation)                */
+/*                                                                              */
+/*  On a big window the 0.55 memory floor costs hundreds of thousands of       */
+/*  tokens while the window itself is mostly empty: a 1M window whose fold     */
+/*  budget is capped by the completion reserve folds at ~35% WINDOW fill,      */
+/*  purely on cadence. When the content intent says the bulk is disposable     */
+/*  (magnitude ≥ 0.5, i.e. tool-heavy), the memory floor relaxes so the        */
+/*  magnitude signal can actually reach a deeper target and the cadence        */
+/*  lengthens. The constants below stay BOUNDARIES; the magnitude intent       */
+/*  stays the driver — no relaxation without it, none near overflow.           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Minimum window (tokens) that qualifies as "large". 512k is half of a 1M
+ * window: below it, the 0.55 floor's absolute cost is small enough that the
+ * extra depth is not worth the tail loss.
+ */
+export const GOV_DEEP_PROBE_MIN_WINDOW = 524_288
+/**
+ * Deep probe only while the measured quantity is below this share of the
+ * WINDOW (not the basis). A fold this early in the window is cadence/seam
+ * driven, not overflow driven — going deeper is safe exactly because the
+ * window has huge slack. At or above this fill the fold is pressure driven
+ * and the normal memory floor applies.
+ */
+export const GOV_DEEP_PROBE_MAX_WINDOW_FILL = 0.4
+/**
+ * Minimum content magnitude that may probe past the memory floor. 0.5 is the
+ * intelligence module's neutral point (pure-tool ≈ 0.95, half-tool ≈ 0.55),
+ * so only a genuinely tool-heavy context unlocks the deeper floor.
+ */
+export const GOV_DEEP_PROBE_MIN_MAGNITUDE = 0.5
+/**
+ * Relaxed memory floor for the deep probe. ~0.35 keeps the landing well above
+ * the hard {@link GOV_TARGET_FLOOR} (0.25) even after the maximum landing
+ * deviation correction (0.35 − 0.12 = 0.23, clamped to 0.25).
+ */
+export const GOV_DEEP_PROBE_MEMORY_FLOOR = 0.35
 /**
  * Fill ratio (measured/basis) at which the fill-driven slide starts; the old
  * dynamicCompactionRatio used 0.5. Kept as a constant so both lanes agree.
@@ -440,6 +557,16 @@ export interface GovernanceBounds extends WaterLevelBounds {
   readonly guardReserveRatio: number
   readonly guardReserveMin: number
   readonly surgeRatio: number
+  /** Cap on the learned landing-deviation correction (share of the basis). */
+  readonly targetDeviationMax: number
+  /** Minimum window (tokens) that qualifies for the deep probe. */
+  readonly deepProbeMinWindow: number
+  /** Maximum measured/window fill under which the deep probe may relax. */
+  readonly deepProbeMaxWindowFill: number
+  /** Minimum content magnitude that may probe past the memory floor. */
+  readonly deepProbeMinMagnitude: number
+  /** Relaxed memory floor used by the deep probe. */
+  readonly deepProbeMemoryFloor: number
 }
 
 /** Shipped planner bounds. */
@@ -450,6 +577,11 @@ export const DEFAULT_GOVERNANCE_BOUNDS: GovernanceBounds = {
   guardReserveRatio: GOV_GUARD_RESERVE_RATIO,
   guardReserveMin: GOV_GUARD_RESERVE_MIN,
   surgeRatio: GOV_SURGE_RATIO,
+  targetDeviationMax: GOV_TARGET_DEVIATION_MAX,
+  deepProbeMinWindow: GOV_DEEP_PROBE_MIN_WINDOW,
+  deepProbeMaxWindowFill: GOV_DEEP_PROBE_MAX_WINDOW_FILL,
+  deepProbeMinMagnitude: GOV_DEEP_PROBE_MIN_MAGNITUDE,
+  deepProbeMemoryFloor: GOV_DEEP_PROBE_MEMORY_FLOOR,
 }
 
 /**
@@ -465,6 +597,13 @@ export interface GovernanceLedger {
   readonly failureCooldown: number
   readonly compressions: number
   readonly growthTokens: number
+  /**
+   * Per-session EMA of `landing − target` in tokens (fold-lane learning). The
+   * planner pre-compensates the next target by it, bounded by
+   * `bounds.targetDeviationMax`; `undefined` (or a non-finite value) disables
+   * the closed loop, preserving the pre-feedback behaviour exactly.
+   */
+  readonly targetDeviationTokens?: number
 }
 
 /** What the calling hook is able to execute. */
@@ -516,6 +655,12 @@ export interface GovernanceInput {
   readonly opportunity?: CompactionOpportunity
   /** Content/stage intent; when present it replaces the phase swing. */
   readonly intent?: CompactionIntent
+  /**
+   * Per-session EMA of `landing − target` from committed folds, in tokens
+   * (same basis as {@link basisTokens}). The closed-loop band deepens the
+   * next target by the learned shortfall; undefined leaves it untouched.
+   */
+  readonly deviationEmaTokens?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
 
@@ -614,9 +759,21 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     b.triggerCeiling,
   )
   const intentMagnitude = intent === undefined ? undefined : clamp01(intent.magnitude)
+  // Deep probe: on a large, mostly-empty window whose bulk is disposable
+  // (the intent says tool-heavy), the 0.55 memory floor costs hundreds of
+  // thousands of tokens while the window sits idle — a 1M session folded on
+  // cadence alone at ~35% window fill. The floor relaxes so the magnitude
+  // signal can actually REACH a deeper target. Fill is measured against the
+  // WINDOW (not the budget): the probe is about the window's spare room, and
+  // the budget already subtracts the completion reserve.
+  const deepProbe = window >= b.deepProbeMinWindow
+    && snapshot.surfaceTokens / window < b.deepProbeMaxWindowFill
+    && intentMagnitude !== undefined
+    && intentMagnitude >= b.deepProbeMinMagnitude
+  const memoryTargetFloor = deepProbe ? b.deepProbeMemoryFloor : b.memoryTargetFloor
   // Interpolate inside the band the trigger can actually use; a global maxBand
   // would push even a low magnitude into the memory floor.
-  const availableBand = Math.max(b.minBand, triggerRatio - b.memoryTargetFloor)
+  const availableBand = Math.max(b.minBand, triggerRatio - memoryTargetFloor)
   const intentBand = intentMagnitude === undefined
     ? 0
     : clampRange(b.minBand + (availableBand - b.minBand) * intentMagnitude, b.minBand, availableBand)
@@ -624,17 +781,28 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     intentMagnitude === undefined
       ? levels.targetRatio - (levels.triggerRatio - triggerRatio)
       : triggerRatio - intentBand,
-    intentMagnitude === undefined ? b.targetFloor : b.memoryTargetFloor,
+    intentMagnitude === undefined ? b.targetFloor : memoryTargetFloor,
     Math.max(b.targetFloor, triggerRatio - b.minBand),
   )
   // The retained tail is what the agent keeps verbatim. A mature session used
   // to widen its band until the tail was almost gone, so keep a memory floor.
   const memoryFloor = clampRange(
-    b.memoryTargetFloor,
+    memoryTargetFloor,
     b.targetFloor,
     Math.max(b.targetFloor, triggerRatio - b.minBand),
   )
-  const targetRatio = Math.max(rawTargetRatio, memoryFloor)
+  // Closed-loop band: folds systematically landed ABOVE the planned target
+  // (the summary's own tokens, the pinned head and the unfoldable tail sit on
+  // top of the retained range), so the planner pre-compensates by the learned
+  // shortfall — bounded to targetDeviationMax of the basis and never below
+  // the memory floor. The correction is clamped >= 0 upstream: a stale
+  // overshoot cannot make the planner lazier than its configured band.
+  const deviationCorrection = targetDeviationCorrection(
+    input.deviationEmaTokens,
+    basis,
+    b.targetDeviationMax,
+  )
+  const targetRatio = Math.max(rawTargetRatio - deviationCorrection, memoryFloor)
   const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - injection)
   const targetTokens = Math.max(0, Math.floor(basis * targetRatio) - injection)
   const surfaceTriggerTokens = triggerTokens
@@ -787,6 +955,8 @@ export interface FoldPlanInput {
   readonly opportunity?: CompactionOpportunity
   /** Content/stage intent, forwarded to the planner. */
   readonly intent?: CompactionIntent
+  /** Learned landing-deviation EMA, forwarded to the planner. */
+  readonly deviationEmaTokens?: number
   readonly declaredWindow?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
@@ -824,6 +994,7 @@ export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
     injectionBudget: input.injectionBudget,
     ...(input.opportunity === undefined ? {} : { opportunity: input.opportunity }),
     ...(input.intent === undefined ? {} : { intent: input.intent }),
+    ...(input.deviationEmaTokens === undefined ? {} : { deviationEmaTokens: input.deviationEmaTokens }),
     ...(input.bounds === undefined ? {} : { bounds: input.bounds }),
   })
 }

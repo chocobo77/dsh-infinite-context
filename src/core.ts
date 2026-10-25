@@ -124,6 +124,14 @@ export {
   minimumFoldTokens,
   summaryCharBudget,
   type FoldBudgetInput,
+  GOV_TARGET_DEVIATION_ALPHA,
+  GOV_TARGET_DEVIATION_MAX,
+  GOV_DEEP_PROBE_MIN_WINDOW,
+  GOV_DEEP_PROBE_MAX_WINDOW_FILL,
+  GOV_DEEP_PROBE_MIN_MAGNITUDE,
+  GOV_DEEP_PROBE_MEMORY_FLOOR,
+  nextTargetDeviationEma,
+  targetDeviationCorrection,
 } from './compaction-governance.ts'
 export {
   analyzeContext,
