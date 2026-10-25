@@ -232,7 +232,8 @@ export interface ToolResultArchiveDeps {
  */
 export function digestStub(ref: string, digest: string, chars: number): string {
   return digest + '\n\n[... ' + chars + ' chars absorbed and archived as ' + ref
-    + ' \u2014 call memory_expand {"ref":"' + ref + '"} for the full text ...]'
+    + ' \u2014 call memory_expand {"ref":"' + ref + '"} for the full text, or page a large read with '
+    + 'memory_expand {"ref":"' + ref + '","offset":0,"limit":4000} ...]'
 }
 
 /**

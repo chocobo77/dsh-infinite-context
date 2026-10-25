@@ -57,6 +57,74 @@ export function matchWindows(original: string, query: string, maxWindows: number
   return windows
 }
 
+/**
+ * Count EVERY occurrence of `query` in `original` (case-insensitive), not just
+ * the capped set `matchWindows` returns, so the tool can say "showing 5 of 9".
+ * @param original - the archived text.
+ * @param query - the substring to look for.
+ * @returns the total number of occurrences (0 for an empty query).
+ */
+export function countMatches(original: string, query: string): number {
+  const needle = query.toLowerCase()
+  if (needle.length === 0) return 0
+  const haystack = original.toLowerCase()
+  let count = 0
+  let from = 0
+  for (;;) {
+    const at = haystack.indexOf(needle, from)
+    if (at < 0) return count
+    count++
+    from = at + needle.length
+  }
+}
+
+/** Default and maximum page sizes of one `memory_expand` read, in code points. */
+export const EXPAND_PAGE_CODE_POINTS = 4000
+export const EXPAND_MAX_CODE_POINTS = 20000
+/** Default and maximum match-window counts of one `memory_expand` query read. */
+export const EXPAND_DEFAULT_WINDOWS = 5
+export const EXPAND_MAX_WINDOWS = 20
+
+/**
+ * Self-describing banner for a `memory_expand` page read, placed as the FIRST
+ * line of the returned text.
+ *
+ * Why the banner must lead the response: the caller (the harness) may truncate
+ * a large tool result AGAIN after the tool returns, and it cuts the tail —
+ * production evidence shows a 7473-code-point expand being cut this way, after
+ * which the model abandoned the archive. A banner at the top survives that cut
+ * and tells the model the true size of the text, how much this response
+ * carries, and how to fetch the rest via offset/limit paging.
+ *
+ * A banner is warranted when the read stopped before the end of the text, or
+ * when the response body itself exceeds one default page (a body that large is
+ * exactly what the caller truncates). Counts are Unicode code points, matching
+ * the tool's offset/limit semantics.
+ *
+ * @param input - the ref, the total size, and the window actually returned.
+ * @returns the banner line, or `null` when the read is complete and small.
+ */
+export function expandTruncationNotice(input: {
+  readonly ref: string
+  readonly totalPoints: number
+  readonly offset: number
+  readonly returnedPoints: number
+}): string | null {
+  const readTo = input.offset + input.returnedPoints
+  const truncated = readTo < input.totalPoints
+  if (!truncated && input.returnedPoints <= EXPAND_PAGE_CODE_POINTS) return null
+  if (truncated) {
+    const next = JSON.stringify({ ref: input.ref, offset: readTo })
+    return '[TRUNCATED READ — full text is ' + input.totalPoints + ' code points; this response returns '
+      + input.returnedPoints + ' (offset ' + input.offset + '\u2013' + readTo + '). More remains: '
+      + 'call memory_expand ' + next + ' for the next page.]'
+  }
+  const page = JSON.stringify({ ref: input.ref, offset: input.offset, limit: EXPAND_PAGE_CODE_POINTS })
+  return '[READ — offset ' + input.offset + '\u2013' + readTo + ' of ' + input.totalPoints
+    + ' code points, last page. If this response looks cut short, the tool CALLER truncated it: '
+    + 'page through with memory_expand ' + page + ', advancing offset by limit each call.]'
+}
+
 /** Register the memory tools. */
 export function apply(ctx: Context) {
   ctx.tools.register(defineTool({
@@ -313,7 +381,7 @@ export function apply(ctx: Context) {
   }))
   ctx.tools.register(defineTool({
     name: 'memory_expand',
-    description: 'Read archived text back from the store. Two kinds of ref: tr_… is an oversized tool result archived off the context (tool-result CCR, upstream ~billion-context CCR); fl_… is a folded history range — the exact messages a compression replaced with a summary (upstream `decompress`). Pass a ref to get its exact text back, optionally paginated with offset/limit or searched with query; omit ref to list the most recent archived results and folded ranges.',
+    description: 'Read archived text back from the store. Two kinds of ref: tr_… is an oversized tool result archived off the context (tool-result CCR, upstream ~billion-context CCR); fl_… is a folded history range — the exact messages a compression replaced with a summary (upstream `decompress`). Pass a ref to get its exact text back, optionally paginated with offset/limit or searched with query; omit ref to list the most recent archived results and folded ranges. A read that stops short of the end (or is large enough that the caller may cut it) opens with a [TRUNCATED READ …]/[READ …] banner naming the full size in code points and the exact next offset call.',
     parameters: {
       ref: { type: 'string', description: 'Archive ref: tr_ab12cd34ef56 (archived tool result) or fl_ab12cd34ef56 (folded history range) — both appear in the stub/summary that replaced the text.' },
       query: { type: 'string', description: 'Substring to search: inside one archived result when ref is given, otherwise across every archived result.' },
@@ -358,14 +426,19 @@ export function apply(ctx: Context) {
       const folded = record === undefined ? ctx.memoryContext.getFoldedRange(ref) : undefined
       let header: string
       let original: string
+      let archiveSessionId: string | undefined
       if (record !== undefined) {
         original = record.text
+        archiveSessionId = record.sessionId
         header = 'Archived tool result ' + record.ref + ' (tool ' + record.tool + ', ' + Array.from(record.text).length
           + ' code points' + (record.callId === undefined ? '' : ', callId ' + record.callId) + ').'
       } else if (folded !== undefined) {
         // Reverse compaction: the exact pre-fold messages, restored on demand
         // (upstream billion-context calls this `decompress`).
         original = folded.original
+        archiveSessionId = folded.sessionId
+        // Read-back telemetry, track 1 of 2: the per-range counter surfaced by
+        // the listing above ("read back Nx"). Works only for fl_ refs.
         ctx.memoryContext.markFoldedRangeRestored(folded.ref)
         header = 'Folded history range ' + folded.ref + ' (' + folded.messages + ' messages, '
           + Array.from(folded.original).length + ' code points, folded '
@@ -376,22 +449,46 @@ export function apply(ctx: Context) {
         return 'Unknown archive ref: ' + ref + '. Call memory_expand without a ref to list recent entries.'
       }
       const points = Array.from(original)
+      // Read-back telemetry, track 2 of 2: one usage-ledger event per
+      // successful expansion (both tr_ and fl_ refs — this is the only counter
+      // the tr_ path has). Recorded only when archived text actually came back.
+      const reportRestore = (returnedPoints: number, truncated: boolean): void => {
+        ctx.memoryContext.recordExpandRestore({
+          ref,
+          returnedChars: returnedPoints,
+          truncated,
+          ...(archiveSessionId === undefined ? {} : { sessionId: archiveSessionId }),
+        })
+      }
       if (query !== undefined && query.length > 0) {
         const label = JSON.stringify(query)
-        const maxWindows = Math.max(1, Math.min(20, Math.floor(args.limit ?? 5)))
+        const maxWindows = Math.max(1, Math.min(EXPAND_MAX_WINDOWS, Math.floor(args.limit ?? EXPAND_DEFAULT_WINDOWS)))
         const windows = matchWindows(original, query, maxWindows)
         if (windows.length === 0) return header + '\nNo match for ' + label + '.'
-        return header + '\n' + windows.length + ' match window(s) for ' + label + ':\n\n' + windows.join('\n\n')
+        const totalMatches = countMatches(original, query)
+        const capped = totalMatches > windows.length
+        const body = windows.join('\n\n')
+        reportRestore(Array.from(body).length, capped)
+        const notice = capped
+          ? '[PARTIAL MATCHES — ' + totalMatches + ' occurrence(s) in the archive; showing the first '
+            + windows.length + ' window(s). Call again with a higher limit (max ' + EXPAND_MAX_WINDOWS
+            + ') or a narrower query.]'
+          : ''
+        return (notice === '' ? '' : notice + '\n') + header + '\n' + windows.length + ' match window(s) for '
+          + label + (capped ? ' of ' + totalMatches + ' matches' : '') + ':\n\n' + body
       }
       const offset = Math.max(0, Math.floor(args.offset ?? 0))
-      const want = Math.max(1, Math.min(20000, Math.floor(args.limit ?? 4000)))
+      const want = Math.max(1, Math.min(EXPAND_MAX_CODE_POINTS, Math.floor(args.limit ?? EXPAND_PAGE_CODE_POINTS)))
       const slice = points.slice(offset, offset + want)
       if (slice.length === 0) return header + '\nOffset ' + offset + ' is past the end of the archived text.'
       const readTo = offset + slice.length
-      const tail = readTo < points.length
+      const truncated = readTo < points.length
+      const notice = expandTruncationNotice({ ref, totalPoints: points.length, offset, returnedPoints: slice.length })
+      reportRestore(slice.length, truncated)
+      const tail = truncated
         ? '\n\n[read up to code point ' + readTo + ' of ' + points.length + '; call again with offset ' + readTo + ']'
         : '\n\n[end of archived text]'
-      return header + '\n\n' + slice.join('') + tail
+      return (notice === null ? '' : notice + '\n') + header + '\n\n' + slice.join('') + tail
     },
     presentCall: args => ({ card: 'generic', title: 'Tool result expand', kind: 'other', rawInput: args }),
   }))

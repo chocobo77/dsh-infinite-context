@@ -70,6 +70,14 @@ export const USAGE_KIND = {
   nudge: 'nudge_forced',
   /** One fold-lane diagnostic sample (detail carries the outcome + numbers). */
   foldCheck: 'fold_check',
+  /**
+   * One successful archive read-back through `memory_expand` (value = code
+   * points returned; detail = `ref=<fl_|tr_…> chars=<n> truncated=<0|1>`).
+   * This is the only measurable signal for the plugin's reversibility story:
+   * real read-backs overwhelmingly hit `tr_` refs, which (unlike
+   * `folded_ranges.restored_count`) have no counter column of their own.
+   */
+  expandRestore: 'expand_restore',
   /** Tokens saved by a history compression. */
   compactionSaved: 'compaction_saved_tokens',
   /** Model requests that reported usage. */
@@ -119,6 +127,13 @@ export interface UsageSummary {
   readonly absorbedChars: number
   readonly nudges: number
   readonly compactionSavedTokens: number
+  /**
+   * Archive read-backs through `memory_expand` (count of successful calls) and
+   * the code points they handed back. The fl_/tr_ split per ref lives in the
+   * raw `expand_restore` events (`detail`), not in this folded total.
+   */
+  readonly expandRestores: number
+  readonly expandedChars: number
   readonly llm: {
     readonly requests: number
     readonly inputTokens: number
@@ -269,9 +284,11 @@ export class UsageLedger {
   summary(days = 7): UsageSummary {
     const totals = this.totals(this.now() - days * DAY_MS)
     const byKind = new Map<string, number>()
+    const eventsByKind = new Map<string, number>()
     let events = 0
     for (const total of totals) {
       byKind.set(total.kind, total.value)
+      eventsByKind.set(total.kind, total.events)
       events += total.events
     }
     const value = (kind: string): number => byKind.get(kind) ?? 0
@@ -290,6 +307,8 @@ export class UsageLedger {
       absorbedChars: value(USAGE_KIND.absorbChars),
       nudges: value(USAGE_KIND.nudge),
       compactionSavedTokens: value(USAGE_KIND.compactionSaved),
+      expandRestores: eventsByKind.get(USAGE_KIND.expandRestore) ?? 0,
+      expandedChars: value(USAGE_KIND.expandRestore),
       llm: {
         requests: value(USAGE_KIND.llmRequests),
         inputTokens,

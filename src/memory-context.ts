@@ -48,6 +48,7 @@ import {
 import { ModelContextTracker } from './model-context.ts'
 import type { SanitizerConfig } from './OutputSanitizer.ts'
 import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
+import { USAGE_KIND } from './usage-ledger.ts'
 import type { UsageSummary } from './usage-ledger.ts'
 
 /** Register `ctx.memoryContext` for typed access elsewhere. */
@@ -55,6 +56,18 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     memoryContext: MemoryContext
   }
+}
+
+/** One successful `memory_expand` read-back, as the usage ledger records it. */
+export interface ExpandRestoreEvent {
+  /** The archive ref that was expanded (`tr_…` tool result, `fl_…` folded range). */
+  readonly ref: string
+  /** Code points of archived text handed back by this call. */
+  readonly returnedChars: number
+  /** Whether the read stopped before the end of the archived text. */
+  readonly truncated: boolean
+  /** Owning session of the archived text, when the archive row knows it. */
+  readonly sessionId?: string | undefined
 }
 
 /** The `memoryContext` service. */
@@ -568,6 +581,44 @@ export class MemoryContext extends Service {
   recordUsageEvent(record: UsageEventRecord): void {
     this.requireEngine()
     this.store?.recordUsageEvent(record)
+  }
+
+  /**
+   * Record one successful archive read-back (`memory_expand`) as a ledger
+   * event: kind=expand_restore, value = code points returned, detail carrying
+   * the ref (its `fl_`/`tr_` prefix distinguishes folded ranges from archived
+   * tool results), the returned size, and whether the read was truncated.
+   *
+   * Written straight to the store rather than through `UsageLedger.record`:
+   * the ledger instance is owned by the compaction engine, and the
+   * `usage` back-reference below deliberately exposes only read paths. The
+   * row lands in the same `usage_events` table, so the ledger summary reports
+   * it and the retention sweep prunes it with everything else. Best-effort by
+   * the ledger's own contract: a failure is logged, never thrown.
+   *
+   * @param input - the ref read back, how much text came back, and whether the
+   *   read stopped before the end of the archived text.
+   */
+  recordExpandRestore(input: ExpandRestoreEvent): void {
+    this.requireEngine()
+    const store = this.store
+    if (store === null) return
+    const returned = Math.max(1, Math.round(input.returnedChars))
+    try {
+      store.recordUsageEvent({
+        ts: Date.now(),
+        kind: USAGE_KIND.expandRestore,
+        value: returned,
+        ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+        detail: 'ref=' + input.ref + ' chars=' + returned
+          + ' truncated=' + (input.truncated ? 1 : 0),
+      })
+    } catch (error) {
+      this.context.logger.warn(
+        '[memoryContext] expand-restore ledger write failed for ' + input.ref + ': '
+          + (error instanceof Error ? error.message : String(error)),
+      )
+    }
   }
 
   /**
