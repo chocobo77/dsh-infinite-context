@@ -100,6 +100,11 @@ import {
   type GovernanceLedger,
 } from './compaction-governance.ts'
 import {
+  analyzeContext,
+  type CompactionIntent,
+  type SurfaceSignal,
+} from './compaction-intelligence.ts'
+import {
   COMPRESS_FAILURE_COOLDOWN,
   SUMMARY_OUTPUT_SHARE,
   decidePressureCompaction,
@@ -1465,6 +1470,39 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * @param session - session whose surface tail is inspected.
    * @returns the phase, opportunity score and session maturity.
    */
+  /**
+   * Read the current surface into a content/stage intent.
+   * @param session - session whose surface is inspected.
+   * @param meter - authoritative prices for the same surface.
+   * @returns the bounded intent, or undefined for an empty surface.
+   */
+  private contextIntent(session: Session, meter: TokenMeasurement): CompactionIntent | undefined {
+    const nodes = session.surface.nodes
+    const priced = meter.nodes
+    const from = Math.max(0, nodes.length - 200)
+    const signals: SurfaceSignal[] = []
+    for (let i = from; i < nodes.length; i += 1) {
+      const seq = nodes[i]
+      const event = seq === undefined ? undefined : session.eventAt(seq)
+      if (event === undefined) continue
+      const tokens = priced[i]?.tokens ?? 0
+      if (event.type === 'user/message' || event.type === 'assistant/message') {
+        const message = (event.data as unknown as { message?: { role: string; content: unknown } }).message
+        const text = message === undefined ? '' : messageText(message)
+        const hasToolCalls = Array.isArray(message?.content)
+          ? message.content.some(block => (block as { type?: string }).type === 'tool-call')
+          : false
+        signals.push({ type: event.type, tokens, text, hasToolCalls })
+      } else if (event.type === 'tool/result') {
+        const isError = (event.data as unknown as { isError?: boolean }).isError === true
+        signals.push({ type: event.type, tokens, isError })
+      } else {
+        signals.push({ type: event.type, tokens })
+      }
+    }
+    return signals.length === 0 ? undefined : analyzeContext(signals)
+  }
+
   private compactionOpportunity(session: Session, compressions: number): CompactionOpportunity {
     const nodes = session.surface.nodes
     let turnCount = 0
@@ -1576,6 +1614,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     })
     const ledger = this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens)
     const opportunity = this.compactionOpportunity(session, ledger.compressions)
+    const intent = this.contextIntent(session, meter)
     const plan = planFoldCompaction({
       surfaceTokens: snapshot.surfaceTokens,
       fixedTokens: snapshot.fixedTokens,
@@ -1589,6 +1628,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       nudge: this.compressor.nudge,
       force,
       opportunity,
+      ...(intent === undefined ? {} : { intent }),
     })
     if (plan.lane !== 'fold') {
       const now = Date.now()
@@ -1599,7 +1639,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         this.lastFoldCheckAt.set(sessionId, now)
         diag(`plan:${plan.lane}:${plan.reason};surf=${snapshot.surfaceTokens};`
           + `trigger=${plan.surfaceTriggerTokens};budget=${pressureBudget};`
-          + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
+          + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+          + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       }
       return null
     }
@@ -1615,7 +1656,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
-        + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
+        + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
       return null
     }
     // A fold that is smaller than the summarizer's own output cannot net a
@@ -1628,7 +1670,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
     // node); treat it as unknown and let compaction-basic's own size check decide.
     if (foldTokens > 0 && foldTokens < minFoldTokens) {
-      diag(`small-fold:${foldTokens}<${minFoldTokens};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens}`)
+      diag(`small-fold:${foldTokens}<${minFoldTokens};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
       return null
     }
     this.ctx.logger.info(
@@ -1641,7 +1684,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
       diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
-        + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)}`)
+        + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
       return result
     } catch (error) {

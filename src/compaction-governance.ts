@@ -15,6 +15,7 @@
  * @module dsh-infinite-context/compaction-governance
  */
 
+import type { CompactionIntent } from './compaction-intelligence.ts'
 import {
   OPP_BONUS_MAX,
   OPP_EARLY_PENALTY,
@@ -513,6 +514,8 @@ export interface GovernanceInput {
   readonly injectionBudget?: number
   /** Session-phase opportunity; omitted means neutral (score 0.5, mature). */
   readonly opportunity?: CompactionOpportunity
+  /** Content/stage intent; when present it replaces the phase swing. */
+  readonly intent?: CompactionIntent
   readonly bounds?: Partial<GovernanceBounds>
 }
 
@@ -538,6 +541,12 @@ export interface CompactionPlan {
     readonly opportunity: number
     /** Session phase the score came from. */
     readonly phase: string
+    /** Content/stage timing (0 = defer, 1 = clean seam); 0 when absent. */
+    readonly timing: number
+    /** Content/stage magnitude (0 = keep, 1 = fold deep); 0 when absent. */
+    readonly magnitude: number
+    /** Whether the last assistant/user message marks a milestone. */
+    readonly milestone: boolean
   }
 }
 
@@ -593,16 +602,29 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
   // Symmetric modulation around a neutral 0.5: a good seam lowers the
   // trigger (compact now), a bad one raises it (defer), and no signal at all
   // (legacy callers/tests) leaves the plan untouched. Hard bounds always win.
-  const swing = opp === undefined ? 0 : (0.5 - oppScore) * (OPP_BONUS_MAX * 2)
+  const intent = input.intent
+  const intentTiming = intent === undefined ? undefined : clamp01(intent.timing)
+  // The content/stage intent already encodes the phase; do not double-count it.
+  const swing = intent !== undefined || opp === undefined ? 0 : (0.5 - oppScore) * (OPP_BONUS_MAX * 2)
   const earlyPenalty = opp === undefined ? 0 : (1 - maturity) * OPP_EARLY_PENALTY
+  const intentDelta = intentTiming === undefined ? 0 : (0.5 - intentTiming) * 0.10
   const triggerRatio = clampRange(
-    levels.triggerRatio + swing + earlyPenalty,
+    levels.triggerRatio + swing + earlyPenalty + intentDelta,
     b.triggerFloor,
     b.triggerCeiling,
   )
+  const intentMagnitude = intent === undefined ? undefined : clamp01(intent.magnitude)
+  // Interpolate inside the band the trigger can actually use; a global maxBand
+  // would push even a low magnitude into the memory floor.
+  const availableBand = Math.max(b.minBand, triggerRatio - b.memoryTargetFloor)
+  const intentBand = intentMagnitude === undefined
+    ? 0
+    : clampRange(b.minBand + (availableBand - b.minBand) * intentMagnitude, b.minBand, availableBand)
   const rawTargetRatio = clampRange(
-    levels.targetRatio - (levels.triggerRatio - triggerRatio),
-    b.targetFloor,
+    intentMagnitude === undefined
+      ? levels.targetRatio - (levels.triggerRatio - triggerRatio)
+      : triggerRatio - intentBand,
+    intentMagnitude === undefined ? b.targetFloor : b.memoryTargetFloor,
     Math.max(b.targetFloor, triggerRatio - b.minBand),
   )
   // The retained tail is what the agent keeps verbatim. A mature session used
@@ -644,6 +666,9 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
         urgency,
         opportunity: oppScore,
         phase: opp?.phase ?? 'unspecified',
+        timing: intentTiming ?? 0,
+        magnitude: intentMagnitude ?? 0,
+        milestone: intent?.profile.milestone ?? false,
       },
     }
   }
@@ -760,6 +785,8 @@ export interface FoldPlanInput {
   readonly force?: boolean
   /** Session-phase opportunity, forwarded to the planner. */
   readonly opportunity?: CompactionOpportunity
+  /** Content/stage intent, forwarded to the planner. */
+  readonly intent?: CompactionIntent
   readonly declaredWindow?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
@@ -796,6 +823,7 @@ export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
     fillRatio: 0,
     injectionBudget: input.injectionBudget,
     ...(input.opportunity === undefined ? {} : { opportunity: input.opportunity }),
+    ...(input.intent === undefined ? {} : { intent: input.intent }),
     ...(input.bounds === undefined ? {} : { bounds: input.bounds }),
   })
 }

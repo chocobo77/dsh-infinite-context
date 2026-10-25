@@ -126,6 +126,12 @@ export {
   type FoldBudgetInput,
 } from './compaction-governance.ts'
 export {
+  analyzeContext,
+  type CompactionIntent,
+  type ContextProfile,
+  type SurfaceSignal,
+} from './compaction-intelligence.ts'
+export {
   OPP_BONUS_MAX,
   OPP_EARLY_PENALTY,
   OPP_MATURE_TURNS,
