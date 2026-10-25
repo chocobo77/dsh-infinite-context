@@ -58,6 +58,16 @@ const PHASE_SCORE: Record<SessionPhase, number> = {
 const COMPLETION = /(^|\n)\s*(done|finished|complete|completed|fixed|resolved|implemented|ready|next steps?|summary)\b/i
 const COMPLETION_CN = /(完成|已完成|搞定|修复|已修复|实现了|下一步|总结|可以了|没问题)/
 const CONFIRMATION = /^(对|好|好的|行|可以|继续|谢谢|收到|ok|okay|yes|yep|perfect|great|thanks|thank you)[.!。！]?$/i
+/**
+ * A genuine wrap-up is SHORT: models that end every long message with a
+ * "Done." line would otherwise mark every turn-end a milestone. The length
+ * gate applies only to the assistant wrap-up path (a CONFIRMATION is already
+ * whole-message anchored and therefore inherently short).
+ */
+const MILESTONE_MAX_CHARS = 400
+/** Work-in-progress markers that veto a milestone hit ("not done yet" still
+ * matches COMPLETION's `done` at a line start, and 完成 matches CJK too). */
+const NEGATION = /\bnot yet\b|\bnot finished\b|\bnot complete\b|还没|尚未|未完成|没有完成|不算完成/
 
 const clamp01 = (value: number): number => Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0
 
@@ -95,8 +105,9 @@ export function analyzeContext(signals: readonly SurfaceSignal[]): CompactionInt
   const lastUser = [...signals].reverse().find(signal => signal.type === 'user/message')
   const assistantText = (lastAssistant?.text ?? '').trim()
   const userText = (lastUser?.text ?? '').trim()
-  const milestone = COMPLETION.test(assistantText)
-    || COMPLETION_CN.test(assistantText)
+  const milestone = (!NEGATION.test(assistantText)
+      && (COMPLETION.test(assistantText) || COMPLETION_CN.test(assistantText))
+      && Array.from(assistantText).length <= MILESTONE_MAX_CHARS)
     || CONFIRMATION.test(userText)
   const openQuestion = /[?？]\s*$/.test(assistantText)
 
