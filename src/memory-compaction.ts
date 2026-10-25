@@ -82,7 +82,7 @@ import {
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
-import { extractiveSummary, summarizeWithResilience } from './extractive-summary.ts'
+import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
@@ -598,6 +598,13 @@ export class HistoryCompressor {
               ...(typeof parsed.compressions === 'number' ? { compressions: parsed.compressions } : {}),
               ...(typeof parsed.lastForceAt === 'number' ? { lastForceAt: parsed.lastForceAt } : {}),
               ...(typeof parsed.lastCompressedAt === 'number' ? { lastCompressedAt: parsed.lastCompressedAt } : {}),
+              // Learned state that CANNOT be re-derived from the surface
+              // (unlike growthEma/lastSizeTokens, which are deliberately
+              // re-seeded from live measurement): dropping it here would
+              // restart the closed-loop band from zero on every restart or
+              // idle eviction.
+              ...(typeof parsed.targetDeviationEma === 'number'
+                ? { targetDeviationEma: parsed.targetDeviationEma } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -711,11 +718,18 @@ export class HistoryCompressor {
 
   /**
    * The session's learned landing-deviation EMA, in tokens. `undefined` means
-   * no fold has landed yet, so no closed-loop correction applies.
+   * no fold has landed yet, so no closed-loop correction applies. Restores the
+   * persisted counter lazily (same as {@link ledgerOf}) so a restart or idle
+   * eviction does not read as "never folded".
    * @param sessionId - the session to query.
    */
   targetDeviationOf(sessionId: string): number | undefined {
-    return this.turnCounters.get(sessionId)?.targetDeviationEma
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return entry.targetDeviationEma
   }
 
   /**
@@ -2076,7 +2090,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const digest = userInstructions.length === 0
         ? ''
         : `## 折叠区用户指令 / User instructions in the folded range\n${userInstructions.join('\n')}`
-      const text = [digest, modelText].filter(Boolean).join('\n\n')
+      // The degradation header stays on the SURFACE copy (result.summary)
+      // only: the durable copies must not persist a transient provider error
+      // into the folded_ranges summary and the mid-tier memory.
+      const text = [digest, stripExtractiveHeader(modelText)].filter(Boolean).join('\n\n')
       if (text.length > 0) {
         // One place records compaction savings for BOTH lanes (durable and
         // fold), using the plugin's CJK-aware surface estimate.

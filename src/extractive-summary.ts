@@ -67,7 +67,7 @@ export function extractiveSummary(
   const o = { ...DEFAULT_EXTRACTIVE_OPTIONS, ...options }
   const reason = (options.reason ?? 'summarizer unavailable').replace(/\s+/g, ' ').trim().slice(0, 160)
   const header = '# Extractive fold summary (no LLM: ' + reason + ')\n'
-    + 'The exact original messages are archived; read them back with memory_expand on the fl_ ref below.'
+    + 'The exact original messages are archived; read them back with memory_expand on the fl_ ref above.'
 
   const users: string[] = []
   const assistants: string[] = []
@@ -117,8 +117,33 @@ export function extractiveSummary(
   return clipLineByCodePoints(text, o.maxChars)
 }
 
-/** Outcome of {@link summarizeWithResilience}. */
-export interface ResilienceOutcome<T> {
+/**
+ * First line of a degraded extractive summary. Callers match on it to tell a
+ * degraded summary apart from an LLM one without threading a flag around.
+ */
+export const EXTRACTIVE_DEGRADED_MARKER = '# Extractive fold summary'
+
+/**
+ * Drop the degradation header (title line plus the archived-messages note)
+ * from an extractive summary, keeping the extracted sections.
+ *
+ * The header belongs to the SURFACE copy only: it tells the model why this
+ * summary is terse. The durable copies (folded_ranges summary, mid-tier
+ * memory) would otherwise persist a transient provider error string into
+ * long-term memory and re-inject it through retrieval.
+ * @param text - a model summary; a degraded extractive one starts with
+ *   {@link EXTRACTIVE_DEGRADED_MARKER}.
+ * @returns the text without its degradation header; unchanged when the text
+ *   is not a degraded extractive summary. An extractive summary with no
+ *   sections reduces to the empty string.
+ */
+export function stripExtractiveHeader(text: string): string {
+  if (!text.startsWith(EXTRACTIVE_DEGRADED_MARKER)) return text
+  const cut = text.indexOf('\n\n')
+  return cut < 0 ? '' : text.slice(cut + 2)
+}
+
+/** Outcome of {@link summarizeWithResilience}. */export interface ResilienceOutcome<T> {
   readonly value: T
   /** True when every attempt failed and `fallback` produced the value. */
   readonly degraded: boolean
