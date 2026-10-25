@@ -62,6 +62,11 @@ const SIGNAL_PATTERNS: readonly RegExp[] = [
   /\bfiles? changed\b/i,
   /\b[\w./\\-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|kt|cs|cpp|c|h|hpp|json|ya?ml|toml|md|sql|sh|ps1|css|html)\b/,
   /^\s*(?:[\u2717\u2718\u00d7]|FAIL|FAILED|ERROR|WARN\b|Traceback)/,
+  // CJK signal lines (errors, failures, warnings, timeouts, denials, missing
+  // paths): sessions are frequently Chinese-language, and without these the
+  // digest and the extractive fold summary would keep only the English noise.
+  // Breadth mirrors the English "cannot|unable|invalid" pattern above.
+  /错误|失败|异常|致命|警告|超时|不存在|被拒绝|无法|未能|权限不足/,
 ]
 
 /** Unicode-code-point length (surrogate-pair safe). */
