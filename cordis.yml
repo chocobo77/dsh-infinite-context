@@ -128,6 +128,13 @@
     # a local server (27B-class models need minutes, not seconds), 90s for
     # cloud. 0 disables the wrapper; explicit values clamp to [15000, 300000].
     summarization_timeout_ms: 90000
+    # Per-turn TASK-STATE working-memory block: a small carried snapshot of the
+    # primary request / pending jobs / next step / critical context, rebuilt
+    # from every fold's structured checkpoint and injected BEFORE the RAG
+    # background every turn. Exists because similarity retrieval misses
+    # open-loop state and the model never calls memory_search unprompted.
+    # Costs ≈400 tokens/turn out of the RAG injection budget. Default true.
+    task_state_enabled: true
     # Dynamic compaction threshold: when the routed model's REAL window (live
     # probe / modelWindows) is smaller than DSH declares, force compaction from
     # a threshold derived from the REAL window instead of waiting for a

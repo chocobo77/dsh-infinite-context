@@ -136,6 +136,13 @@ export {
   targetDeviationCorrection,
 } from './compaction-governance.ts'
 export {
+  TASK_STATE_MARKER,
+  TASK_STATE_MAX_CHARS,
+  buildTaskStateBlock,
+  parseCheckpointSection,
+  type TaskStateInput,
+} from './task-state.ts'
+export {
   analyzeContext,
   type CompactionIntent,
   type ContextProfile,

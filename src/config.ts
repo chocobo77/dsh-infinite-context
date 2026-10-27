@@ -429,6 +429,15 @@ export interface MemoryCompactionConfig {
    * Clamped to [15000, 300000] otherwise. Default 90000.
    */
   summarization_timeout_ms?: number
+  /**
+   * Whether the per-turn TASK-STATE working-memory block is injected (a small
+   * carried snapshot of primary request / pending jobs / next step / critical
+   * context, rebuilt from every fold's structured checkpoint). It exists
+   * because similarity retrieval structurally misses open-loop state and the
+   * model never calls memory_search unprompted. Costs ≈400 tokens per turn
+   * out of the RAG injection budget. Default true.
+   */
+  task_state_enabled?: boolean
   /** Number of most recent messages to keep uncompressed. */
   retain_recent_messages?: number
   /** Maximum characters for generic JSON string fields in output sanitization. */
@@ -548,6 +557,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   compress_dynamic_levels: z.boolean(),
   compaction_governance: z.boolean(),
   summarization_timeout_ms: z.number().step(1).min(0),
+  task_state_enabled: z.boolean(),
   retain_recent_messages: z.number().step(1).min(1),
   sanitize_max_chars: z.number().step(1).min(100),
   rag_top_k: z.number().step(1).min(1),
@@ -736,6 +746,15 @@ export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig, isLoc
     MAX_SUMMARIZATION_TIMEOUT_MS,
     Math.max(MIN_SUMMARIZATION_TIMEOUT_MS, Math.floor(value)),
   )
+}
+
+/**
+ * Resolve the task-state working-memory toggle (default on).
+ * @param raw - the config from cordis.yml.
+ * @returns whether the per-turn task-state block should be injected.
+ */
+export function resolveTaskStateEnabled(raw: MemoryCompactionConfig): boolean {
+  return raw.task_state_enabled ?? true
 }
 
 /**

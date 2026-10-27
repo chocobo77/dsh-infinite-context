@@ -77,12 +77,14 @@ import {
   resolveFoldOptions,
   resolveRetrievalOptions,
   resolveSummarizationTimeoutMs,
+  resolveTaskStateEnabled,
   resolveToolArchiveOptions,
   resolveUsageOptions,
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
+import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
@@ -377,6 +379,13 @@ interface SessionCounter {
    * the session ledger so it is persisted and garbage-collected with it.
    */
   targetDeviationEma?: number
+  /**
+   * The working-memory task-state block carried from the last fold (bounded
+   * by TASK_STATE_MAX_CHARS). Injected fresh every turn via the pre-step
+   * splice; learned state that cannot be re-derived from the surface once the
+   * folded range is gone, so it persists with the session ledger.
+   */
+  taskState?: string
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
 }
@@ -607,6 +616,9 @@ export class HistoryCompressor {
               // idle eviction.
               ...(typeof parsed.targetDeviationEma === 'number'
                 ? { targetDeviationEma: parsed.targetDeviationEma } : {}),
+              // Same rationale as the EMA: learned/carried state that cannot
+              // be re-derived from the surface after the fold is gone.
+              ...(typeof parsed.taskState === 'string' ? { taskState: parsed.taskState } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -732,6 +744,34 @@ export class HistoryCompressor {
       this.turnCounters.set(sessionId, entry)
     }
     return entry.targetDeviationEma
+  }
+
+  /**
+   * The session's carried task-state block (see src/task-state.ts), or
+   * `undefined` when no fold has committed one yet. Restores the persisted
+   * counter lazily so a restart or idle eviction does not read as "never".
+   * @param sessionId - the session to query.
+   */
+  taskStateOf(sessionId: string): string | undefined {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return entry.taskState
+  }
+
+  /**
+   * Store the task-state block built from a committed fold, persisting it
+   * with the rest of the session state.
+   * @param sessionId - the session that just committed a fold.
+   * @param block - the new block (bounded by TASK_STATE_MAX_CHARS).
+   */
+  recordTaskState(sessionId: string, block: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.taskState = block
+    this.persistCounter(sessionId)
   }
 
   /**
@@ -2125,6 +2165,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .map(block => block.text)
         .join('\n')
         .trim()
+      // Working-memory slot: rebuild the carried task-state block from this
+      // fold's structured checkpoint (primary request / pending jobs / next
+      // step / critical context), falling back per-section to the previous
+      // block where the new fold has nothing. Injected fresh every turn by
+      // the pre-step splice; persisted here so restarts keep it.
+      if (modelText.length > 0) {
+        const sessionIdStr = String(agent.session.id)
+        const taskState = buildTaskStateBlock({
+          summary: modelText,
+          previous: this.compressor.taskStateOf(sessionIdStr),
+        })
+        if (taskState !== undefined && taskState !== this.compressor.taskStateOf(sessionIdStr)) {
+          this.compressor.recordTaskState(sessionIdStr, taskState)
+        }
+      }
       // Keep the user's own words in the folded range. A model summary can
       // drop instructions and identifiers; this digest is deterministic and
       // survives whatever the summarizer decides to keep.
@@ -2308,15 +2363,37 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // Messages to splice in BEFORE the latest user message, in order.
         const injections: UserMessage[] = []
 
+        // --- Strategy 3.5: task-state working memory (carried from folds) ---
+        // Similarity retrieval structurally misses open-loop state: the next
+        // user message is rarely similar to a fifty-turn-old pending job, and
+        // production showed memory_search was never called directly. So the
+        // loop's working set (primary request / pending jobs / next step /
+        // critical context, rebuilt from every fold's checkpoint) is spliced
+        // in unconditionally, BEFORE the RAG background. Fresh each turn and
+        // never durable - it adds no per-turn surface messages. Its tokens
+        // come out of the RAG cap so the reserved injection budget holds.
+        let taskStateTokens = 0
+        if (resolveTaskStateEnabled(this.config)) {
+          const taskState = this.compressor.taskStateOf(sessionId)
+          if (taskState !== undefined) {
+            injections.push(createUserMessage({
+              content: [{ type: 'text', text: taskState }],
+              source: { kind: 'plugin:' + PLUGIN } as any,
+            }))
+            taskStateTokens = estimateTokens(taskState)
+            this.usage.record(USAGE_KIND.injectTokens, taskStateTokens, { sessionId })
+          }
+        }
+
         if (this.retrieval.enabled) {
           // Cap the injection at a share of the session's REAL window so a
           // short-context local model keeps room for the conversation itself
           // (the configured rag_token_budget remains the ceiling for large
-          // windows).
-          const injectionCap = Math.min(
+          // windows). The task-state block above is paid first.
+          const injectionCap = Math.max(256, Math.min(
             this.injectionBudget,
             Math.max(256, Math.floor(effectiveWindow * RAG_WINDOW_SHARE)),
-          )
+          ) - taskStateTokens)
           const userText = this.latestUserText(currentMessages)
           if (userText !== undefined) {
             const excludeIds = this.lastInjectedIds.get(session)
