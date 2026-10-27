@@ -124,7 +124,9 @@
     # attempt gets a fresh timer; after one retry the fold degrades to a
     # deterministic extractive summary instead of being abandoned (production
     # saw the call hang to the provider's 300s stream-idle limit while the
-    # fold waited). 0 disables the wrapper; clamped to [15000, 300000].
+    # fold waited). Default is ROUTE-AWARE: 240s when the summarizer points at
+    # a local server (27B-class models need minutes, not seconds), 90s for
+    # cloud. 0 disables the wrapper; explicit values clamp to [15000, 300000].
     summarization_timeout_ms: 90000
     # Dynamic compaction threshold: when the routed model's REAL window (live
     # probe / modelWindows) is smaller than DSH declares, force compaction from

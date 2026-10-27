@@ -704,18 +704,33 @@ export const DEFAULT_SUMMARIZATION_TIMEOUT_MS = 90_000
 export const MIN_SUMMARIZATION_TIMEOUT_MS = 15_000
 /** Largest summarizer timeout; the provider's own stream-idle limit is 300s. */
 export const MAX_SUMMARIZATION_TIMEOUT_MS = 300_000
+/**
+ * Default summarizer timeout when the route points at a LOCAL server. A
+ * 27B-class quantized model needs minutes, not seconds, to summarize a
+ * 20k-token range: production (2026-10) showed 100% of local-session folds
+ * degrading to the extractive fallback at the cloud default of 90s. The
+ * explicit-config clamp (≤ 300s) still applies.
+ */
+export const LOCAL_SUMMARIZATION_TIMEOUT_MS = 240_000
 
 /**
  * Resolve `summarization_timeout_ms`. 0 disables the resilience wrapper (the
  * provider's own defaults then bound the call); any other value is clamped
  * into {@link MIN_SUMMARIZATION_TIMEOUT_MS}..{@link MAX_SUMMARIZATION_TIMEOUT_MS}.
+ * When the key is UNSET the default depends on the route's locality: local
+ * summarizers get {@link LOCAL_SUMMARIZATION_TIMEOUT_MS} (they are slow, not
+ * hung), cloud summarizers keep the tight 90s (they hang, not dawdle).
  * Non-finite input takes the default rather than producing a broken timer.
  * @param raw - the config from cordis.yml.
+ * @param isLocal - whether the resolved summarizer route points at a local
+ *   server; only consulted for the unset default.
  * @returns the resolved timeout in ms (0 = disabled).
  */
-export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig): number {
+export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig, isLocal = false): number {
   const value = raw.summarization_timeout_ms
-  if (value === undefined || !Number.isFinite(value)) return DEFAULT_SUMMARIZATION_TIMEOUT_MS
+  if (value === undefined || !Number.isFinite(value)) {
+    return isLocal ? LOCAL_SUMMARIZATION_TIMEOUT_MS : DEFAULT_SUMMARIZATION_TIMEOUT_MS
+  }
   if (value <= 0) return 0
   return Math.min(
     MAX_SUMMARIZATION_TIMEOUT_MS,

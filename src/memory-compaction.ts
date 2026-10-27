@@ -90,6 +90,7 @@ import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import {
   GOV_GUARD_RESERVE_MIN,
+  GOV_MIN_NET_SAVING_RATIO,
   GOV_GUARD_RESERVE_RATIO,
   GOV_TRIGGER_CEILING,
   failureCooldownFor,
@@ -1916,6 +1917,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const retainTokens = this.config.retainTokens === undefined
       ? Math.max(0, Math.floor(window * (this.config.retainRatio ?? 0.16)))
       : this.config.retainTokens
+    // Thin-fold gate for the legacy durable routine path. Under the unified
+    // governor routine pressure belongs to the fold lane (which has its own
+    // gate); this method is the one durable path the plugin owns end-to-end,
+    // and it gets the same deal: a region whose net saving does not cover its
+    // summary plus the call cost waits for a deeper occasion.
+    const regionTokens = Math.max(0, measurement.totalTokens - Math.min(retainTokens, measurement.totalTokens))
+    if (isThinFold(regionTokens, summarizationTargetTokens(this.config, regionTokens), window)) {
+      this.ctx.logger.info(
+        `[ContextGovernor] Thin durable fold skipped: region ~${regionTokens} tokens nets under `
+          + `${Math.floor(window * GOV_MIN_NET_SAVING_RATIO)} (window ${window}); waiting for a deeper occasion`,
+      )
+      return null
+    }
     // Head-anchored range selection (mirrors compaction-basic's
     // selectCompactableRange): walk from the tail accumulating prices until the
     // retained tail is covered, then step back to a tool-pairing-balanced cut.
@@ -2025,7 +2039,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
-    const timeoutMs = resolveSummarizationTimeoutMs(this.config)
+    // The default deadline depends on WHERE the summarizer route points: a
+    // local model is SLOW (minutes for a 20k-token range on 27B-class
+    // hardware — production showed every local-session fold degrading to the
+    // extractive fallback at the cloud default), while a cloud model that
+    // stalls is HUNG. Unknown locality keeps the tight cloud default.
+    let isLocal = false
+    try {
+      const target = resolveSummarizationTarget(this.config, agent.session)
+      isLocal = target !== undefined && this.ctx.memoryContext.isLocalRoute(target.provider)
+    } catch {
+      // Locality unreadable — the cloud default is the safe choice.
+    }
+    const timeoutMs = resolveSummarizationTimeoutMs(this.config, isLocal)
     if (timeoutMs <= 0) return super.summarize(input, agent, signal)
     const shadowed = shadowedMessages(input)
     const outcome = await summarizeWithResilience(
