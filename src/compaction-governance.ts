@@ -70,6 +70,12 @@ export const GOV_MATURE_COMPRESSIONS = 8
  * Set 0 to disable the gate.
  */
 export const GOV_MIN_NET_SAVING_RATIO = 0.08
+/**
+ * Minimum cosine(node text, task-state block) for a cut-boundary node to be
+ * kept verbatim regardless of its role. Conservative: only CLEARLY on-topic
+ * boundaries survive — the hash embedder prices unrelated texts near 0.
+ */
+export const GOV_IMPORTANCE_KEEP_COS = 0.35
 
 /* -------------------------------------------------------------------------- */
 /*  Closed-loop target band (landing-deviation feedback)                       */

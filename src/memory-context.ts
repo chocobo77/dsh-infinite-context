@@ -25,6 +25,7 @@ import {
 import { createEmbedder, type Embedder } from './embedder.ts'
 import { VectorIndex } from './vector-index.ts'
 import {
+  FOLDED_REF_PREFIX,
   MemoryStore,
   type FoldedRangeMeta,
   type FoldedRangeRecord,
@@ -77,7 +78,15 @@ export class MemoryContext extends Service {
   private readonly resolved: ResolvedMemoryContextConfig
   private store: MemoryStore | null = null
   private engine: MemoryEngine | null = null
+  private embedder: Embedder | null = null
   private readonly context: Context
+  /**
+   * Cumulative fl_ read-back count per session (in-memory; the durable truth
+   * lives in the expand_restore ledger events). Telemetry for the fold
+   * quality signal: a fold whose fl_ ref gets read back later is a fold the
+   * agent had to HUNT for - the summary did not carry enough.
+   */
+  private readonly flRecalls = new Map<string, number>()
   /** Tracks the adopted model context window and probe-once-per-model state. */
   private readonly modelTracker: ModelContextTracker
 
@@ -143,6 +152,7 @@ export class MemoryContext extends Service {
     // way to register a disposer that runs during UNLOADING.
     this.context.effect(() => () => store.close(), 'close memory store')
     const index = new VectorIndex()
+    this.embedder = embedder
     this.engine = new MemoryEngine({
       store,
       embedder,
@@ -619,6 +629,44 @@ export class MemoryContext extends Service {
           + (error instanceof Error ? error.message : String(error)),
       )
     }
+    // Fold-quality recall signal (track 3): an fl_ read-back means the agent
+    // had to HUNT for what a fold removed.
+    if (input.ref.startsWith(FOLDED_REF_PREFIX) && input.sessionId !== undefined) {
+      this.flRecalls.set(input.sessionId, (this.flRecalls.get(input.sessionId) ?? 0) + 1)
+    }
+  }
+
+  /**
+   * Best-effort embed one text with the configured embedder. Used by the
+   * compaction engine for goal-conditioned node importance (the task-state
+   * block is the goal reference; candidate cut nodes are the inputs).
+   * @param text - the text to embed (callers pre-clip the length).
+   * @returns the embedding vector, or `undefined` when the embedder is
+   *   unavailable or failed — callers must treat undefined as "not
+   *   important" and fall back to their non-semantic behaviour.
+   */
+  async embedText(text: string): Promise<readonly number[] | undefined> {
+    const embedder = this.embedder
+    if (embedder === null) return undefined
+    try {
+      return await embedder.embed(text)
+    } catch (error) {
+      this.context.logger.warn(
+        '[memoryContext] embed failed: ' + (error instanceof Error ? error.message : String(error)),
+      )
+      return undefined
+    }
+  }
+
+  /**
+   * Cumulative count of fl_ (folded-range) read-backs for one session —
+   * the fold-quality recall signal. In-memory: a restart resets it to zero
+   * together with the same counter's inputs; the durable truth stays in the
+   * expand_restore ledger events.
+   * @param sessionId - the session whose folded ranges are queried.
+   */
+  flRecallCount(sessionId: string): number {
+    return this.flRecalls.get(sessionId) ?? 0
   }
 
   /**

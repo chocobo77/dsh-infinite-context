@@ -85,7 +85,7 @@ import {
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
-import { fnv1a } from './embedder.ts'
+import { cosineSimilarity, fnv1a } from './embedder.ts'
 import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
@@ -99,6 +99,7 @@ import {
   GOV_TRIGGER_CEILING,
   failureCooldownFor,
   foldPressureBudget,
+  GOV_IMPORTANCE_KEEP_COS,
   isThinFold,
   ledgerView,
   minimumFoldTokens,
@@ -436,6 +437,7 @@ export function selectFoldRange(
   session: Session,
   measurement: TokenMeasurement,
   retainTokens: number,
+  importanceKeep?: ReadonlySet<SessionSeq>,
 ): { start: SessionSeq; end: SessionSeq } | null {
   const priced = measurement.nodes
   if (priced.length === 0) return null
@@ -455,16 +457,22 @@ export function selectFoldRange(
   }
   // High-value cut boundary: a user message immediately BEFORE the cut would
   // be folded while the model's response to it stays verbatim — context
-  // inversion. Extend the kept tail over trailing user messages, bounded
-  // (≤3 messages, ≤15% of the retained budget) so the target cannot balloon;
-  // the digest preserves their words, this preserves their ADJACENCY.
+  // inversion. Extend the kept tail over trailing user messages, and over
+  // nodes the goal-conditioned importance pass marked on-topic
+  // (`importanceKeep`), bounded (≤3 messages, ≤15% of the retained budget)
+  // so the target cannot balloon; the digest preserves their words, this
+  // preserves their ADJACENCY.
   const boundaryBudget = Math.floor(retainTokens * 0.15)
   let walked = 0
   let walkedTokens = 0
   while (keepFromIdx > firstIdx && walked < 3) {
     const node = priced[keepFromIdx - 1]
-    if (types[keepFromIdx - 1] !== 'user/message') break
-    if (node === undefined || walkedTokens + node.tokens > boundaryBudget) break
+    if (node === undefined) break
+    const isUser = types[keepFromIdx - 1] === 'user/message'
+    const boundarySeq = surfaceNodes[keepFromIdx - 1]
+    const isImportant = boundarySeq !== undefined && importanceKeep?.has(boundarySeq) === true
+    if (!isUser && !isImportant) break
+    if (walkedTokens + node.tokens > boundaryBudget) break
     walkedTokens += node.tokens
     walked += 1
     keepFromIdx -= 1
@@ -812,6 +820,60 @@ export class HistoryCompressor {
     entry.targetDeviationEma = nextTargetDeviationEma(entry.targetDeviationEma, landingDelta)
     this.persistCounter(sessionId)
     return entry.targetDeviationEma
+  }
+
+  /** KV key of one summarizer route's cross-session deviation prior. */
+  private static deviationPriorKey(route: string): string {
+    return HistoryCompressor.KV_PREFIX + 'deviation-prior:' + route
+  }
+
+  /**
+   * The converged deviation EMA of this summarizer route's most recent
+   * session — the warm-start prior for a fresh session's first folds.
+   * @param route - the summarizer route (`provider/model`).
+   */
+  deviationPriorOf(route: string): number | undefined {
+    if (this.kv === null) return undefined
+    try {
+      const raw = this.kv.get(HistoryCompressor.deviationPriorKey(route))
+      if (raw === undefined) return undefined
+      const parsed = JSON.parse(raw) as { ema?: unknown }
+      return typeof parsed.ema === 'number' && Number.isFinite(parsed.ema) ? parsed.ema : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Publish the route's deviation prior after a routine landing. Degraded
+   * (extractive) folds skip: their overhead shape differs and would poison
+   * the warm start.
+   * @param route - the summarizer route (`provider/model`).
+   * @param ema - the session's current EMA.
+   */
+  recordDeviationPrior(route: string, ema: number): void {
+    if (this.kv === null || !Number.isFinite(ema)) return
+    try {
+      this.kv.set(HistoryCompressor.deviationPriorKey(route), JSON.stringify({ ema: Math.round(ema) }))
+    } catch {
+      // best-effort persistence; the in-memory session EMA remains authoritative
+    }
+  }
+
+  /**
+   * Warm-start a never-folded session's deviation EMA from the route prior.
+   * Without it, every new session re-runs the systematic shortfall for two
+   * folds while its EMA re-converges. Only fires when the session has no EMA
+   * at all (never folded, or restored from a pre-prior entry).
+   * @param sessionId - the session to seed.
+   * @param value - the route prior (finite).
+   */
+  seedDeviationEma(sessionId: string, value: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined || !Number.isFinite(value)) return
+    if (entry.targetDeviationEma !== undefined) return
+    entry.targetDeviationEma = value
+    this.persistCounter(sessionId)
   }
 
   /**
@@ -1233,6 +1295,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly speculativeInFlight = new Set<string>()
   /** Last speculative launch per session (launch throttle). */
   private readonly lastSpeculativeAt = new Map<string, number>()
+  /** fl_ recall count observed at each session's last fold (quality delta). */
+  private readonly lastRecallAtFold = new Map<string, number>()
+  /**
+   * Whether the most recent summarize() call for this agent degraded to the
+   * extractive fallback. CompactionResult carries no provider field, so the
+   * resilience wrapper records it here for the fold path (prior learning).
+   */
+  private readonly lastSummarizeDegraded = new WeakMap<Agent, boolean>()
   /**
    * Master switch for the unified governor (planCompaction). When on, both the
    * durable and fold hooks obey one decision; when off, each lane keeps its
@@ -1778,6 +1848,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       window,
     })
     const ledger = this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens)
+    // Cross-session prior: a session that has never folded warm-starts its
+    // deviation EMA from the converged prior of the same summarizer route —
+    // without it, every new session re-runs the systematic shortfall for two
+    // folds while its EMA re-converges from zero.
+    if (ledger.compressions === 0 && this.compressor.targetDeviationOf(sessionId) === undefined) {
+      const target = routedTargetOf(session)
+      if (target !== undefined) {
+        const prior = this.compressor.deviationPriorOf(`${target.provider}/${target.model}`)
+        if (prior !== undefined) this.compressor.seedDeviationEma(sessionId, prior)
+      }
+    }
     const opportunity = this.compactionOpportunity(session, ledger.compressions)
     const intent = this.contextIntent(session, meter)
     const deviationEma = this.compressor.targetDeviationOf(sessionId)
@@ -1823,6 +1904,32 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         return null
       }
     }
+    // Goal-conditioned importance: the carried task-state block is the goal
+    // reference; nodes in the cut-boundary window (the walk's max reach is 3)
+    // that are clearly ON-TOPIC stay verbatim even when they are not user
+    // messages. Zero LLM cost - the hash embedder prices each candidate in
+    // microseconds. No block or no embedder => empty set => the walk falls
+    // back to its user-message-only behaviour.
+    let importanceKeep: Set<SessionSeq> | undefined
+    const taskStateBlock = this.compressor.taskStateOf(sessionId)
+    if (taskStateBlock !== undefined) {
+      const goalVec = await this.ctx.memoryContext.embedText(taskStateBlock.slice(0, 2000))
+      if (goalVec !== undefined) {
+        importanceKeep = new Set()
+        const naive = retainedTailStart(meter.nodes.map(node => node.tokens), Math.max(0, plan.targetSurfaceTokens))
+        for (let back = 1; back <= 3; back += 1) {
+          const node = meter.nodes[naive - back]
+          if (node === undefined) break
+          const event = session.eventAt(node.seq)
+          const message = event === undefined ? null : session.deriveEventMessage(event)
+          const text = message === null ? '' : messageText(message)
+          if (text.length === 0) continue
+          const vec = await this.ctx.memoryContext.embedText(text.slice(0, 2000))
+          if (vec === undefined) continue
+          if (cosineSimilarity(goalVec, vec) >= GOV_IMPORTANCE_KEEP_COS) importanceKeep.add(node.seq)
+        }
+      }
+    }
     // Prefer a speculative summary when its region is still verbatim-valid
     // (fingerprint over the exact input the base engine will rebuild). A
     // stale region - content replaced, surface drifted - is dropped and the
@@ -1837,7 +1944,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         this.speculative.delete(sessionId)
       }
     }
-    if (range === null) range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
+    if (range === null) range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), importanceKeep)
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
         + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
@@ -1898,10 +2005,27 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             sessionId,
             landed - plan.targetSurfaceTokens,
           )
+      // The route's cross-session prior only learns from LIVE (LLM)
+      // summaries: a degraded extractive fold has a different overhead shape
+      // and would poison the warm start.
+      const degraded = this.lastSummarizeDegraded.get(agent) ?? false
+      if (plan.reason !== 'forced' && !degraded) {
+        const target = routedTargetOf(session)
+        if (target !== undefined) {
+          this.compressor.recordDeviationPrior(`${target.provider}/${target.model}`, deviation)
+        }
+      }
+      // Fold-quality recall signal: an fl_ read-back since the last fold
+      // means the agent had to HUNT for what the previous fold removed.
+      const recallFl = this.ctx.memoryContext.flRecallCount(sessionId)
+      if (recallFl > (this.lastRecallAtFold.get(sessionId) ?? 0)) {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'fold_quality:recalled' })
+      }
+      this.lastRecallAtFold.set(sessionId, recallFl)
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
       diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
-        + `landed=${landed};dev=${Math.round(deviation)};`
+        + `landed=${landed};dev=${Math.round(deviation)};recallFl=${recallFl};`
         + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
@@ -2300,6 +2424,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       },
       { timeoutMs, retries: 1, ...(signal === undefined ? {} : { outerSignal: signal }) },
     )
+    this.lastSummarizeDegraded.set(agent, outcome.degraded)
     if (outcome.degraded) {
       const reason = outcome.error instanceof Error
         ? outcome.error.message
