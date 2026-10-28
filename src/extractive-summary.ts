@@ -155,6 +155,13 @@ export function stripExtractiveHeader(text: string): string {
 export interface ResilienceOptions {
   /** Hard timeout per attempt in ms; each attempt gets a FRESH timer. */
   readonly timeoutMs: number
+  /**
+   * Deadline for the RETRY attempt. Default: `timeoutMs × 2` (a timeout is
+   * evidence the estimate was too tight). Callers with locality knowledge
+   * override: a slow-but-alive local route doubles, a hung cloud stream
+   * retries flat.
+   */
+  readonly retryMs?: number
   /** Extra attempts after the first (default 1). */
   readonly retries?: number
   /** Caller's cancellation signal; its abort always rethrows immediately. */
@@ -163,10 +170,12 @@ export interface ResilienceOptions {
 
 /**
  * Run an attempt under a hard timeout, retry once, then fall back — never
- * throw. The RETRY gets a doubled deadline: a first-attempt timeout is
- * evidence the estimate was too tight (locality misread, slow model, big
- * range), and degrading after 2 × too-little is worse than one patient
- * second try. Worst case stays bounded at `3 × timeoutMs`.
+ * throw. The RETRY deadline is caller policy (`retryMs`, default: double the
+ * first attempt): a first-attempt timeout is evidence the estimate was too
+ * tight, but HOW much tighter differs by failure mode — a local model is
+ * slow-but-alive (double helps), a cloud stream that produced nothing is
+ * usually dead (double just wastes time). Worst case stays bounded at
+ * `timeoutMs + retryMs`.
  *
  * The outer signal is honoured on every path: when the CALLER aborts, the
  * error rethrows (a cancelled step must not fabricate a degraded result); a
@@ -183,10 +192,8 @@ export async function summarizeWithResilience<T>(
   const retries = Number.isFinite(options.retries) ? Math.max(0, Math.floor(options.retries as number)) : 1
   let lastError: unknown
   for (let triesLeft = 1 + retries; triesLeft > 0; triesLeft -= 1) {
-    // First try at the estimated deadline; the retry at DOUBLE — the miss is
-    // itself information about the right scale.
     const isRetry = triesLeft <= retries
-    const attemptMs = isRetry ? options.timeoutMs * 2 : options.timeoutMs
+    const attemptMs = isRetry ? (options.retryMs ?? options.timeoutMs * 2) : options.timeoutMs
     const timer = AbortSignal.timeout(attemptMs)
     const combined = options.outerSignal === undefined
       ? timer

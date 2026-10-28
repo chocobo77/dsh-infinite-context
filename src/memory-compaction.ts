@@ -72,7 +72,10 @@ function pickBasicCompactionKeys(raw: Record<string, unknown>): BasicCompactionC
 
 import {
   DEFAULT_INGEST_DENYLIST,
+  LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS,
+  MAX_SUMMARIZATION_TIMEOUT_MS,
   MemoryCompactionConfigSchema,
+  MIN_SUMMARIZATION_TIMEOUT_MS,
   resolveAbsorbOptions,
   resolveFoldOptions,
   resolveRetrievalOptions,
@@ -2214,7 +2217,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     if (foldTokens > 0 && foldTokens < minimumFoldTokens(input.pressureBudget)) return
     if (isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), input.pressureBudget)) return
+    // Concurrency headroom: the speculative call runs WHILE the step's main
+    // request streams to the same server. The spec input must fit in the
+    // room the conversation leaves — on a tight local server (real window
+    // ~24k, fold ranges ~23k) the two cannot coexist, and launching would
+    // 400 one of them. No magic constant: "fits alongside the conversation"
+    // is the definition. An unknown window skips speculation (conservative —
+    // it is optional).
+    const routed = routedTargetOf(input.session)
+    const realWindow = routed === undefined
+      ? undefined
+      : this.ctx.memoryContext.windowForModel(routed.model)
+    if (realWindow === undefined) return
     const specInput = this.buildRegionInput(input.session, range.start, range.end)
+    const specTokens = estimateTokens(specInput.messages.map(message => messageText(message)).join('\n'))
+    if (input.snapshot.totalTokens + specTokens > realWindow) return
     const fingerprint = summarizationFingerprint(specInput)
     const existing = this.speculative.get(input.sessionId)
     if (existing !== undefined && existing.fingerprint === fingerprint) return
@@ -2288,25 +2305,75 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
   }
 
+  /**
+   * The route's learned summarizer latency (EMA of successful durations, in
+   * ms), read from the KV store. `undefined` until the route has completed
+   * one live summary — the locality defaults then bootstrap, and this EMA
+   * takes over: the deadline becomes a MEASUREMENT, not a constant guess.
+   * @param route - the summarizer route (`provider/model`).
+   */
+  private summarizerLatencyOf(route: string): number | undefined {
+    try {
+      const raw = this.ctx.memoryContext.kvGet('summarizer-latency:' + route)
+      if (raw === undefined) return undefined
+      const parsed = JSON.parse(raw) as { ms?: unknown }
+      return typeof parsed.ms === 'number' && Number.isFinite(parsed.ms) && parsed.ms > 0
+        ? parsed.ms
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private recordSummarizerLatency(route: string, durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return
+    try {
+      const prev = this.summarizerLatencyOf(route)
+      // EMA weight 0.5 (one-call half-life), matching the deviation loop.
+      const next = prev === undefined ? durationMs : Math.round(prev * 0.5 + durationMs * 0.5)
+      this.ctx.memoryContext.kvSet('summarizer-latency:' + route, JSON.stringify({ ms: next }))
+    } catch {
+      // Learning is best-effort; the locality defaults still apply.
+    }
+  }
+
   private async summarizeResilient(
     input: SummarizationInput,
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
-    // The default deadline depends on WHERE the summarizer route points: a
-    // local model is SLOW (minutes for a 20k-token range on 27B-class
-    // hardware — production showed every local-session fold degrading to the
-    // extractive fallback at the cloud default), while a cloud model that
-    // stalls is HUNG. Unknown locality keeps the tight cloud default — and
-    // if that misread causes a timeout, the RETRY runs at double, so one
-    // locality miss costs headroom, not the fold.
-    const baseMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(agent))
-    if (baseMs <= 0) return super.summarize(input, agent, signal)
+    // Deadline policy, in layers:
+    // 1. ROUTE LEARNING first: the EMA of this route's successful summary
+    //    durations × 1.25 headroom. Once a route has completed one summary,
+    //    the deadline is a MEASUREMENT — no constant guesses.
+    // 2. No data yet → the locality constants bootstrap (local 240s / cloud
+    //    90s, scaled by input size): a local model is SLOW (minutes for a
+    //    20k-token range), a cloud model that stalls is HUNG. Unknown
+    //    locality keeps the tight cloud default — and if that misread times
+    //    out, the first successful call teaches the EMA.
+    // 3. Hard caps per locality: cloud 300s (the provider's own stream-idle
+    //    limit), local 900s (llama.cpp-style servers have NO idle limit — a
+    //    slow stream is healthy, and capping it made local summaries
+    //    permanently unlearnable).
+    const isLocal = this.summarizerIsLocal(agent)
+    const maxMs = isLocal ? LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS : MAX_SUMMARIZATION_TIMEOUT_MS
     const inputTokens = estimateTokens(input.messages
       .map(message => messageText(message))
       .join('\n'))
-    const timeoutMs = scaleSummarizationTimeoutMs(baseMs, inputTokens)
+    const baseMs = scaleSummarizationTimeoutMs(
+      resolveSummarizationTimeoutMs(this.config, isLocal),
+      inputTokens,
+      maxMs,
+    )
+    const target = resolveSummarizationTarget(this.config, agent.session)
+    const route = target === undefined ? undefined : `${target.provider}/${target.model}`
+    const learned = route === undefined ? undefined : this.summarizerLatencyOf(route)
+    const timeoutMs = learned === undefined
+      ? baseMs
+      : Math.min(maxMs, Math.max(MIN_SUMMARIZATION_TIMEOUT_MS, Math.floor(learned * 1.25)))
+    if (timeoutMs <= 0) return super.summarize(input, agent, signal)
     const shadowed = shadowedMessages(input)
+    const startedAt = Date.now()
     const outcome = await summarizeWithResilience(
       combined => super.summarize(input, agent, combined),
       error => {
@@ -2321,8 +2388,43 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           model: 'extractive',
         } satisfies SummaryResult
       },
-      { timeoutMs, retries: 1, ...(signal === undefined ? {} : { outerSignal: signal }) },
+      {
+        timeoutMs,
+        // Retry policy is locality knowledge: a local route is slow-but-
+        // alive (double the deadline), a cloud stream that produced nothing
+        // for a full deadline is usually dead (retry flat).
+        retryMs: isLocal ? timeoutMs * 2 : timeoutMs,
+        retries: 1,
+        ...(signal === undefined ? {} : { outerSignal: signal }),
+      },
     )
+    // Learn the route's real latency from LIVE summaries only — the
+    // extractive fallback's duration measures OUR code, not the model.
+    if (!outcome.degraded && route !== undefined && signal?.aborted !== true) {
+      this.recordSummarizerLatency(route, Date.now() - startedAt)
+      // Self-healing widen: this call carried MORE tokens than the recorded
+      // window and SUCCEEDED — the window bound was too tight (a transient
+      // busy-server 400, say). The success is its own evidence; widen
+      // narrow-only style so the next fold plans against the truth.
+      if (inputTokens > 0 && inputTokens > (this.ctx.memoryContext.windowForModel(target?.model) ?? Number.MAX_SAFE_INTEGER)) {
+        try {
+          if (target !== undefined) {
+            this.ctx.memoryContext.updateModelContext({
+              provider: target.provider,
+              model: target.model,
+              contextWindow: inputTokens,
+              source: 'overflow',
+            })
+            this.ctx.logger.info(
+              `[ContextGovernor] summarizer success widens real window to >= ${inputTokens} `
+                + `for ${target.provider}/${target.model}`,
+            )
+          }
+        } catch {
+          // Learning is best-effort.
+        }
+      }
+    }
     this.lastSummarizeDegraded.set(agent, outcome.degraded)
     if (outcome.degraded) {
       const reason = outcome.error instanceof Error

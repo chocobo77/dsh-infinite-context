@@ -726,6 +726,14 @@ export const MIN_SUMMARIZATION_TIMEOUT_MS = 15_000
 /** Largest summarizer timeout; the provider's own stream-idle limit is 300s. */
 export const MAX_SUMMARIZATION_TIMEOUT_MS = 300_000
 /**
+ * Largest summarizer timeout on a LOCAL route. A llama.cpp-style server has
+ * NO provider-side stream-idle limit — it streams slowly and healthily for
+ * as long as the generation takes — so the 300s cloud cap was a calibration
+ * error that made slow-but-healthy local summaries permanently unlearnable
+ * and unusable. Still a bound (safety), just the right one.
+ */
+export const LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS = 900_000
+/**
  * Default summarizer timeout when the route points at a LOCAL server. A
  * 27B-class quantized model needs minutes, not seconds, to summarize a
  * 20k-token range: production (2026-10) showed 100% of local-session folds
@@ -764,17 +772,26 @@ export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig, isLoc
  * 3k-token range and a 25k-token range identically, but generation time is
  * dominated by output and a big input shifts where the model spends its
  * budget. The base deadline is the FLOOR; each 40k tokens of input above the
- * first 4k adds 50%, capped at {@link MAX_SUMMARIZATION_TIMEOUT_MS}.
+ * first 4k adds 50%, capped at `maxMs`.
+ *
+ * This is the COLD-START estimator only: once a route has observed
+ * summarizer latencies, the learned per-route EMA (see the engine's
+ * summarizer resilience) takes over and this function falls back to being
+ * the no-data default. Constants bootstrap; measurements decide.
  * @param baseMs - the locality default (cloud 90s / local 240s), or an
  *   explicit config value.
  * @param inputTokens - the summarizer input size.
- * @returns the scaled deadline, still within the hard max.
+ * @param maxMs - the locality hard cap (cloud 300s — the provider's own
+ *   stream-idle limit; local 900s — no provider idle limit exists on a
+ *   llama.cpp-style server, and the cap itself was a calibration error that
+ *   made slow-but-healthy local summaries unlearnable).
+ * @returns the scaled deadline, still within the locality hard max.
  */
-export function scaleSummarizationTimeoutMs(baseMs: number, inputTokens: number): number {
+export function scaleSummarizationTimeoutMs(baseMs: number, inputTokens: number, maxMs: number = MAX_SUMMARIZATION_TIMEOUT_MS): number {
   if (!Number.isFinite(baseMs) || baseMs <= 0) return baseMs
   if (!Number.isFinite(inputTokens) || inputTokens <= 0) return baseMs
   const extra = Math.max(0, Math.floor((inputTokens - 4_000) / 40_000)) * 0.5
-  return Math.min(MAX_SUMMARIZATION_TIMEOUT_MS, Math.floor(baseMs * (1 + extra)))
+  return Math.min(maxMs, Math.floor(baseMs * (1 + extra)))
 }
 
 /**
