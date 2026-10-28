@@ -131,7 +131,11 @@ export class ModelContextTracker {
     if (!Number.isSafeInteger(info.contextWindow) || info.contextWindow <= 0) return
     const existing = this.windowsByModel.get(info.model)
     const wider = existing !== undefined && info.contextWindow > existing.contextWindow
-    if (wider && info.source !== 'config') return
+    // Narrow-only, with two exceptions: 'config' (an explicit override is the
+    // operator's word) and 'overflow' WIDENING (self-healing — the call
+    // SUCCEEDED carrying more tokens than the recorded bound, which is its
+    // own evidence that a transient busy-server narrowing was too tight).
+    if (wider && info.source !== 'config' && info.source !== 'overflow') return
     if (existing !== undefined && info.contextWindow === existing.contextWindow) return
     this.windowsByModel.set(info.model, {
       ...(info.provider === undefined ? {} : { provider: info.provider }),

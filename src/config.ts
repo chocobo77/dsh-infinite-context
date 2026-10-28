@@ -804,6 +804,23 @@ export function resolveTaskStateEnabled(raw: MemoryCompactionConfig): boolean {
 }
 
 /**
+ * Whether the operator EXPLICITLY pinned a summarizer timeout. The shipped
+ * default (90000) is not "explicit" — it is the cold-start prior the learned
+ * per-route latency is allowed to refine. Any other finite positive value is
+ * an operator decision and pins the deadline (learning stands down); `0`
+ * disables the wrapper entirely and is likewise not a learning signal.
+ * @param raw - the config from cordis.yml.
+ * @returns true when learning must not override the configured deadline.
+ */
+export function isSummarizationTimeoutExplicit(raw: MemoryCompactionConfig): boolean {
+  const value = raw.summarization_timeout_ms
+  return value !== undefined
+    && Number.isFinite(value)
+    && value > 0
+    && value !== DEFAULT_SUMMARIZATION_TIMEOUT_MS
+}
+
+/**
  * Resolve the speculative fold-summary toggle (default on).
  * @param raw - the config from cordis.yml.
  * @returns whether background precomputation of fold summaries is enabled.

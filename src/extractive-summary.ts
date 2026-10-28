@@ -149,6 +149,12 @@ export function stripExtractiveHeader(text: string): string {
   readonly degraded: boolean
   /** The last attempt error when `degraded` is true. */
   readonly error?: unknown
+  /**
+   * How many attempts ran (1 = first try succeeded). Callers learning from
+   * durations divide their measured total by this to get the per-attempt
+   * time the deadline actually approximates.
+   */
+  readonly attempts: number
 }
 
 /** Knobs for {@link summarizeWithResilience}. */
@@ -191,6 +197,7 @@ export async function summarizeWithResilience<T>(
 ): Promise<ResilienceOutcome<T>> {
   const retries = Number.isFinite(options.retries) ? Math.max(0, Math.floor(options.retries as number)) : 1
   let lastError: unknown
+  let attempts = 0
   for (let triesLeft = 1 + retries; triesLeft > 0; triesLeft -= 1) {
     const isRetry = triesLeft <= retries
     const attemptMs = isRetry ? (options.retryMs ?? options.timeoutMs * 2) : options.timeoutMs
@@ -208,9 +215,10 @@ export async function summarizeWithResilience<T>(
         attemptMs,
       )
     })
+    attempts += 1
     try {
       const value = await Promise.race([attempt(combined), deadline])
-      return { value, degraded: false }
+      return { value, degraded: false, attempts }
     } catch (error) {
       if (options.outerSignal?.aborted === true) throw error
       lastError = error
@@ -218,5 +226,5 @@ export async function summarizeWithResilience<T>(
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
     }
   }
-  return { value: fallback(lastError), degraded: true, error: lastError }
+  return { value: fallback(lastError), degraded: true, error: lastError, attempts }
 }

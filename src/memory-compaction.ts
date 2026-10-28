@@ -82,6 +82,7 @@ import {
   resolveSummarizationTimeoutMs,
   resolveSpeculativeFold,
   resolveTaskStateEnabled,
+  isSummarizationTimeoutExplicit,
   scaleSummarizationTimeoutMs,
   resolveToolArchiveOptions,
   resolveUsageOptions,
@@ -2337,29 +2338,32 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
   }
 
-  private async summarizeResilient(
-    input: SummarizationInput,
+  /**
+   * The summarizer deadline layers, SHARED by the live summarizer path and
+   * the speculative launcher — both must bound the same call shape under the
+   * same policy, or the speculative cache never populates on exactly the
+   * slow routes where precompute matters most. Layers:
+   * 1. ROUTE LEARNING first: the EMA of this route's successful summary
+   *    durations × 1.25 headroom. Once a route has completed one summary,
+   *    the deadline is a MEASUREMENT — no constant guesses. Stands down
+   *    when the operator explicitly pinned summarization_timeout_ms.
+   * 2. No data yet → the locality constants bootstrap (local 240s / cloud
+   *    90s, scaled by input size): a local model is SLOW (minutes for a
+   *    20k-token range), a cloud model that stalls is HUNG. Unknown
+   *    locality keeps the tight cloud default — and if that misread times
+   *    out, the first successful call teaches the EMA.
+   * 3. Hard caps per locality: cloud 300s (the provider's own stream-idle
+   *    limit), local 900s (llama.cpp-style servers have NO idle limit — a
+   *    slow stream is healthy, and capping it made local summaries
+   *    permanently unlearnable).
+   * @returns the per-attempt deadline plus the locality-aware retry deadline.
+   */
+  private summarizerDeadline(
     agent: Agent,
-    signal?: AbortSignal,
-  ): Promise<SummaryResult> {
-    // Deadline policy, in layers:
-    // 1. ROUTE LEARNING first: the EMA of this route's successful summary
-    //    durations × 1.25 headroom. Once a route has completed one summary,
-    //    the deadline is a MEASUREMENT — no constant guesses.
-    // 2. No data yet → the locality constants bootstrap (local 240s / cloud
-    //    90s, scaled by input size): a local model is SLOW (minutes for a
-    //    20k-token range), a cloud model that stalls is HUNG. Unknown
-    //    locality keeps the tight cloud default — and if that misread times
-    //    out, the first successful call teaches the EMA.
-    // 3. Hard caps per locality: cloud 300s (the provider's own stream-idle
-    //    limit), local 900s (llama.cpp-style servers have NO idle limit — a
-    //    slow stream is healthy, and capping it made local summaries
-    //    permanently unlearnable).
+    inputTokens: number,
+  ): { timeoutMs: number; retryMs: number } {
     const isLocal = this.summarizerIsLocal(agent)
     const maxMs = isLocal ? LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS : MAX_SUMMARIZATION_TIMEOUT_MS
-    const inputTokens = estimateTokens(input.messages
-      .map(message => messageText(message))
-      .join('\n'))
     const baseMs = scaleSummarizationTimeoutMs(
       resolveSummarizationTimeoutMs(this.config, isLocal),
       inputTokens,
@@ -2367,10 +2371,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     )
     const target = resolveSummarizationTarget(this.config, agent.session)
     const route = target === undefined ? undefined : `${target.provider}/${target.model}`
-    const learned = route === undefined ? undefined : this.summarizerLatencyOf(route)
+    const learned = route === undefined || isSummarizationTimeoutExplicit(this.config)
+      ? undefined
+      : this.summarizerLatencyOf(route)
     const timeoutMs = learned === undefined
       ? baseMs
       : Math.min(maxMs, Math.max(MIN_SUMMARIZATION_TIMEOUT_MS, Math.floor(learned * 1.25)))
+    return { timeoutMs, retryMs: isLocal ? timeoutMs * 2 : timeoutMs }
+  }
+
+  private async summarizeResilient(
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    const inputTokens = estimateTokens(input.messages
+      .map(message => messageText(message))
+      .join('\n'))
+    const target = resolveSummarizationTarget(this.config, agent.session)
+    const route = target === undefined ? undefined : `${target.provider}/${target.model}`
+    const { timeoutMs, retryMs } = this.summarizerDeadline(agent, inputTokens)
     if (timeoutMs <= 0) return super.summarize(input, agent, signal)
     const shadowed = shadowedMessages(input)
     const startedAt = Date.now()
@@ -2390,18 +2410,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       },
       {
         timeoutMs,
-        // Retry policy is locality knowledge: a local route is slow-but-
-        // alive (double the deadline), a cloud stream that produced nothing
-        // for a full deadline is usually dead (retry flat).
-        retryMs: isLocal ? timeoutMs * 2 : timeoutMs,
+        // Retry policy is locality knowledge (computed in summarizerDeadline):
+        // a local route is slow-but-alive (double the deadline), a cloud
+        // stream that produced nothing for a full deadline is usually dead
+        // (retry flat).
+        retryMs,
         retries: 1,
         ...(signal === undefined ? {} : { outerSignal: signal }),
       },
     )
     // Learn the route's real latency from LIVE summaries only — the
     // extractive fallback's duration measures OUR code, not the model.
+    // The measured span covers ALL attempts; the EMA wants the per-attempt
+    // time the deadline approximates, so divide by the attempt count.
     if (!outcome.degraded && route !== undefined && signal?.aborted !== true) {
-      this.recordSummarizerLatency(route, Date.now() - startedAt)
+      this.recordSummarizerLatency(route, Math.round((Date.now() - startedAt) / Math.max(1, outcome.attempts)))
       // Self-healing widen: this call carried MORE tokens than the recorded
       // window and SUCCEEDED — the window bound was too tight (a transient
       // busy-server 400, say). The success is its own evidence; widen
