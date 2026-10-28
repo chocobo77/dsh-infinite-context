@@ -760,6 +760,24 @@ export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig, isLoc
 }
 
 /**
+ * Scale a summarizer deadline by the INPUT size: a fixed deadline treats a
+ * 3k-token range and a 25k-token range identically, but generation time is
+ * dominated by output and a big input shifts where the model spends its
+ * budget. The base deadline is the FLOOR; each 40k tokens of input above the
+ * first 4k adds 50%, capped at {@link MAX_SUMMARIZATION_TIMEOUT_MS}.
+ * @param baseMs - the locality default (cloud 90s / local 240s), or an
+ *   explicit config value.
+ * @param inputTokens - the summarizer input size.
+ * @returns the scaled deadline, still within the hard max.
+ */
+export function scaleSummarizationTimeoutMs(baseMs: number, inputTokens: number): number {
+  if (!Number.isFinite(baseMs) || baseMs <= 0) return baseMs
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return baseMs
+  const extra = Math.max(0, Math.floor((inputTokens - 4_000) / 40_000)) * 0.5
+  return Math.min(MAX_SUMMARIZATION_TIMEOUT_MS, Math.floor(baseMs * (1 + extra)))
+}
+
+/**
  * Resolve the task-state working-memory toggle (default on).
  * @param raw - the config from cordis.yml.
  * @returns whether the per-turn task-state block should be injected.

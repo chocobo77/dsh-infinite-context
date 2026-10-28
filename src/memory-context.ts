@@ -87,6 +87,8 @@ export class MemoryContext extends Service {
    * agent had to HUNT for - the summary did not carry enough.
    */
   private readonly flRecalls = new Map<string, number>()
+  /** Providers already warned about unresolvable locality (once per process). */
+  private readonly localityWarned = new Set<string>()
   /** Tracks the adopted model context window and probe-once-per-model state. */
   private readonly modelTracker: ModelContextTracker
 
@@ -248,7 +250,23 @@ export class MemoryContext extends Service {
    * local-model conciseness directive is injected only on local routes.
    */
   isLocalRoute(provider: string | undefined): boolean {
-    return isLocalBaseURL(this.resolveProviderBaseURL(provider))
+    const baseURL = this.resolveProviderBaseURL(provider)
+    if (baseURL.length > 0) return isLocalBaseURL(baseURL)
+    // Fallback evidence: probes are only ever launched for local routes, so a
+    // successful probe record proves locality even when the settings lookup
+    // cannot resolve the baseURL (host service shape changes - the silent
+    // demotion to cloud treatment that kept the 90s summarizer deadline on a
+    // local model). Unknown either way stays non-local (safe default).
+    const probed = this.modelTracker.wasProbedByProvider(provider)
+    if (probed) return true
+    if (provider !== undefined && provider.length > 0 && !this.localityWarned.has(provider)) {
+      this.localityWarned.add(provider)
+      this.context.logger.warn(
+        '[memoryContext] locality unknown for provider "' + provider
+          + '": baseURL unresolvable and no probe record; treating as cloud',
+      )
+    }
+    return false
   }
 
   /**

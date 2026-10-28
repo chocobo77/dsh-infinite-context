@@ -163,7 +163,10 @@ export interface ResilienceOptions {
 
 /**
  * Run an attempt under a hard timeout, retry once, then fall back — never
- * throw, never block longer than `(retries + 1) × timeoutMs`.
+ * throw. The RETRY gets a doubled deadline: a first-attempt timeout is
+ * evidence the estimate was too tight (locality misread, slow model, big
+ * range), and degrading after 2 × too-little is worse than one patient
+ * second try. Worst case stays bounded at `3 × timeoutMs`.
  *
  * The outer signal is honoured on every path: when the CALLER aborts, the
  * error rethrows (a cancelled step must not fabricate a degraded result); a
@@ -180,7 +183,11 @@ export async function summarizeWithResilience<T>(
   const retries = Number.isFinite(options.retries) ? Math.max(0, Math.floor(options.retries as number)) : 1
   let lastError: unknown
   for (let triesLeft = 1 + retries; triesLeft > 0; triesLeft -= 1) {
-    const timer = AbortSignal.timeout(options.timeoutMs)
+    // First try at the estimated deadline; the retry at DOUBLE — the miss is
+    // itself information about the right scale.
+    const isRetry = triesLeft <= retries
+    const attemptMs = isRetry ? options.timeoutMs * 2 : options.timeoutMs
+    const timer = AbortSignal.timeout(attemptMs)
     const combined = options.outerSignal === undefined
       ? timer
       : AbortSignal.any([options.outerSignal, timer])
@@ -190,8 +197,8 @@ export async function summarizeWithResilience<T>(
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(
-        () => reject(new Error('summarizer timed out after ' + options.timeoutMs + 'ms')),
-        options.timeoutMs,
+        () => reject(new Error('summarizer timed out after ' + attemptMs + 'ms')),
+        attemptMs,
       )
     })
     try {

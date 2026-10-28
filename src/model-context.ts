@@ -192,6 +192,23 @@ export class ModelContextTracker {
   }
 
   /**
+   * Whether ANY model of this provider was confirmed by a successful live
+   * probe. Probes are only ever LAUNCHED for local routes (the locality gate),
+   * so a probe record is itself locality evidence — it is the fallback when
+   * the settings-based baseURL lookup cannot resolve the provider (host
+   * service shape changes), which otherwise silently demotes a local route to
+   * cloud treatment (the 90s summarizer deadline).
+   * @param provider - the provider route to check.
+   */
+  wasProbedByProvider(provider: string | undefined): boolean {
+    if (provider === undefined) return false
+    for (const info of this.windowsByModel.values()) {
+      if (info.provider === provider && info.source === 'probe') return true
+    }
+    return false
+  }
+
+  /**
    * Adopt a context window resolved from any source. Non-positive windows are
    * ignored; repeated identical adoptions are no-ops.
    */

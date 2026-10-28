@@ -79,6 +79,7 @@ import {
   resolveSummarizationTimeoutMs,
   resolveSpeculativeFold,
   resolveTaskStateEnabled,
+  scaleSummarizationTimeoutMs,
   resolveToolArchiveOptions,
   resolveUsageOptions,
   type MemoryCompactionConfig,
@@ -1790,6 +1791,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * drop the step's real messages). The fold therefore rewrites the surface
    * exactly like the durable lane, via compaction-basic's `compactRegion`,
    * with the system head and first user message pinned (billion-context #2733).
+   *
+   * GENERATION SAFETY: this runs only from step boundaries (`agent/pre-step`
+   * / `compactIfNeeded`), never from `llm/stream` — the waterfall is deep
+   * frozen and no fold hook exists there by construction. A fold therefore
+   * always waits for the model to FINISH generating (including a long local
+   * reasoning phase) before it rewrites anything: the 14:53 production case
+   * (a 9m45s reasoning stream, fold committed the moment it ended) is this
+   * guarantee working, not a race. Never add a fold trigger on `llm/stream`.
    * @param agent - owner of the session to fold.
    * @param signal - cancellation signal.
    * @param force - bypass the trigger/rate-limit gates (manual tool use).
@@ -2404,9 +2413,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // local model is SLOW (minutes for a 20k-token range on 27B-class
     // hardware — production showed every local-session fold degrading to the
     // extractive fallback at the cloud default), while a cloud model that
-    // stalls is HUNG. Unknown locality keeps the tight cloud default.
-    const timeoutMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(agent))
-    if (timeoutMs <= 0) return super.summarize(input, agent, signal)
+    // stalls is HUNG. Unknown locality keeps the tight cloud default — and
+    // if that misread causes a timeout, the RETRY runs at double, so one
+    // locality miss costs headroom, not the fold.
+    const baseMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(agent))
+    if (baseMs <= 0) return super.summarize(input, agent, signal)
+    const inputTokens = estimateTokens(input.messages
+      .map(message => messageText(message))
+      .join('\n'))
+    const timeoutMs = scaleSummarizationTimeoutMs(baseMs, inputTokens)
     const shadowed = shadowedMessages(input)
     const outcome = await summarizeWithResilience(
       combined => super.summarize(input, agent, combined),
@@ -2431,6 +2446,33 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         : String(outcome.error ?? 'unknown')
       const brief = reason.replace(/\s+/g, ' ').trim().slice(0, 160)
       this.ctx.logger.warn('[ContextGovernor] summarizer degraded to extractive: ' + brief)
+      // Overflow learning: a 400 "exceeds the available context size" on the
+      // SUMMARIZER call means the server's real context is smaller than the
+      // declared one (production: declared 128k, server answered "available
+      // context size (32)"). The summarizer replays the range as a prefix,
+      // so inputTokens + slack is a hard UPPER BOUND on the real window —
+      // adopt it narrow-only, and the next fold plans against the truth.
+      const overflow = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
+        ?? reason.match(/\((\d+) tokens\) exceeds/i)
+      if (overflow !== null && inputTokens > 0) {
+        try {
+          const target = resolveSummarizationTarget(this.config, agent.session)
+          if (target !== undefined) {
+            this.ctx.memoryContext.updateModelContext({
+              provider: target.provider,
+              model: target.model,
+              contextWindow: inputTokens,
+              source: 'probe',
+            })
+            this.ctx.logger.warn(
+              `[ContextGovernor] summarizer overflow 400: adopting real window <= ${inputTokens} `
+                + `for ${target.provider}/${target.model}`,
+            )
+          }
+        } catch {
+          // Overflow learning is best-effort; the fold continues degraded.
+        }
+      }
       try {
         this.usage.record(USAGE_KIND.foldCheck, 1, {
           sessionId: String(agent.session.id),
