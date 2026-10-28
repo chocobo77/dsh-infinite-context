@@ -438,6 +438,16 @@ export interface MemoryCompactionConfig {
    * out of the RAG injection budget. Default true.
    */
   task_state_enabled?: boolean
+  /**
+   * Whether SPECULATIVE fold summaries are precomputed in the background when
+   * the surface approaches the fold trigger: the summary LLM call — the slow
+   * part of a fold, up to minutes on a local model — then runs while the
+   * conversation continues, and the committing fold consumes it when the
+   * region fingerprint still matches (a miss falls back to the live
+   * summarizer). Costs at most one extra summarizer call per ~3 minutes per
+   * session when close to the trigger. Default true.
+   */
+  speculative_fold?: boolean
   /** Number of most recent messages to keep uncompressed. */
   retain_recent_messages?: number
   /** Maximum characters for generic JSON string fields in output sanitization. */
@@ -558,6 +568,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   compaction_governance: z.boolean(),
   summarization_timeout_ms: z.number().step(1).min(0),
   task_state_enabled: z.boolean(),
+  speculative_fold: z.boolean(),
   retain_recent_messages: z.number().step(1).min(1),
   sanitize_max_chars: z.number().step(1).min(100),
   rag_top_k: z.number().step(1).min(1),
@@ -755,6 +766,15 @@ export function resolveSummarizationTimeoutMs(raw: MemoryCompactionConfig, isLoc
  */
 export function resolveTaskStateEnabled(raw: MemoryCompactionConfig): boolean {
   return raw.task_state_enabled ?? true
+}
+
+/**
+ * Resolve the speculative fold-summary toggle (default on).
+ * @param raw - the config from cordis.yml.
+ * @returns whether background precomputation of fold summaries is enabled.
+ */
+export function resolveSpeculativeFold(raw: MemoryCompactionConfig): boolean {
+  return raw.speculative_fold ?? true
 }
 
 /**

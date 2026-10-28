@@ -135,6 +135,13 @@
     # open-loop state and the model never calls memory_search unprompted.
     # Costs ≈400 tokens/turn out of the RAG injection budget. Default true.
     task_state_enabled: true
+    # SPECULATIVE fold summaries: when the surface approaches the fold trigger
+    # (>= 80% of it) without a clean seam, the summary LLM call - the slow part
+    # of a fold, up to minutes on a local model - runs in the BACKGROUND; the
+    # committing fold consumes it when the region fingerprint still matches,
+    # otherwise falls back to the live summarizer. Costs at most one extra
+    # summarizer call per ~3 minutes per session near the trigger.
+    speculative_fold: true
     # Dynamic compaction threshold: when the routed model's REAL window (live
     # probe / modelWindows) is smaller than DSH declares, force compaction from
     # a threshold derived from the REAL window instead of waiting for a

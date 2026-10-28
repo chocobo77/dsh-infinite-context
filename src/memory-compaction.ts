@@ -77,6 +77,7 @@ import {
   resolveFoldOptions,
   resolveRetrievalOptions,
   resolveSummarizationTimeoutMs,
+  resolveSpeculativeFold,
   resolveTaskStateEnabled,
   resolveToolArchiveOptions,
   resolveUsageOptions,
@@ -84,6 +85,7 @@ import {
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
+import { fnv1a } from './embedder.ts'
 import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
@@ -104,7 +106,9 @@ import {
   summaryCharBudget,
   planFoldCompaction,
   toSurfaceSnapshot,
+  type CompactionPlan,
   type GovernanceLedger,
+  type SurfaceSnapshot,
 } from './compaction-governance.ts'
 import {
   analyzeContext,
@@ -449,6 +453,22 @@ export function selectFoldRange(
     if (seq === undefined || toolPairingBalancedBefore(session, seq)) break
     keepFromIdx -= 1
   }
+  // High-value cut boundary: a user message immediately BEFORE the cut would
+  // be folded while the model's response to it stays verbatim — context
+  // inversion. Extend the kept tail over trailing user messages, bounded
+  // (≤3 messages, ≤15% of the retained budget) so the target cannot balloon;
+  // the digest preserves their words, this preserves their ADJACENCY.
+  const boundaryBudget = Math.floor(retainTokens * 0.15)
+  let walked = 0
+  let walkedTokens = 0
+  while (keepFromIdx > firstIdx && walked < 3) {
+    const node = priced[keepFromIdx - 1]
+    if (types[keepFromIdx - 1] !== 'user/message') break
+    if (node === undefined || walkedTokens + node.tokens > boundaryBudget) break
+    walkedTokens += node.tokens
+    walked += 1
+    keepFromIdx -= 1
+  }
   if (keepFromIdx <= firstIdx) return null
   const start = surfaceNodes[firstIdx]
   const end = surfaceNodes[keepFromIdx - 1]
@@ -458,6 +478,10 @@ export function selectFoldRange(
 /** In-memory session counters idle this long are evicted (RAM only). */
 /** Minimum wall-clock gap between routine folds (force/fit-guard bypass). */
 const MIN_FOLD_INTERVAL_MS = 20 * 60_000
+/** Speculation launches when the surface is at least this share of the trigger. */
+const SPECULATIVE_AHEAD_RATIO = 0.8
+/** Minimum wall-clock gap between two speculative launches for one session. */
+const SPECULATIVE_MIN_INTERVAL_MS = 3 * 60_000
 const SESSION_COUNTER_IDLE_MS = 3600_000
 /** Persisted session counters are retained this long across idle gaps. */
 const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
@@ -1146,6 +1170,33 @@ function fallbackTruncate(
 /*  MemoryCompactionEngine — the Cordis entry point                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A speculative fold summary awaiting a committing fold. The fingerprint keys
+ * the EXACT SummarizationInput the compaction-basic engine will rebuild from
+ * the range's seqs; a match at commit time lets the summarizer call be
+ * skipped entirely.
+ */
+interface SpeculativeSummary {
+  readonly fingerprint: number
+  readonly summary: ContentBlock[]
+  readonly start: SessionSeq
+  readonly end: SessionSeq
+}
+
+/**
+ * Fingerprint one SummarizationInput: the roles + TEXT of every message plus
+ * the tool-schema names. Two inputs with the same fingerprint get the same
+ * summary, which is the whole contract of the speculative precompute. Text
+ * only — non-text blocks (images) are not what the summarizer reads.
+ * Exported for tests.
+ */
+export function summarizationFingerprint(input: SummarizationInput): number {
+  return fnv1a(JSON.stringify({
+    tools: input.tools === undefined ? null : input.tools.map(tool => tool.name),
+    messages: input.messages.map(message => [message.role, messageText(message)]),
+  }))
+}
+
 /** The multi-tier memory compaction backend. */
 export class MemoryCompactionEngine extends BasicCompactionEngine {
   static override inject = ['llm', 'tokenMeter', 'sessions', 'memoryContext']
@@ -1169,6 +1220,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * which would bloat the context and accumulate contradictions.
    */
   private readonly lastInjectedIds = new WeakMap<Session, ReadonlySet<string>>()
+  /**
+   * Speculative fold summaries keyed by session. Launched when the surface is
+   * close to the fold trigger but the step is not a clean seam: the summary
+   * LLM call (the slow part of a fold) runs in the BACKGROUND, and the
+   * committing fold consumes it when the region fingerprint still matches —
+   * converting fold latency from blocking to hidden. One entry per session;
+   * a newer speculation supersedes an older one.
+   */
+  private readonly speculative = new Map<string, SpeculativeSummary>()
+  /** Sessions with a speculative summarization currently running. */
+  private readonly speculativeInFlight = new Set<string>()
+  /** Last speculative launch per session (launch throttle). */
+  private readonly lastSpeculativeAt = new Map<string, number>()
   /**
    * Master switch for the unified governor (planCompaction). When on, both the
    * durable and fold hooks obey one decision; when off, each lane keeps its
@@ -1745,6 +1809,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
           + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       }
+      // Close to the trigger but not a clean seam: precompute the fold
+      // summary in the background so the eventual fold does not block.
+      this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
       return null
     }
     // Frequency gate: a routine fold must not fire again within a short
@@ -1756,7 +1823,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         return null
       }
     }
-    const range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
+    // Prefer a speculative summary when its region is still verbatim-valid
+    // (fingerprint over the exact input the base engine will rebuild). A
+    // stale region - content replaced, surface drifted - is dropped and the
+    // range selected fresh; either way the committing fold is correct.
+    const speculation = this.speculative.get(sessionId)
+    let range: { start: SessionSeq; end: SessionSeq } | null = null
+    if (speculation !== undefined) {
+      const fingerprint = summarizationFingerprint(this.buildRegionInput(session, speculation.start, speculation.end))
+      if (fingerprint === speculation.fingerprint) {
+        range = { start: speculation.start, end: speculation.end }
+      } else {
+        this.speculative.delete(sessionId)
+      }
+    }
+    if (range === null) range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens))
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
         + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
@@ -2056,6 +2137,108 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * Replicate compaction-basic's `buildSummarizationInput`: the replayed
+   * cacheable prefix (system head from surface node 0, the header's tool
+   * schemas) followed by the region's derived messages in surface order. The
+   * speculative fingerprint is only as good as this replication — any
+   * divergence degrades to a fingerprint miss at commit, never to a wrong
+   * summary (the fingerprint match is the verification).
+   */
+  private buildRegionInput(session: Session, start: SessionSeq, end: SessionSeq): SummarizationInput {
+    const header = session.requestHeader()
+    const headNode = session.surface.nodes[0]
+    const headEvent = headNode === undefined ? undefined : session.eventAt(headNode)
+    const head = headEvent?.type === 'system/message' ? headEvent : undefined
+    const system = head === undefined ? null : session.deriveEventMessage(head)
+    const regionMessages: Message[] = []
+    for (const nodeSeq of session.surface.nodes) {
+      if (nodeSeq < start || nodeSeq > end) continue
+      const event = session.eventAt(nodeSeq)
+      if (event === undefined) continue
+      const message = session.deriveEventMessage(event)
+      if (message !== null) regionMessages.push(message)
+    }
+    return {
+      ...(header?.tools === undefined ? {} : { tools: header.tools }),
+      messages: system === null ? regionMessages : [system, ...regionMessages],
+    }
+  }
+
+  /**
+   * Launch a speculative fold summarization when the surface is CLOSE to the
+   * trigger but this step was not a clean seam. The summary LLM call — the
+   * slow part of a fold, up to minutes on a local model — then runs in the
+   * background while the conversation continues, and the committing fold
+   * consumes it if the region fingerprint still matches. Best-effort on every
+   * path: a failure or a surface drift simply falls back to the live
+   * summarizer at commit (fingerprint miss is recorded in the ledger, so the
+   * hit rate is observable).
+   */
+  private maybeSpeculate(input: {
+    agent: Agent
+    session: Session
+    sessionId: string
+    plan: CompactionPlan
+    snapshot: SurfaceSnapshot
+    meter: TokenMeasurement
+    pressureBudget: number
+  }): void {
+    if (!resolveSpeculativeFold(this.config)) return
+    if (input.plan.surfaceTriggerTokens <= 0) return
+    if (input.snapshot.surfaceTokens < input.plan.surfaceTriggerTokens * SPECULATIVE_AHEAD_RATIO) return
+    if (this.speculativeInFlight.has(input.sessionId)) return
+    const now = Date.now()
+    if (now - (this.lastSpeculativeAt.get(input.sessionId) ?? 0) < SPECULATIVE_MIN_INTERVAL_MS) return
+    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens))
+    if (range === null) return
+    let foldTokens = 0
+    for (const node of input.meter.nodes) {
+      if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
+    }
+    if (foldTokens > 0 && foldTokens < minimumFoldTokens(input.pressureBudget)) return
+    if (isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), input.pressureBudget)) return
+    const specInput = this.buildRegionInput(input.session, range.start, range.end)
+    const fingerprint = summarizationFingerprint(specInput)
+    const existing = this.speculative.get(input.sessionId)
+    if (existing !== undefined && existing.fingerprint === fingerprint) return
+    this.lastSpeculativeAt.set(input.sessionId, now)
+    this.speculativeInFlight.add(input.sessionId)
+    const deadlineMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(input.agent))
+    void this.runSpeculative(input.agent, input.sessionId, range, specInput, fingerprint, deadlineMs)
+  }
+
+  private async runSpeculative(
+    agent: Agent,
+    sessionId: string,
+    range: { start: SessionSeq; end: SessionSeq },
+    specInput: SummarizationInput,
+    fingerprint: number,
+    deadlineMs: number,
+  ): Promise<void> {
+    try {
+      // super.summarize = the RAW summarizer (no resilience fallback, no
+      // post-processing): a failed speculation is dropped silently, and the
+      // committing fold then runs the live path with its own telemetry.
+      const result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) return
+      this.speculative.set(sessionId, {
+        fingerprint,
+        summary: result.summary,
+        start: range.start,
+        end: range.end,
+      })
+      this.ctx.logger.info(
+        `[ContextGovernor] speculative fold summary prepared (session …${sessionId.slice(-8)}, `
+          + `range ${range.start}..${range.end})`,
+      )
+    } catch {
+      // Speculation is opportunistic: any failure defers to the live path.
+    } finally {
+      this.speculativeInFlight.delete(sessionId)
+    }
+  }
+
+  /**
    * The summarizer call under a bounded deadline, with a degradation path.
    *
    * Telemetry (2026-10) showed the call hanging until the provider's own
@@ -2074,6 +2257,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * own idle limit reaps it. Worst case is a briefly duplicated in-flight
    * request, never a duplicated summary (the loser's result is discarded).
    */
+  /**
+   * Whether the session's summarizer route points at a LOCAL server. Shared
+   * by the live summarizer deadline and the speculative precompute.
+   */
+  private summarizerIsLocal(agent: Agent): boolean {
+    try {
+      const target = resolveSummarizationTarget(this.config, agent.session)
+      return target !== undefined && this.ctx.memoryContext.isLocalRoute(target.provider)
+    } catch {
+      // Locality unreadable — the cloud default is the safe choice.
+      return false
+    }
+  }
+
   private async summarizeResilient(
     input: SummarizationInput,
     agent: Agent,
@@ -2084,14 +2281,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // hardware — production showed every local-session fold degrading to the
     // extractive fallback at the cloud default), while a cloud model that
     // stalls is HUNG. Unknown locality keeps the tight cloud default.
-    let isLocal = false
-    try {
-      const target = resolveSummarizationTarget(this.config, agent.session)
-      isLocal = target !== undefined && this.ctx.memoryContext.isLocalRoute(target.provider)
-    } catch {
-      // Locality unreadable — the cloud default is the safe choice.
-    }
-    const timeoutMs = resolveSummarizationTimeoutMs(this.config, isLocal)
+    const timeoutMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(agent))
     if (timeoutMs <= 0) return super.summarize(input, agent, signal)
     const shadowed = shadowedMessages(input)
     const outcome = await summarizeWithResilience(
@@ -2137,6 +2327,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
+    // Consume a speculative summary when the input fingerprint matches: the
+    // summary LLM call already ran in the background, so the fold commits
+    // without blocking on it. One-shot: consumed or mismatched, the entry is
+    // gone (a miss falls through to the live summarizer with its telemetry).
+    const sessionIdStr = String(agent.session.id)
+    const speculation = this.speculative.get(sessionIdStr)
+    if (speculation !== undefined) {
+      this.speculative.delete(sessionIdStr)
+      if (summarizationFingerprint(input) === speculation.fingerprint) {
+        this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:hit' })
+        return { summary: speculation.summary, provider: 'precomputed', model: 'speculative' }
+      }
+      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:miss' })
+    }
     // Spread once: the resilience wrapper's declared type keeps the summary
     // read-only, while the clipping below rewrites it in place.
     const result = { ...(await this.summarizeResilient(input, agent, signal)) }

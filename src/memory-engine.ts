@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { Embedder } from './embedder.ts'
+import { cosineSimilarity, type Embedder } from './embedder.ts'
 import type { VectorIndex } from './vector-index.ts'
 import type { MemoryStore } from './memory-store.ts'
 import type { TokenBudget } from './token-budget.ts'
@@ -258,7 +258,7 @@ export class MemoryEngine {
     if (pyramid.mergeThreshold <= 0) return null
     const mids = this.store.list('mid').reverse() // oldest first
     if (mids.length < pyramid.mergeThreshold) return null
-    const batch = mids.slice(0, Math.max(1, pyramid.mergeBatch))
+    const batch = this.selectConsolidationBatch(mids, Math.max(1, pyramid.mergeBatch))
     if (this.summarize === undefined) {
       throw new Error('pyramid consolidation is enabled but no summarizer was provided')
     }
@@ -293,6 +293,38 @@ export class MemoryEngine {
     }
     this.trimLongMemories()
     return { merged: longDoc, demotedMids: batch.map(doc => doc.id) }
+  }
+
+  /**
+   * Pick the consolidation batch: the OLDEST mid seeds it (staleness ordering
+   * is preserved — the pyramid still retires age first), and the remaining
+   * seats go to its most SIMILAR siblings rather than the merely-next-oldest.
+   * Merging five summaries of the same subsystem yields one coherent long
+   * memory; merging the five chronologically-oldest yields an arbitrary
+   * mixture. Falls back to plain oldest-first when the seed has no embedding
+   * (nothing to rank by).
+   * @param pool - the mid memories, oldest first.
+   * @param size - the configured batch size.
+   * @returns the batch to consolidate.
+   */
+  private selectConsolidationBatch(pool: MemoryDoc[], size: number): MemoryDoc[] {
+    const seed = pool[0]
+    if (seed === undefined) return []
+    const seedEmbedding = seed.embedding
+    if (size <= 1 || pool.length === 1 || seedEmbedding === undefined) {
+      return pool.slice(0, size)
+    }
+    const ranked = pool.slice(1)
+      .map(doc => ({
+        doc,
+        similarity: doc.embedding === undefined
+          ? -1
+          : cosineSimilarity(seedEmbedding, doc.embedding),
+      }))
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, size - 1)
+      .map(entry => entry.doc)
+    return [seed, ...ranked]
   }
 
   /** Drop the oldest `long` memories beyond the configured cap. */
