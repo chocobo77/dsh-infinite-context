@@ -252,13 +252,14 @@ export class MemoryContext extends Service {
   isLocalRoute(provider: string | undefined): boolean {
     const baseURL = this.resolveProviderBaseURL(provider)
     if (baseURL.length > 0) return isLocalBaseURL(baseURL)
-    // Fallback evidence: probes are only ever launched for local routes, so a
-    // successful probe record proves locality even when the settings lookup
+    // Fallback evidence: probes are only ever launched for local routes, and
+    // an overflow bound is adopted from the route server's own rejection —
+    // either record proves the route's locality even when the settings lookup
     // cannot resolve the baseURL (host service shape changes - the silent
     // demotion to cloud treatment that kept the 90s summarizer deadline on a
     // local model). Unknown either way stays non-local (safe default).
-    const probed = this.modelTracker.wasProbedByProvider(provider)
-    if (probed) return true
+    const hasEvidence = this.modelTracker.hasRouteWindowEvidence(provider)
+    if (hasEvidence) return true
     if (provider !== undefined && provider.length > 0 && !this.localityWarned.has(provider)) {
       this.localityWarned.add(provider)
       this.context.logger.warn(

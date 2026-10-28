@@ -937,74 +937,6 @@ export class HistoryCompressor {
   }
 
   /**
-   * Extract structured information from a batch of messages.
-   * Detail-preserving: keeps code, file paths, decisions, and tool results verbatim.
-   *
-   * @param messages - the messages to extract from.
-   * @param isBatch - true if this is one batch of a larger conversation (affects prompt wording).
-   * @returns extracted structured text.
-   */
-  private async extractBatch(
-    messages: readonly { role: string; content: unknown }[],
-    isBatch: boolean,
-    target: SummarizationTarget,
-  ): Promise<string> {
-    const serialized = serializeMessagesForSummary(messages)
-    const inputTokens = estimateTokens(serialized)
-    const targetTokens = summarizationTargetTokens(this.config, inputTokens)
-    const batchLabel = isBatch ? ' (this is one segment of a longer conversation)' : ''
-
-    const prompt = [
-      `You are a detail-preserving conversation archiver${batchLabel}.`,
-      'Extract ALL substantive information from this conversation into a structured record.',
-      '',
-      `Output budget: the input is ~${inputTokens} tokens. Aim for ~${targetTokens} tokens of`,
-      'output (a dense ~30% compression). Stay well under this; do not pad or repeat.',
-      '',
-      'Rules:',
-      '- PRESERVE verbatim: code snippets, file paths, function names, variable names, config values, error messages, API responses',
-      '- PRESERVE: every decision made and the reasoning behind it',
-      '- PRESERVE: every problem encountered and how it was resolved',
-      '- PRESERVE: tool call inputs/outputs that contain useful data',
-      '- PRESERVE: user requirements and constraints exactly as stated',
-      '- PRESERVE the original language of each statement — do NOT translate',
-      '- DROP only: greetings/farewells, repetitive phrasing, formatting whitespace',
-      '- NEVER paraphrase code or technical terms',
-      '- NEVER invent facts that are not present in the conversation',
-      '- Use bullet points for scannability',
-      '',
-      'Format EXACTLY as (use these headings verbatim, in this order; skip a section',
-      'entirely if it has no content):',
-      '## Goals & Requirements',
-      '(what the user wanted, verbatim constraints)',
-      '',
-      '## Key Decisions',
-      '(decision + reasoning, for each)',
-      '',
-      '## File Changes',
-      '(file path: what changed, for each file)',
-      '',
-      '## Code & Config',
-      '(important code snippets, configs, commands — verbatim, wrapped in ``` fences)',
-      '',
-      '## Problems & Solutions',
-      '(problem → root cause → fix, for each)',
-      '',
-      '## Tool Results',
-      '(important outputs from tool calls)',
-      '',
-      '## Open Questions',
-      '(anything unresolved)',
-      '',
-      'Conversation:',
-      '',
-      serialized,
-    ].join('\n')
-
-    return this.llmSummarize(prompt, target)
-  }
-
-  /**
    * Archive the exact messages a compression is about to fold into a summary,
    * and return the header that introduces that summary on the surface.
    *
@@ -1064,79 +996,6 @@ export class HistoryCompressor {
     }
   }
 
-  /**
-   * Merge multiple batch summaries into a single unified record.
-   * De-duplicates across batches and preserves all unique details.
-   *
-   * @param batchSummaries - the per-batch extracted summaries.
-   * @returns merged structured summary.
-   */
-  private async mergeBatches(
-    batchSummaries: readonly string[],
-    target: SummarizationTarget,
-  ): Promise<string> {
-    const combined = batchSummaries
-      .map((s, i) => `--- Segment ${i + 1} ---\n${s}`)
-      .join('\n\n')
-    const inputTokens = estimateTokens(combined)
-    const targetTokens = summarizationTargetTokens(this.config, inputTokens)
-
-    const prompt = [
-      'You are merging multiple conversation segments into one unified record.',
-      'Combine the information below into a SINGLE structured document.',
-      '',
-      `Output budget: the input is ~${inputTokens} tokens. Aim for ~${targetTokens} tokens of`,
-      'output. Merge aggressively to avoid bloat, but keep every unique fact.',
-      '',
-      'Rules:',
-      '- PRESERVE ALL details from every segment — nothing should be dropped',
-      '- De-duplicate: if the same fact appears in multiple segments, keep it once',
-      '- If segments have overlapping content (from the overlap window), merge them coherently',
-      '- When two segments conflict, keep the more specific/later statement and note the discrepancy',
-      '- PRESERVE the original language of each statement — do NOT translate',
-      '- NEVER invent facts that are not present in the segments',
-      '- Maintain the same section structure (Goals, Decisions, Files, Code, Problems, Tools, Questions)',
-      '- Order information chronologically within each section',
-      '- Use the exact section headings: ## Goals & Requirements, ## Key Decisions, ## File Changes,',
-      '  ## Code & Config, ## Problems & Solutions, ## Tool Results, ## Open Questions',
-      '',
-      'Segments to merge:',
-      '',
-      combined,
-    ].join('\n')
-
-    return this.llmSummarize(prompt, target)
-  }
-
-  /**
-   * Call the LLM with a prompt and return the text result.
-   * Shared by extractBatch and mergeBatches.
-   */
-  private async llmSummarize(prompt: string, target: SummarizationTarget): Promise<string> {
-    const assembler = new BlockAssembler()
-    const options: GenerateOptions = {
-      provider: target.provider,
-      model: target.model,
-      messages: [createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin:' + PLUGIN } as any,
-      })],
-      maxTokens: this.config.maxTokens,
-      purpose: 'compaction',
-    }
-
-    for await (const chunk of this.ctx.llm.stream(options)) assembler.push(chunk)
-    const error = finishError(assembler.finish)
-    if (error !== undefined) {
-      throw new Error(`LLM summarization failed: ${error.message}`)
-    }
-
-    return assembler.blocks()
-      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-      .map(b => b.text)
-      .join('\n')
-      .trim()
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1901,7 +1760,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       }
       // Close to the trigger but not a clean seam: precompute the fold
       // summary in the background so the eventual fold does not block.
-      this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
+      void this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
       return null
     }
     // Frequency gate: a routine fold must not fire again within a short
@@ -1919,26 +1778,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // messages. Zero LLM cost - the hash embedder prices each candidate in
     // microseconds. No block or no embedder => empty set => the walk falls
     // back to its user-message-only behaviour.
-    let importanceKeep: Set<SessionSeq> | undefined
-    const taskStateBlock = this.compressor.taskStateOf(sessionId)
-    if (taskStateBlock !== undefined) {
-      const goalVec = await this.ctx.memoryContext.embedText(taskStateBlock.slice(0, 2000))
-      if (goalVec !== undefined) {
-        importanceKeep = new Set()
-        const naive = retainedTailStart(meter.nodes.map(node => node.tokens), Math.max(0, plan.targetSurfaceTokens))
-        for (let back = 1; back <= 3; back += 1) {
-          const node = meter.nodes[naive - back]
-          if (node === undefined) break
-          const event = session.eventAt(node.seq)
-          const message = event === undefined ? null : session.deriveEventMessage(event)
-          const text = message === null ? '' : messageText(message)
-          if (text.length === 0) continue
-          const vec = await this.ctx.memoryContext.embedText(text.slice(0, 2000))
-          if (vec === undefined) continue
-          if (cosineSimilarity(goalVec, vec) >= GOV_IMPORTANCE_KEEP_COS) importanceKeep.add(node.seq)
-        }
-      }
-    }
+    const importanceKeep = await this.importanceBoundary(sessionId, session, meter, plan)
     // Prefer a speculative summary when its region is still verbatim-valid
     // (fingerprint over the exact input the base engine will rebuild). A
     // stale region - content replaced, surface drifted - is dropped and the
@@ -2298,6 +2138,44 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * Goal-conditioned importance for the cut-boundary window: the carried
+   * task-state block embedded as the goal reference, and the ≤3 nodes the
+   * high-value walk can reach embedded per node. Sequences clearing
+   * GOV_IMPORTANCE_KEEP_COS stay verbatim even when they are not user
+   * messages. SHARED by the live fold path and the speculative launcher —
+   * the two must select ranges under the SAME rule, or a speculative hit
+   * would silently bypass the goal-conditioned boundary.
+   * @returns the important sequences, or `undefined` when the goal reference
+   *   is unavailable (no block yet / no embedder) — the caller then uses the
+   *   role-only rule.
+   */
+  private async importanceBoundary(
+    sessionId: string,
+    session: Session,
+    meter: TokenMeasurement,
+    plan: CompactionPlan,
+  ): Promise<Set<SessionSeq> | undefined> {
+    const taskStateBlock = this.compressor.taskStateOf(sessionId)
+    if (taskStateBlock === undefined) return undefined
+    const goalVec = await this.ctx.memoryContext.embedText(taskStateBlock.slice(0, 2000))
+    if (goalVec === undefined) return undefined
+    const important = new Set<SessionSeq>()
+    const naive = retainedTailStart(meter.nodes.map(node => node.tokens), Math.max(0, plan.targetSurfaceTokens))
+    for (let back = 1; back <= 3; back += 1) {
+      const node = meter.nodes[naive - back]
+      if (node === undefined) break
+      const event = session.eventAt(node.seq)
+      const message = event === undefined || event === null ? null : session.deriveEventMessage(event)
+      const text = message === null ? '' : messageText(message)
+      if (text.length === 0) continue
+      const vec = await this.ctx.memoryContext.embedText(text.slice(0, 2000))
+      if (vec === undefined) continue
+      if (cosineSimilarity(goalVec, vec) >= GOV_IMPORTANCE_KEEP_COS) important.add(node.seq)
+    }
+    return important
+  }
+
+  /**
    * Launch a speculative fold summarization when the surface is CLOSE to the
    * trigger but this step was not a clean seam. The summary LLM call — the
    * slow part of a fold, up to minutes on a local model — then runs in the
@@ -2307,7 +2185,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * summarizer at commit (fingerprint miss is recorded in the ledger, so the
    * hit rate is observable).
    */
-  private maybeSpeculate(input: {
+  private async maybeSpeculate(input: {
     agent: Agent
     session: Session
     sessionId: string
@@ -2315,14 +2193,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     snapshot: SurfaceSnapshot
     meter: TokenMeasurement
     pressureBudget: number
-  }): void {
+  }): Promise<void> {
     if (!resolveSpeculativeFold(this.config)) return
     if (input.plan.surfaceTriggerTokens <= 0) return
     if (input.snapshot.surfaceTokens < input.plan.surfaceTriggerTokens * SPECULATIVE_AHEAD_RATIO) return
     if (this.speculativeInFlight.has(input.sessionId)) return
     const now = Date.now()
     if (now - (this.lastSpeculativeAt.get(input.sessionId) ?? 0) < SPECULATIVE_MIN_INTERVAL_MS) return
-    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens))
+    const importanceKeep = await this.importanceBoundary(
+      input.sessionId,
+      input.session,
+      input.meter,
+      input.plan,
+    )
+    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens), importanceKeep)
     if (range === null) return
     let foldTokens = 0
     for (const node of input.meter.nodes) {
@@ -2462,7 +2346,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
               provider: target.provider,
               model: target.model,
               contextWindow: inputTokens,
-              source: 'probe',
+              source: 'overflow',
             })
             this.ctx.logger.warn(
               `[ContextGovernor] summarizer overflow 400: adopting real window <= ${inputTokens} `
@@ -2505,6 +2389,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (summarizationFingerprint(input) === speculation.fingerprint) {
         this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:hit' })
+        // A precomputed summary is a genuine live-LLM result: record it so the
+        // fold path publishes the route prior (the flag would otherwise hold a
+        // STALE value from an earlier call and wrongly suppress publishing).
+        this.lastSummarizeDegraded.set(agent, false)
         return { summary: speculation.summary, provider: 'precomputed', model: 'speculative' }
       }
       this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:miss' })

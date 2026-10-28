@@ -131,6 +131,7 @@ export {
   GOV_DEEP_PROBE_MIN_MAGNITUDE,
   GOV_DEEP_PROBE_MEMORY_FLOOR,
   GOV_MIN_NET_SAVING_RATIO,
+  GOV_IMPORTANCE_KEEP_COS,
   isThinFold,
   nextTargetDeviationEma,
   targetDeviationCorrection,

@@ -192,18 +192,21 @@ export class ModelContextTracker {
   }
 
   /**
-   * Whether ANY model of this provider was confirmed by a successful live
-   * probe. Probes are only ever LAUNCHED for local routes (the locality gate),
-   * so a probe record is itself locality evidence — it is the fallback when
-   * the settings-based baseURL lookup cannot resolve the provider (host
-   * service shape changes), which otherwise silently demotes a local route to
-   * cloud treatment (the 90s summarizer deadline).
+   * Whether this provider has ROUTE-WINDOW evidence: a successful live probe
+   * ('probe') or a summarizer overflow 400 ('overflow') — both only ever
+   * originate from the route's own configured server. Probes are launched
+   * exclusively for local routes, and an overflow bound is adopted from the
+   * server's own rejection, so either record is locality evidence. This is
+   * the fallback when the settings-based baseURL lookup cannot resolve the
+   * provider (host service shape changes), which otherwise silently demotes
+   * a local route to cloud treatment (the 90s summarizer deadline).
    * @param provider - the provider route to check.
    */
-  wasProbedByProvider(provider: string | undefined): boolean {
+  hasRouteWindowEvidence(provider: string | undefined): boolean {
     if (provider === undefined) return false
     for (const info of this.windowsByModel.values()) {
-      if (info.provider === provider && info.source === 'probe') return true
+      if (info.provider !== provider) continue
+      if (info.source === 'probe' || info.source === 'overflow') return true
     }
     return false
   }

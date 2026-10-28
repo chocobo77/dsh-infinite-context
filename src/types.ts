@@ -147,7 +147,7 @@ export interface MemoryStatus {
 }
 
 /** Where the model context window value came from. */
-export type ModelContextSource = 'config' | 'request-context' | 'probe'
+export type ModelContextSource = 'config' | 'request-context' | 'probe' | 'overflow'
 
 /** Detected model context information, adopted from DSH or a local probe. */
 export interface ModelContextInfo {
