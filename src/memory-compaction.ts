@@ -2262,7 +2262,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (existing !== undefined && existing.fingerprint === fingerprint) return
     this.lastSpeculativeAt.set(input.sessionId, now)
     this.speculativeInFlight.add(input.sessionId)
-    const deadlineMs = resolveSummarizationTimeoutMs(this.config, this.summarizerIsLocal(input.agent))
+    // The speculative call must be bounded by the SAME policy as the live
+    // summarizer (learned EMA, input scaling, locality caps) — the raw
+    // locality default here made the cache never populate on exactly the
+    // slow routes where precompute matters most.
+    const { timeoutMs: deadlineMs } = this.summarizerDeadline(input.agent, specTokens)
     void this.runSpeculative(input.agent, input.sessionId, range, specInput, fingerprint, deadlineMs)
   }
 
