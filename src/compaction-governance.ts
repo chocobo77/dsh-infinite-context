@@ -70,6 +70,72 @@ export const GOV_MATURE_COMPRESSIONS = 8
  * Set 0 to disable the gate.
  */
 export const GOV_MIN_NET_SAVING_RATIO = 0.08
+
+/**
+ * The fold interval and thin-fold ratio, derived from the LEARNED summarizer
+ * latency instead of fixed values: a fold costs roughly one summary call, so
+ * a route whose summaries take minutes should fold on a minutes-scale cadence
+ * with a higher bar for "worth it", while a route that summarizes in seconds
+ * can fold often and cheaply. The 20-minute shipped interval and the 8% ratio
+ * are what these formulas produce at a ~5-minute summary — they are the
+ * cold-start prior when no latency has been learned yet, not independent
+ * decisions.
+ *
+ * Derivation (no new constants — both reference MIN_FOLD_INTERVAL_MS):
+ * - interval  = clamp(4 × EMA,  20min/4,  20min×3)   → [5min, 60min]
+ * - thin ratio = 0.08 × clamp(EMA / 2min, 1, 3)      → [0.08, 0.24]
+ */
+
+/** Latency at which the shipped 20-minute interval is the right cadence. */
+const FOLD_INTERVAL_REF_EMA_MS = 5 * 60_000
+/** Interval multiplier over the learned summary latency. */
+const FOLD_INTERVAL_EMA_MULT = 4
+
+/**
+ * The shipped minimum wall-clock gap between routine folds — the COLD-START
+ * value of {@link foldIntervalFor} (what a ~5-minute summary route converges
+ * to). Kept exported as the engine's fallback and for its force-cooldown
+ * bookkeeping.
+ */
+export const MIN_FOLD_INTERVAL_MS = 20 * 60_000
+
+/**
+ * The minimum wall-clock gap between routine folds, derived from the route's
+ * learned summarizer latency. A summary that takes minutes makes a fixed
+ * 20-minute gap simultaneously too long for a fast model and too short for a
+ * slow one; scaling it by the measured cost keeps the RHYTHM proportional to
+ * the actual price of a fold. Unknown latency → the shipped 20 minutes.
+ * @param learnedLatencyMs - the route's summarizer latency EMA, or `undefined`
+ *   before the first successful summary.
+ * @returns the minimum interval in ms, within [5min, 60min].
+ */
+export function foldIntervalFor(learnedLatencyMs: number | undefined): number {
+  if (learnedLatencyMs === undefined || !Number.isFinite(learnedLatencyMs) || learnedLatencyMs <= 0) {
+    return MIN_FOLD_INTERVAL_MS
+  }
+  const raw = learnedLatencyMs * FOLD_INTERVAL_EMA_MULT
+  return Math.min(
+    MIN_FOLD_INTERVAL_MS * 3,
+    Math.max(MIN_FOLD_INTERVAL_MS / 4, Math.floor(raw)),
+  )
+}
+
+/**
+ * The thin-fold ratio for a route, derived from its learned summarizer
+ * latency: on a route where a summary costs minutes, a given net saving buys
+ * less per second of waiting, so the bar rises (up to ×3); on a fast route
+ * the shipped ratio already clears. Unknown latency → the shipped ratio.
+ * @param learnedLatencyMs - the route's summarizer latency EMA, or `undefined`
+ *   before the first successful summary.
+ * @returns the minimum net-saving ratio for this route.
+ */
+export function thinFoldRatioFor(learnedLatencyMs: number | undefined): number {
+  if (learnedLatencyMs === undefined || !Number.isFinite(learnedLatencyMs) || learnedLatencyMs <= 0) {
+    return GOV_MIN_NET_SAVING_RATIO
+  }
+  const scale = learnedLatencyMs / (MIN_FOLD_INTERVAL_MS / 10)
+  return GOV_MIN_NET_SAVING_RATIO * Math.min(3, Math.max(1, scale))
+}
 /**
  * Minimum cosine(node text, task-state block) for a cut-boundary node to be
  * kept verbatim regardless of its role. Conservative: only CLEARLY on-topic

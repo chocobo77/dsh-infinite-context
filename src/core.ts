@@ -132,7 +132,9 @@ export {
   GOV_DEEP_PROBE_MEMORY_FLOOR,
   GOV_MIN_NET_SAVING_RATIO,
   GOV_IMPORTANCE_KEEP_COS,
+  foldIntervalFor,
   isThinFold,
+  thinFoldRatioFor,
   nextTargetDeviationEma,
   targetDeviationCorrection,
 } from './compaction-governance.ts'

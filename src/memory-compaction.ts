@@ -103,14 +103,17 @@ import {
   GOV_GUARD_RESERVE_RATIO,
   GOV_TRIGGER_CEILING,
   failureCooldownFor,
+  foldIntervalFor,
   foldPressureBudget,
   GOV_IMPORTANCE_KEEP_COS,
   isThinFold,
   ledgerView,
+  MIN_FOLD_INTERVAL_MS,
   minimumFoldTokens,
   nextTargetDeviationEma,
   summaryCharBudget,
   planFoldCompaction,
+  thinFoldRatioFor,
   toSurfaceSnapshot,
   type CompactionPlan,
   type GovernanceLedger,
@@ -489,8 +492,6 @@ export function selectFoldRange(
 }
 
 /** In-memory session counters idle this long are evicted (RAM only). */
-/** Minimum wall-clock gap between routine folds (force/fit-guard bypass). */
-const MIN_FOLD_INTERVAL_MS = 20 * 60_000
 /** Speculation launches when the surface is at least this share of the trigger. */
 const SPECULATIVE_AHEAD_RATIO = 0.8
 /** Minimum wall-clock gap between two speculative launches for one session. */
@@ -1768,11 +1769,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       return null
     }
     // Frequency gate: a routine fold must not fire again within a short
-    // window. Force, surge and the fit-guard still bypass it.
+    // window. Force, surge and the fit-guard still bypass it. The window is
+    // COST-AWARE: derived from the route's learned summarizer latency (4×
+    // EMA, clamped [5min, 60min]) — a slow local route folds on a minutes-
+    // scale cadence, a fast route folds as soon as the interval allows.
+    const learnedLatency = this.routeLatency(session)
+    const minIntervalMs = foldIntervalFor(learnedLatency)
     if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
       const last = this.compressor.lastFoldAt(sessionId)
-      if (last !== undefined && Date.now() - last < MIN_FOLD_INTERVAL_MS) {
-        diag(`min-interval:${Math.round((Date.now() - last) / 1000)}s;surf=${snapshot.surfaceTokens}`)
+      if (last !== undefined && Date.now() - last < minIntervalMs) {
+        diag(`min-interval:${Math.round((Date.now() - last) / 1000)}/${Math.round(minIntervalMs / 1000)}s;`
+          + `surf=${snapshot.surfaceTokens}`)
         return null
       }
     }
@@ -1819,14 +1826,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       return null
     }
     // Thin-fold gate: a ROUTINE fold must net more than its own summarizer
-    // output plus the cost of the call and the post-fold cache refill (≈8%
-    // of the budget). On a small window the memory floor caps the band so
-    // the closed loop cannot deepen its way out - without this gate the
-    // session churned at a median 3-minute cadence for a ~6% sliver each
-    // time. Force, surge and the fit-guard bypass it: their occasion is not
-    // optional, and a thin emergency fold still beats an overflow.
+    // output plus the cost of the call and the post-fold cache refill. The
+    // ratio is COST-AWARE (scales with the learned latency: on a slow route
+    // a given saving buys less per second of waiting). Force, surge and the
+    // fit-guard bypass it: their occasion is not optional, and a thin
+    // emergency fold still beats an overflow.
     if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
-      && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget)) {
+      && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget,
+        thinFoldRatioFor(learnedLatency))) {
       diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
         + `budget=${pressureBudget};surf=${snapshot.surfaceTokens};timing=${plan.drivers.timing.toFixed(2)};`
         + `mag=${plan.drivers.magnitude.toFixed(2)}`)
@@ -2142,6 +2149,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * The session's summarizer route latency EMA (ms), or `undefined` before
+   * the first successful summary. Feeds the cost-aware fold cadence and
+   * thin-fold ratio.
+   */
+  private routeLatency(session: Session): number | undefined {
+    try {
+      const target = resolveSummarizationTarget(this.config, session)
+      return target === undefined
+        ? undefined
+        : this.summarizerLatencyOf(`${target.provider}/${target.model}`)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * Goal-conditioned importance for the cut-boundary window: the carried
    * task-state block embedded as the goal reference, and the ≤3 nodes the
    * high-value walk can reach embedded per node. Sequences clearing
@@ -2217,7 +2240,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
     }
     if (foldTokens > 0 && foldTokens < minimumFoldTokens(input.pressureBudget)) return
-    if (isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), input.pressureBudget)) return
+    if (isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), input.pressureBudget,
+      thinFoldRatioFor(this.routeLatency(input.session)))) return
     // Concurrency headroom: the speculative call runs WHILE the step's main
     // request streams to the same server. The spec input must fit in the
     // room the conversation leaves — on a tight local server (real window
