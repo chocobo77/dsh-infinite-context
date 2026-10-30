@@ -795,6 +795,34 @@ export function scaleSummarizationTimeoutMs(baseMs: number, inputTokens: number,
 }
 
 /**
+ * Combine the cold-start estimate and the LEARNED route latency into the
+ * effective deadline. The rule is MONOTONIC in both directions: the learned
+ * value refines the estimate upward when the route is slower than the prior
+ * assumed, and can never TIGHTEN the deadline below it when the route is
+ * faster — production (2026-10-30) had a local route learn ~108s and drop
+ * the deadline to 135s, BELOW the 240s cold start, re-degrading a fold whose
+ * summary ran slower than the EMA sample.
+ * @param baseMs - the cold-start estimate (locality default scaled by input).
+ * @param learnedMs - the route's latency EMA, or `undefined` when it has no
+ *   successful summary yet.
+ * @param minMs - floor for the learned path.
+ * @param maxMs - hard cap for both paths.
+ * @returns the effective deadline in ms.
+ */
+export function deadlineFrom(baseMs: number, learnedMs: number | undefined, minMs: number, maxMs: number): number {
+  const clamp = (ms: number): number => Math.min(maxMs, Math.max(minMs, Math.floor(ms)))
+  // Garbage inputs fail FAST (minMs) rather than blocking the turn or
+  // producing a NaN deadline (a NaN setTimeout fires immediately and would
+  // kill the attempt for nothing). Garbage LEARNED values ignore the EMA and
+  // fall back to the cold-start estimate.
+  if (!Number.isFinite(baseMs)) return minMs
+  if (learnedMs === undefined) return clamp(baseMs)
+  if (!Number.isFinite(learnedMs) || learnedMs <= 0) return clamp(baseMs)
+  // max(base, learned x 1.25): the EMA refines upward; never tightens.
+  return clamp(Math.max(baseMs, learnedMs * 1.25))
+}
+
+/**
  * Resolve the task-state working-memory toggle (default on).
  * @param raw - the config from cordis.yml.
  * @returns whether the per-turn task-state block should be injected.

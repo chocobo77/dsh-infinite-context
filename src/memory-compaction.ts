@@ -83,6 +83,7 @@ import {
   resolveSpeculativeFold,
   resolveTaskStateEnabled,
   isSummarizationTimeoutExplicit,
+  deadlineFrom,
   scaleSummarizationTimeoutMs,
   resolveToolArchiveOptions,
   resolveUsageOptions,
@@ -2402,9 +2403,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const learned = route === undefined || isSummarizationTimeoutExplicit(this.config)
       ? undefined
       : this.summarizerLatencyOf(route)
-    const timeoutMs = learned === undefined
-      ? baseMs
-      : Math.min(maxMs, Math.max(MIN_SUMMARIZATION_TIMEOUT_MS, Math.floor(learned * 1.25)))
+    // Take the LARGER of the cold-start estimate and the learned latency —
+    // the learned value must never TIGHTEN below the cold-start estimate.
+    // Production (2026-10-30): a local route learned ~108s and the deadline
+    // dropped to 135s, BELOW the 240s cold start, re-degrading a fold whose
+    // summary ran slower than the EMA sample. Monotonic both ways: learning
+    // refines, it never tightens.
+    const timeoutMs = deadlineFrom(baseMs, learned, MIN_SUMMARIZATION_TIMEOUT_MS, maxMs)
     return { timeoutMs, retryMs: isLocal ? timeoutMs * 2 : timeoutMs }
   }
 
