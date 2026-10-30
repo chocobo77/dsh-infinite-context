@@ -495,8 +495,6 @@ export function selectFoldRange(
 /** In-memory session counters idle this long are evicted (RAM only). */
 /** Speculation launches when the surface is at least this share of the trigger. */
 const SPECULATIVE_AHEAD_RATIO = 0.8
-/** Minimum wall-clock gap between two speculative launches for one session. */
-const SPECULATIVE_MIN_INTERVAL_MS = 3 * 60_000
 const SESSION_COUNTER_IDLE_MS = 3600_000
 /** Persisted session counters are retained this long across idle gaps. */
 const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
@@ -1159,8 +1157,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly speculative = new Map<string, SpeculativeSummary>()
   /** Sessions with a speculative summarization currently running. */
   private readonly speculativeInFlight = new Set<string>()
-  /** Last speculative launch per session (launch throttle). */
-  private readonly lastSpeculativeAt = new Map<string, number>()
   /** fl_ recall count observed at each session's last fold (quality delta). */
   private readonly lastRecallAtFold = new Map<string, number>()
   /**
@@ -1828,13 +1824,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     // Thin-fold gate: a ROUTINE fold must net more than its own summarizer
     // output plus the cost of the call and the post-fold cache refill. The
-    // ratio is COST-AWARE (scales with the learned latency: on a slow route
-    // a given saving buys less per second of waiting). Force, surge and the
-    // fit-guard bypass it: their occasion is not optional, and a thin
-    // emergency fold still beats an overflow.
+    // ratio is COST-AWARE: paid (cloud) routes keep the 8% bar; local routes
+    // run on the operator's own hardware (the call is free) so the bar drops
+    // to zero — the dynamic fold interval is the only churn guard there.
+    // Force, surge and the fit-guard bypass it: their occasion is not
+    // optional, and a thin emergency fold still beats an overflow.
     if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
       && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget,
-        thinFoldRatioFor(learnedLatency))) {
+        thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
       diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
         + `budget=${pressureBudget};surf=${snapshot.surfaceTokens};timing=${plan.drivers.timing.toFixed(2)};`
         + `mag=${plan.drivers.magnitude.toFixed(2)}`)
@@ -2213,6 +2210,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * summarizer at commit (fingerprint miss is recorded in the ledger, so the
    * hit rate is observable).
    */
+  /**
+   * Keep the session's SPECULATIVE CHECKPOINT current while the surface
+   * approaches the fold trigger.
+   *
+   * ROLLING DESIGN: the first launch summarizes the fold range R1 as it
+   * exists then (the expensive full call, in the background); every later
+   * pre-step with significant new content MERGES the delta into the carried
+   * checkpoint (a small call: prior summary + delta). At commit the frozen
+   * range's fingerprint still matches (the surface is append-only between
+   * refreshes, unless a stub rewrite mutated it — that correctly misses), so
+   * the fold consumes the latest checkpoint without a blocking full-range
+   * call. This fixes the v0.7.0 structural flaw: the commit-time range is
+   * always BIGGER than the speculation-time range on a growing surface, so
+   * the exact-fingerprint contract could only ever miss.
+   *
+   * No thin-fold bar here: the checkpoint is an INVESTMENT consumed at
+   * commit (where the range is large), not a fold itself — the commit-time
+   * thin gate still applies to the frozen range. The delta bar
+   * (minimumFoldTokens) keeps refreshes from being chatty.
+   */
   private async maybeSpeculate(input: {
     agent: Agent
     session: Session
@@ -2226,52 +2243,87 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (input.plan.surfaceTriggerTokens <= 0) return
     if (input.snapshot.surfaceTokens < input.plan.surfaceTriggerTokens * SPECULATIVE_AHEAD_RATIO) return
     if (this.speculativeInFlight.has(input.sessionId)) return
-    const now = Date.now()
-    if (now - (this.lastSpeculativeAt.get(input.sessionId) ?? 0) < SPECULATIVE_MIN_INTERVAL_MS) return
-    const importanceKeep = await this.importanceBoundary(
-      input.sessionId,
-      input.session,
-      input.meter,
-      input.plan,
-    )
-    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens), importanceKeep)
-    if (range === null) return
-    let foldTokens = 0
-    for (const node of input.meter.nodes) {
-      if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
-    }
-    if (foldTokens > 0 && foldTokens < minimumFoldTokens(input.pressureBudget)) return
-    if (isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), input.pressureBudget,
-      thinFoldRatioFor(this.routeLatency(input.session)))) return
-    // Concurrency headroom: the speculative call runs WHILE the step's main
-    // request streams to the same server. The spec input must fit in the
-    // room the conversation leaves — on a tight local server (real window
-    // ~24k, fold ranges ~23k) the two cannot coexist, and launching would
-    // 400 one of them. No magic constant: "fits alongside the conversation"
-    // is the definition. An unknown window skips speculation (conservative —
-    // it is optional).
+    // Concurrency headroom: the background call streams to the same server
+    // WHILE the step's main request streams. The call input must fit in the
+    // room the conversation leaves. No magic constant: "fits alongside the
+    // conversation" is the definition. An unknown window skips speculation
+    // (conservative — it is optional).
     const routed = routedTargetOf(input.session)
     const realWindow = routed === undefined
       ? undefined
       : this.ctx.memoryContext.windowForModel(routed.model)
     if (realWindow === undefined) return
-    const specInput = this.buildRegionInput(input.session, range.start, range.end)
-    const specTokens = estimateTokens(specInput.messages.map(message => messageText(message)).join('\n'))
-    if (input.snapshot.totalTokens + specTokens > realWindow) return
-    const fingerprint = summarizationFingerprint(specInput)
     const existing = this.speculative.get(input.sessionId)
-    if (existing !== undefined && existing.fingerprint === fingerprint) return
-    this.lastSpeculativeAt.set(input.sessionId, now)
+    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens))
+    if (range === null) return
+
+    if (existing === undefined) {
+      // FIRST LAUNCH: full summarizer call over the current fold range.
+      const specInput = this.buildRegionInput(input.session, range.start, range.end)
+      const specTokens = estimateTokens(specInput.messages.map(message => messageText(message)).join('\n'))
+      if (input.snapshot.totalTokens + specTokens > realWindow) return
+      const fingerprint = summarizationFingerprint(specInput)
+      this.speculativeInFlight.add(input.sessionId)
+      const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, timeoutMs)
+      return
+    }
+    // REFRESH: merge the delta (everything after the cached range end) into
+    // the carried checkpoint. Skipped when the delta is insignificant.
+    if (range.end <= existing.end) return
+    let deltaTokens = 0
+    for (const node of input.meter.nodes) {
+      if (node.seq > existing.end && node.seq <= range.end) deltaTokens += node.tokens
+    }
+    if (deltaTokens < minimumFoldTokens(input.pressureBudget)) return
+    const mergeInput = this.buildMergeInput(input.session, existing, range.end)
+    const mergedFingerprint = summarizationFingerprint(this.buildRegionInput(input.session, range.start, range.end))
     this.speculativeInFlight.add(input.sessionId)
-    // The speculative call must be bounded by the SAME policy as the live
-    // summarizer (learned EMA, input scaling, locality caps) — the raw
-    // locality default here made the cache never populate on exactly the
-    // slow routes where precompute matters most.
-    const { timeoutMs: deadlineMs } = this.summarizerDeadline(input.agent, specTokens)
-    void this.runSpeculative(input.agent, input.sessionId, range, specInput, fingerprint, deadlineMs)
+    const { timeoutMs } = this.summarizerDeadline(input.agent, deltaTokens + estimateTokens(mergeInput.messages.map(message => messageText(message)).join('\n')))
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, timeoutMs, existing)
   }
 
-  private async runSpeculative(
+  /**
+   * Build the merge-call input for a rolling checkpoint refresh: the carried
+   * checkpoint (wrapped as a PRIOR checkpoint so the base instruction's
+   * merge rule recognizes it) followed by the delta messages.
+   */
+  private buildMergeInput(
+    session: Session,
+    existing: SpeculativeSummary,
+    endNow: SessionSeq,
+  ): SummarizationInput {
+    const priorText = existing.summary
+      .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+    const deltaMessages: Message[] = []
+    for (const nodeSeq of session.surface.nodes) {
+      if (nodeSeq <= existing.end || nodeSeq > endNow) continue
+      const event = session.eventAt(nodeSeq)
+      if (event === undefined) continue
+      const message = session.deriveEventMessage(event)
+      if (message !== null) deltaMessages.push(message)
+    }
+    return {
+      messages: [
+        createUserMessage({
+          content: [{ type: 'text', text: '<compacted-summary>\n' + priorText + '\n</compacted-summary>\n\nNewer messages arrived after the checkpoint above. Fold them into it.' }],
+          source: { kind: 'plugin:' + PLUGIN } as any,
+        }),
+        ...deltaMessages,
+      ],
+    }
+  }
+
+  /**
+   * FIRST speculative launch: full summarizer call over the current fold
+   * range, storing the checkpoint keyed by the region fingerprint. Funnel
+   * telemetry: launch → prepared/empty/failed, then hit/miss at consume —
+   * without the launch record the funnel is unobservable (a route with zero
+   * hits could mean "never fired" or "always missed").
+   */
+  private async runSpeculativeInitial(
     agent: Agent,
     sessionId: string,
     range: { start: SessionSeq; end: SessionSeq },
@@ -2279,9 +2331,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     fingerprint: number,
     deadlineMs: number,
   ): Promise<void> {
-    // Funnel telemetry: launch → prepared/empty/failed, then hit/miss at
-    // consume. Without the launch record the funnel is unobservable — a
-    // route with zero hits could mean "never fired" or "always missed".
     const record = (detail: string): void => {
       try {
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
@@ -2316,6 +2365,51 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .trim()
         .slice(0, 120)
       record('speculative:failed:' + brief)
+    } finally {
+      this.speculativeInFlight.delete(sessionId)
+    }
+  }
+
+  private async runSpeculativeMerge(
+    agent: Agent,
+    sessionId: string,
+    endNow: SessionSeq,
+    mergeInput: SummarizationInput,
+    mergedFingerprint: number,
+    deadlineMs: number,
+    previous: SpeculativeSummary,
+  ): Promise<void> {
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks speculation.
+      }
+    }
+    record('speculative:refresh-merge')
+    try {
+      const result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) {
+        record('speculative:refresh-empty')
+        return
+      }
+      this.speculative.set(sessionId, {
+        fingerprint: mergedFingerprint,
+        summary: result.summary,
+        start: previous.start,
+        end: endNow,
+      })
+      record('speculative:refreshed')
+      this.ctx.logger.info(
+        `[ContextGovernor] speculative checkpoint refreshed (session …${sessionId.slice(-8)}, `
+          + `covers through ${endNow})`,
+      )
+    } catch (error) {
+      const brief = (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120)
+      record('speculative:refresh-failed:' + brief)
     } finally {
       this.speculativeInFlight.delete(sessionId)
     }

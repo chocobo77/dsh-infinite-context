@@ -129,12 +129,19 @@ export function foldIntervalFor(learnedLatencyMs: number | undefined): number {
  *   before the first successful summary.
  * @returns the minimum net-saving ratio for this route.
  */
-export function thinFoldRatioFor(learnedLatencyMs: number | undefined): number {
-  if (learnedLatencyMs === undefined || !Number.isFinite(learnedLatencyMs) || learnedLatencyMs <= 0) {
-    return GOV_MIN_NET_SAVING_RATIO
-  }
-  const scale = learnedLatencyMs / (MIN_FOLD_INTERVAL_MS / 10)
-  return GOV_MIN_NET_SAVING_RATIO * Math.min(3, Math.max(1, scale))
+/**
+ * The thin-fold ratio for a route, driven by COST (not latency): the bar
+ * exists because a summarizer call + post-fold cache refill costs money on
+ * paid routes. LOCAL routes are the operator's own hardware — the call is
+ * free, so the bar drops to zero and the dynamic fold interval (4x EMA) is
+ * the only churn guard. Paid routes keep the shipped 8%.
+ * @param isLocal - whether the summarizer route points at the operator's own
+ *   hardware (baseURL loopback/LAN — NOT window size; a 256k local model is
+ *   as local as a 24k one).
+ * @returns the minimum net-saving ratio for this route.
+ */
+export function thinFoldRatioFor(isLocal: boolean): number {
+  return isLocal ? 0 : GOV_MIN_NET_SAVING_RATIO
 }
 /**
  * Minimum cosine(node text, task-state block) for a cut-boundary node to be
