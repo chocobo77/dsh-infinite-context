@@ -109,7 +109,6 @@ import {
   GOV_IMPORTANCE_KEEP_COS,
   isThinFold,
   ledgerView,
-  MIN_FOLD_INTERVAL_MS,
   minimumFoldTokens,
   nextTargetDeviationEma,
   summaryCharBudget,
@@ -1761,8 +1760,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       }
       // Close to the trigger but not a clean seam: precompute the fold
-      // summary in the background so the eventual fold does not block.
-      void this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
+      // summary in the background so the eventual fold does not block. The
+      // rejection is contained here — an unhandled promise rejection would
+      // take the whole harness process down, and the gate code inside
+      // (selectFoldRange) has a documented meter/surface race throw.
+      this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
+        .catch((error) => {
+          const brief = (error instanceof Error ? error.message : String(error))
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120)
+          diag('spec-error:' + brief)
+        })
       return null
     }
     // Frequency gate: a routine fold must not fire again within a short
@@ -2254,7 +2263,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       : this.ctx.memoryContext.windowForModel(routed.model)
     if (realWindow === undefined) return
     const existing = this.speculative.get(input.sessionId)
-    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens))
+    // Same cut rule as the live path (importance keep included): two paths,
+    // one selection rule.
+    const importanceKeep = await this.importanceBoundary(input.sessionId, input.session, input.meter, input.plan)
+    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens), importanceKeep)
     if (range === null) return
 
     if (existing === undefined) {
@@ -2277,9 +2289,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     if (deltaTokens < minimumFoldTokens(input.pressureBudget)) return
     const mergeInput = this.buildMergeInput(input.session, existing, range.end)
+    const mergeTokens = estimateTokens(mergeInput.messages.map(message => messageText(message)).join('\n'))
+    // The merge call replays the prior checkpoint plus the delta — neither
+    // is part of the conversation, so both must fit in the room the
+    // conversation leaves. Same headroom rule as the first launch: on a
+    // tight server skip instead of firing a merge that cannot succeed.
+    // The entry survives; the refresh retries on a later pass.
+    if (input.snapshot.totalTokens + mergeTokens > realWindow) return
     const mergedFingerprint = summarizationFingerprint(this.buildRegionInput(input.session, range.start, range.end))
     this.speculativeInFlight.add(input.sessionId)
-    const { timeoutMs } = this.summarizerDeadline(input.agent, deltaTokens + estimateTokens(mergeInput.messages.map(message => messageText(message)).join('\n')))
+    const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
     void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, timeoutMs, existing)
   }
 
