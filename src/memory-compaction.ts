@@ -2279,24 +2279,43 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     fingerprint: number,
     deadlineMs: number,
   ): Promise<void> {
+    // Funnel telemetry: launch → prepared/empty/failed, then hit/miss at
+    // consume. Without the launch record the funnel is unobservable — a
+    // route with zero hits could mean "never fired" or "always missed".
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks speculation.
+      }
+    }
+    record('speculative:launch')
     try {
       // super.summarize = the RAW summarizer (no resilience fallback, no
       // post-processing): a failed speculation is dropped silently, and the
       // committing fold then runs the live path with its own telemetry.
       const result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
-      if (result.summary.length === 0) return
+      if (result.summary.length === 0) {
+        record('speculative:empty')
+        return
+      }
       this.speculative.set(sessionId, {
         fingerprint,
         summary: result.summary,
         start: range.start,
         end: range.end,
       })
+      record('speculative:prepared')
       this.ctx.logger.info(
         `[ContextGovernor] speculative fold summary prepared (session …${sessionId.slice(-8)}, `
           + `range ${range.start}..${range.end})`,
       )
-    } catch {
-      // Speculation is opportunistic: any failure defers to the live path.
+    } catch (error) {
+      const brief = (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120)
+      record('speculative:failed:' + brief)
     } finally {
       this.speculativeInFlight.delete(sessionId)
     }
