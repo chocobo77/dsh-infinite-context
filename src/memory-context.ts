@@ -206,6 +206,22 @@ export class MemoryContext extends Service {
     return this.modelTracker.windowFor(model)
   }
 
+  /**
+   * The routed model's window for budget math, refusing the global "last
+   * observed" slot when it belongs to a DIFFERENT model: the slot follows the
+   * most recently observed model by design, so on a multi-model deployment a
+   * plain `?? contextWindow` fallback budgets one model off another's window.
+   */
+  windowForModelOrDeclared(model: string | undefined): number {
+    const own = this.modelTracker.windowFor(model)
+    if (own !== undefined) return own
+    const info = this.modelTracker.info
+    if (info !== null && model !== undefined && model.length > 0 && info.model === model) {
+      return info.contextWindow
+    }
+    return this.resolved.contextWindow
+  }
+
   /** All per-model windows currently known (for observability). */
   perModelWindows(): readonly ModelContextInfo[] {
     return this.modelTracker.perModel()
@@ -235,7 +251,11 @@ export class MemoryContext extends Service {
    */
   observeRequestContext(route: { provider?: string; model?: string; contextWindow?: number }): void {
     const probeModel = this.modelTracker.observe(route, { probe: this.isLocalRoute(route.provider) })
-    if (probeModel !== undefined) void this.runProbe(probeModel, route.provider)
+    if (probeModel !== undefined) {
+      // Thread the route's declared window down as the probe ceiling: the
+      // config default must not cap a genuinely wider server.
+      void this.runProbe(probeModel, route.provider, route.contextWindow)
+    }
   }
 
   /**
@@ -274,17 +294,18 @@ export class MemoryContext extends Service {
    * Run one background probe for a model's context window and adopt the
    * result. Resolves when the probe settles (success or failure).
    */
-  private async runProbe(model: string, provider?: string): Promise<void> {
+  private async runProbe(model: string, provider: string | undefined, declaredCeiling?: number): Promise<void> {
     try {
       const baseURL = this.resolveProbeBaseURL(provider)
       const window = await probeModelContext({ ...this.resolved.modelProbe, baseURL }, model)
       if (window !== undefined) {
         // A live probe reflects the server's REAL runtime context, which can
         // be far smaller than the declared catalog window. Cap the adoption at
-        // the PROBED model's own declared window (per-model registry) — a probe
-        // can only LOWER that model's window, never inflate it. The ceiling is
-        // never the global "last observed" slot, which may belong to another
-        // model (a small local one could otherwise flatten this model's probe).
+        // the PROBED model's own declared window (per-model registry), else at
+        // the ROUTE's declared window — the config default (94000) must not
+        // silently cap a real 128k server 27% down. The ceiling is never the
+        // global "last observed" slot, which may belong to another model (a
+        // small local one could otherwise flatten this model's probe).
         //
         // Note: `adopt` also moves the global "last observed" slot to the
         // probed model, so the config-fallback window follows the most
@@ -292,15 +313,21 @@ export class MemoryContext extends Service {
         // deployments (the fallback then reflects the REAL window, not a wrong
         // declaration); multi-model runtimes always read the per-model
         // registry via windowForModel, which this call also maintains.
-        const ceiling = this.modelTracker.probeCeilingFor(model, this.resolved.contextWindow)
+        const ceiling = this.modelTracker.probeCeilingFor(model, declaredCeiling ?? this.resolved.contextWindow)
         const adopted = Math.min(window, ceiling)
-        this.modelTracker.adopt({ model, contextWindow: adopted, source: 'probe' })
+        this.modelTracker.adopt({
+          ...(provider === undefined ? {} : { provider }),
+          model,
+          contextWindow: adopted,
+          source: 'probe',
+        })
         this.modelTracker.markResolved(model)
         this.context.logger.info(
           `[memoryContext] Model probe adopted context window ${adopted} `
           + `(model=${model}, probed=${window}, ceiling=${ceiling}, source=probe)`,
         )
       } else {
+        this.modelTracker.noteProbeFailure(model)
         this.context.logger.info(
           `[memoryContext] Model probe for "${model}" reported no context window (will retry)`,
         )
@@ -364,6 +391,9 @@ export class MemoryContext extends Service {
     // belong to a different model, and probing through the wrong provider's
     // baseURL would query the wrong server.
     const provider = this.modelTracker.providerFor(target) ?? this.modelTracker.info?.provider
+    // A manual probe is the operator's word: clear the auto-probe give-up
+    // counter so this attempt always runs.
+    this.modelTracker.clearProbeFailures(target)
     await this.runProbe(target, provider)
     return this.modelInfo
   }
@@ -402,6 +432,14 @@ export class MemoryContext extends Service {
   /** Whether any stored memory has exactly this text (ingest dedup helper). */
   hasText(text: string): boolean {
     return this.requireEngine().hasText(text)
+  }
+
+  /**
+   * Drop per-session fold-quality recall counters for evicted (idle) sessions
+   * — bounded RAM alongside the engine's own per-session maps.
+   */
+  evictFlRecalls(stale: readonly string[]): void {
+    for (const sessionId of stale) this.flRecalls.delete(sessionId)
   }
 
   /** Whether any stored memory has this text after fuzzy normalization (dedup helper). */

@@ -103,6 +103,7 @@ import {
   GOV_MIN_NET_SAVING_RATIO,
   GOV_GUARD_RESERVE_RATIO,
   GOV_TRIGGER_CEILING,
+  completionReserveOf,
   failureCooldownFor,
   foldIntervalFor,
   foldPressureBudget,
@@ -183,6 +184,15 @@ const PLUGIN = 'dsh-infinite-context'
  * simply deferred, and provider overflow recovery remains the backstop.
  */
 const FORCED_PRESSURE_COOLDOWN_MS = 10_000
+/**
+ * After this many consecutive fold attempts that found nothing safe to fold
+ * (or failed outright), the fit-guard/force doors stand down for
+ * {@link FORCED_FOLD_STALL_BACKOFF_MS} and let the probe path re-verify the
+ * narrowed window — a dead summarizer on a full window must not turn every
+ * step into a failing summarizer attempt.
+ */
+const FORCED_FOLD_STALL_MAX = 2
+const FORCED_FOLD_STALL_BACKOFF_MS = 5 * 60_000
 
 /**
  * Share of the session's model window the per-turn RAG injection may occupy.
@@ -446,6 +456,7 @@ export function selectFoldRange(
   measurement: TokenMeasurement,
   retainTokens: number,
   importanceKeep?: ReadonlySet<SessionSeq>,
+  minimumTokens = 0,
 ): { start: SessionSeq; end: SessionSeq } | null {
   const priced = measurement.nodes
   if (priced.length === 0) return null
@@ -484,6 +495,27 @@ export function selectFoldRange(
     walkedTokens += node.tokens
     walked += 1
     keepFromIdx -= 1
+  }
+  if (keepFromIdx <= firstIdx) return null
+  // ESCALATION: the range above the retained tail cannot net its own summary —
+  // usually one huge tail node overshooting `retain`, or a speculation frozen
+  // at an older surface. Under pressure the caller passes minimumTokens; move
+  // the cut toward the tail node-by-node until the range clears it. Bounded:
+  // stops at the FIRST crossing, never folds the newest nodes, only cuts at
+  // tool-pairing-balanced points; the system-head and first-user pins are
+  // upstream and untouched. Importance-kept nodes DO get folded by an
+  // escalation (unlike the boundary walk above): leaving them out would pin
+  // the escalation to a no-op exactly when progress is mandatory — the digest
+  // preserves their words instead of their adjacency. Callers without
+  // pressure pass 0 and behavior is byte-identical to the unescalated
+  // selection.
+  let sum = 0
+  for (let i = firstIdx; i < keepFromIdx; i += 1) sum += priced[i]?.tokens ?? 0
+  while (sum < minimumTokens && keepFromIdx < surfaceNodes.length - 1) {
+    const nextCut = surfaceNodes[keepFromIdx + 1]
+    if (nextCut === undefined || !toolPairingBalancedBefore(session, nextCut)) break
+    sum += priced[keepFromIdx]?.tokens ?? 0
+    keepFromIdx += 1
   }
   if (keepFromIdx <= firstIdx) return null
   const start = surfaceNodes[firstIdx]
@@ -914,15 +946,17 @@ export class HistoryCompressor {
    * {@link SESSION_COUNTER_RETENTION_MS} and restored lazily by
    * {@link restoreCounter}. Call from the pre-step hook.
    */
-  cleanupStale(): void {
+  cleanupStale(): readonly string[] {
     const now = Date.now()
+    const staleSessions: string[] = []
     for (const [sessionId, entry] of this.turnCounters) {
       if (now - entry.lastActive > SESSION_COUNTER_IDLE_MS) {
         this.turnCounters.delete(sessionId)
+        staleSessions.push(sessionId)
       }
     }
-    if (this.kv?.deleteOlderThan === undefined) return
-    if (now - this.lastKvPruneAt < SESSION_KV_PRUNE_INTERVAL_MS) return
+    if (this.kv?.deleteOlderThan === undefined) return staleSessions
+    if (now - this.lastKvPruneAt < SESSION_KV_PRUNE_INTERVAL_MS) return staleSessions
     this.lastKvPruneAt = now
     try {
       const removed = this.kv.deleteOlderThan(
@@ -937,6 +971,7 @@ export class HistoryCompressor {
         `[ContextGovernor] Session-counter retention sweep failed: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
+    return staleSessions
   }
 
   /**
@@ -1158,6 +1193,48 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly speculativeInFlight = new Set<string>()
   /** fl_ recall count observed at each session's last fold (quality delta). */
   private readonly lastRecallAtFold = new Map<string, number>()
+  /**
+   * Evict idle sessions from the engine's per-session RAM maps, matching the
+   * compressor's counter eviction (same idle clock, returned by
+   * {@link HistoryCompressor.cleanupStale}). Without this the engine pins
+   * every idle session's Agent (→ Session → full event log) for the life of
+   * the process, and small per-session counters accumulate forever. A manual
+   * force-compress on an evicted session reports so; the next step
+   * re-populates the entry.
+   */
+  private evictIdleSessions(stale: readonly string[]): void {
+    for (const sessionId of stale) {
+      this.lastAgentBySession.delete(sessionId)
+      this.lastFoldCheckAt.delete(sessionId)
+      this.lastRecallAtFold.delete(sessionId)
+      this.speculative.delete(sessionId)
+    }
+    this.ctx.memoryContext.evictFlRecalls(stale)
+    // Route-keyed overflow strikes age out on the counter retention clock.
+    const now = Date.now()
+    for (const [route, strike] of this.overflowStrikes) {
+      if (now - strike.lastAt > SESSION_COUNTER_RETENTION_MS) this.overflowStrikes.delete(route)
+    }
+    for (const sessionId of stale) this.forcedFoldsStalled.delete(sessionId)
+  }
+
+  /**
+   * Repeated summarizer "exceeds context" 400s per route. A transient
+   * busy-server 400 must not adopt a window bound on first sight (the
+   * 2026-11-03 storm: a garbage "available context size (32)" answer got
+   * estimated-input adopted as the model's window, and the fit-guard then
+   * compacted every step against it). Cleared on a successful summary.
+   */
+  private readonly overflowStrikes = new Map<string, { count: number; lastAt: number }>()
+  /**
+   * Consecutive fold attempts per session that failed outright or found
+   * nothing safe to fold. After {@link FORCED_FOLD_STALL_MAX}, the
+   * fit-guard/force doors stand down for {@link FORCED_FOLD_STALL_BACKOFF_MS}
+   * (they bypass the failure cooldown by design, so without this a dead
+   * summarizer on a full window is re-asked every step). Cleared by any
+   * committed fold; swept with the idle-session maps.
+   */
+  private readonly forcedFoldsStalled = new Map<string, { count: number; lastAt: number }>()
   /**
    * Whether the most recent summarize() call for this agent degraded to the
    * extractive fallback. CompactionResult carries no provider field, so the
@@ -1447,10 +1524,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       windowForSession: (sessionId) => {
         const session = ctx.sessions.get(SessionId(sessionId))
         if (session === undefined) return undefined
-        const requestContext = session.requestContext()
-        const model = requestContext?.model
-        if (model === undefined || model.length === 0) return ctx.memoryContext.contextWindow
-        return ctx.memoryContext.windowForModel(model) ?? ctx.memoryContext.contextWindow
+        // Route-aware to the end: the global "last observed" slot may belong to
+        // a different model, and budgeting the guard off it would fire the
+        // takeover at another session's window.
+        return ctx.memoryContext.windowForModelOrDeclared(session.requestContext()?.model)
       },
       log: (message) => ctx.logger.info(message),
     })
@@ -1540,7 +1617,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     } catch (error) {
       this.ctx.logger.warn(
         `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}; `
-        + 'falling through to the durable lane',
+        + 'governance keeps the durable lane suppressed for this step (failure cooldown recorded)',
       )
       return null
     }
@@ -1680,34 +1757,37 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     const window = this.ctx.memoryContext.windowForModel(requestContext?.model ?? '')
       ?? requestContext?.contextWindow
-      ?? this.ctx.memoryContext.contextWindow
+      ?? this.ctx.memoryContext.windowForModelOrDeclared(requestContext?.model)
     if (!(Number.isFinite(window) && window > 0)) { diag('no-window'); return null }
     // Use the SAME pressure budget as the durable lane: the window minus the
     // reserved completion tokens (the provider charges them to the same
     // window) minus the plugin headroom. Without the completion reserve the
     // fold trigger sat ABOVE the durable threshold and the durable lane always
     // won the race.
-    let reservedCompletion = session.requestHeader()?.config.maxTokens ?? 0
-    if (reservedCompletion <= 0) {
+    let declaredMaxTokens = session.requestHeader()?.config.maxTokens ?? 0
+    if (declaredMaxTokens <= 0) {
       try {
         const info = await this.ctx.llm.resolveModelInfo(
           requestContext?.provider ?? '',
           requestContext?.model ?? '',
           signal,
         )
-        reservedCompletion = info.defaultMaxTokens ?? 0
+        declaredMaxTokens = info.defaultMaxTokens ?? 0
         const effort = info.reasoning?.efforts?.[0]?.id ?? info.reasoning?.defaultEffort
         if (effort !== undefined) {
           this.modelEfforts.set(`${requestContext?.provider ?? ''}/${requestContext?.model ?? ''}`, effort)
         }
       } catch {
-        // Unknown reserve: fall back to the headroom-only budget.
+        // Unknown reserve: completionReserveOf substitutes the placeholder constant.
       }
     }
     const headroom = Math.max(0, window - this.compressor.tokenBudget(window))
-    // A request cap that reserves (almost) the whole window must not collapse
-    // the fold budget to one token: clamp the reserve to what the window can
-    // spare and keep a minimum prompt share.
+    // A request cap at (or above) the whole window is the "never truncate"
+    // placeholder, not a completion budget: fed here raw it clamped to a
+    // quarter of the window and halved the fold budget (the 2026-11 Ubuntu
+    // low-water diagnosis). completionReserveOf degrades it to a small
+    // constant; the clamp below still keeps the minimum prompt share.
+    const reservedCompletion = completionReserveOf(declaredMaxTokens, window)
     const pressureBudget = foldPressureBudget({ window, reservedCompletion, headroom })
     const meter = this.ctx.tokenMeter.measure(session)
     if (meter.totalTokens <= 0) { diag('no-meter'); return null }
@@ -1759,6 +1839,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
           + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       }
+      // Forced-door stall: after repeated fold failures the fit-guard reason
+      // (downgraded to a fold by the capability table) stands down too — the
+      // probe path re-verifies the narrowed record in the meantime.
+      if (plan.reason === 'fit-guard') {
+        const stall = this.forcedFoldsStalled.get(sessionId)
+        if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+          && now - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
+          diag(`fit-guard-stall:${stall.count};surf=${snapshot.surfaceTokens}`)
+        }
+        return null
+      }
       // Close to the trigger but not a clean seam: precompute the fold
       // summary in the background so the eventual fold does not block. The
       // rejection is contained here — an unhandled promise rejection would
@@ -1802,15 +1893,64 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // range selected fresh; either way the committing fold is correct.
     const speculation = this.speculative.get(sessionId)
     let range: { start: SessionSeq; end: SessionSeq } | null = null
+    let speculationUsed = false
     if (speculation !== undefined) {
       const fingerprint = summarizationFingerprint(this.buildRegionInput(session, speculation.start, speculation.end))
       if (fingerprint === speculation.fingerprint) {
         range = { start: speculation.start, end: speculation.end }
+        speculationUsed = true
       } else {
         this.speculative.delete(sessionId)
       }
     }
-    if (range === null) range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), importanceKeep)
+    // Under real pressure the selector may ESCALATE: widen the range
+    // node-by-node until it clears minimumFoldTokens, so a monster tail node
+    // or a speculation frozen at an older surface cannot starve the fold lane
+    // into per-step small-fold skips while the surface keeps growing (the
+    // 59.8k→84.5k incident). Without pressure, selection is unchanged.
+    const pressured = snapshot.surfaceTokens >= plan.surfaceTriggerTokens
+      || plan.reason === 'surge' || plan.reason === 'fit-guard' || plan.reason === 'forced'
+    const minFoldTokens = minimumFoldTokens(pressureBudget)
+    if (speculationUsed && range !== null) {
+      let frozenTokens = 0
+      for (const node of meter.nodes) {
+        if (node.seq >= range.start && node.seq <= range.end) frozenTokens += node.tokens
+      }
+      if (pressured && frozenTokens > 0 && frozenTokens < minFoldTokens) {
+        // The frozen speculation cannot net its own summary while the surface
+        // is at/over the trigger: drop it and select fresh (the escalated
+        // selector widens past whatever pinned the small range).
+        this.speculative.delete(sessionId)
+        speculationUsed = false
+        range = null
+      }
+    }
+    let escalated = false
+    if (range === null) {
+      range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), importanceKeep)
+      // Escalate ONLY when the plain selection cannot net its own summary
+      // (a monster tail node, a just-dropped frozen speculation): widen
+      // node-by-node toward the tail. A naturally-large selection stays
+      // subject to the thin-fold gate — the net-saving bar is the churn
+      // protection for pressure folds, and `escalated` (not `pressured`)
+      // is what bypasses it below.
+      if (pressured) {
+        let plainTokens = 0
+        if (range !== null) {
+          for (const node of meter.nodes) {
+            if (node.seq >= range.start && node.seq <= range.end) plainTokens += node.tokens
+          }
+        }
+        if (range === null || (plainTokens > 0 && plainTokens < minFoldTokens)) {
+          const widened = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens),
+            importanceKeep, minFoldTokens)
+          if (widened !== null) {
+            range = widened
+            escalated = true
+          }
+        }
+      }
+    }
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
         + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
@@ -1818,16 +1958,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       return null
     }
     // A fold that is smaller than the summarizer's own output cannot net a
-    // saving (compaction-basic rejects it). Skip it instead of churning.
+    // saving (compaction-basic rejects it). Skip it instead of churning — a
+    // manual force still reports the honest outcome; the base's own size
+    // rejection remains the correctness backstop there.
     let foldTokens = 0
     for (const node of meter.nodes) {
       if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
     }
-    const minFoldTokens = minimumFoldTokens(pressureBudget)
     // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
     // node); treat it as unknown and let compaction-basic's own size check decide.
-    if (foldTokens > 0 && foldTokens < minFoldTokens) {
-      diag(`small-fold:${foldTokens}<${minFoldTokens};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
+    if (!force && foldTokens > 0 && foldTokens < minFoldTokens) {
+      diag(`small-fold:${foldTokens}<${minFoldTokens};escalated=${pressured};surf=${snapshot.surfaceTokens};`
+        + `target=${plan.targetSurfaceTokens};`
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
       return null
     }
@@ -1836,9 +1978,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // ratio is COST-AWARE: paid (cloud) routes keep the 8% bar; local routes
     // run on the operator's own hardware (the call is free) so the bar drops
     // to zero — the dynamic fold interval is the only churn guard there.
-    // Force, surge and the fit-guard bypass it: their occasion is not
-    // optional, and a thin emergency fold still beats an overflow.
-    if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
+    // Force, surge, the fit-guard and ESCALATED folds bypass it: their
+    // occasion is not optional (a thin emergency fold still beats an
+    // overflow), while a NATURALLY-large pressure fold stays gated.
+    if (!force && !escalated && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
       && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget,
         thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
       diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
@@ -1852,15 +1995,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     )
     try {
       const result = await this.compactRegion(range.start, range.end, agent, signal)
+      // A committed fold proves the summarizer works: clear the forced-fold
+      // stall so the fit-guard/force doors resume their normal cadence.
+      this.forcedFoldsStalled.delete(sessionId)
       this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
       // Closed-loop band: observe where the fold actually landed versus the
       // plan's target and feed the signed shortfall into the next plan. The
       // meter re-reads the rewritten surface (measure() re-syncs the session
       // each call), so `landed` shares the target's basis (meter surface
       // tokens on the same estimator). Scope: the FOLD lane feeds the loop —
-      // the durable lane shares the same planCompaction targets but its
-      // landings are not observed here, so a summary-overhead change seen
-      // only by durable compactions reaches this EMA one fold later.
+      // the durable lane runs its own (legacy) threshold curve rather than
+      // planCompaction, and its landings are not observed here, so a
+      // summary-overhead change seen only by durable compactions reaches
+      // this EMA one fold later.
       const landed = this.ctx.tokenMeter.measure(session).surfaceTokens
       // Forced folds (manual tool call) have atypical range shapes and
       // overhead, so they OBSERVE without TEACHING: the diagnosis still
@@ -1899,6 +2046,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       return result
     } catch (error) {
       this.compressor.recordFoldFailure(sessionId, error)
+      // A failed fold is stall evidence for the fit-guard/force doors (see
+      // FORCED_FOLD_STALL_*): a dead summarizer must not be re-asked every
+      // step through a door that bypasses the failure cooldown.
+      const stall = this.forcedFoldsStalled.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.forcedFoldsStalled.set(sessionId, { count: stall.count + 1, lastAt: Date.now() })
       diag(`error:${error instanceof Error ? error.message : String(error)}`)
       throw error
     }
@@ -1922,6 +2074,35 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .context?.contextWindow
       if (signal.aborted) return undefined
       const measurement = this.ctx.tokenMeter.measure(agent.session)
+      // Forced-door stall (see FORCED_FOLD_STALL_*): repeated barren/failed
+      // attempts stand down here too — the fold door and these doors share
+      // the stall ledger, and a dead summarizer must not be re-asked through
+      // whichever door comes first.
+      const stallKey = String(agent.session.id)
+      const stall = this.forcedFoldsStalled.get(stallKey)
+      if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
+        return null
+      }
+      // Sanity guard against a POISONED narrowed record: an 'overflow' bound
+      // is a heuristic estimate, and one far below the declared window (a
+      // garbage busy-server 400) turns every guard keyed on the "real window"
+      // into a per-step compaction storm that cannot converge (2026-11-03:
+      // 36 transactions in 73 minutes). When the record is estimate-sourced
+      // and implausibly small, re-verify with a live probe and stand down for
+      // this step; the probe result (which may widen an overflow record)
+      // settles it truthfully.
+      const narrowedRecord = this.ctx.memoryContext.perModelWindows()
+        .find(entry => entry.model === target.model)
+      if (narrowedRecord !== undefined && narrowedRecord.source === 'overflow'
+        && declared !== undefined && narrowed < declared / 4) {
+        this.ctx.logger.warn(
+          `[ContextGovernor] Narrowed window ${narrowed} for ${target.model} is an overflow estimate `
+            + `under a quarter of the declared ${declared} — looks poisoned; re-probing instead of forcing`,
+        )
+        void this.ctx.memoryContext.probeModel(target.model)
+        return null
+      }
       // Hard fit-guard: the request is about to run out of the REAL window.
       // Force the durable path regardless of the dynamic threshold so the
       // plugin's own summarization always gets room — the 'ensure no overflow'
@@ -1936,7 +2117,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           `[ContextGovernor] Fit-guard: ${measurement.totalTokens} tokens >= real window ${narrowed} `
           + `− reserve ${guardReserve} (model=${target.model}); forcing durable compaction`,
         )
-        return await super.compactIfNeeded(agent, 'context-overflow', signal)
+        const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
+        if (forced === null) {
+          // Nothing safe to fold even at the fit-guard line: the narrowed
+          // record may be wrong. Count the barren attempt (the stand-down
+          // applies once it repeats), back off via the failure cooldown and
+          // ask for a fresh probe rather than hammering every step.
+          const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+          this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+          this.compressor.recordFoldFailure(stallKey, new Error('fit-guard: no safe compaction range'))
+          void this.ctx.memoryContext.probeModel(target.model)
+        }
+        return forced
       }
       const decision = decidePressureCompaction({
         declaredWindow: declared,
@@ -1961,7 +2153,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
           + `< declared ${declared ?? 'unknown'}); forcing balanced compaction`,
         )
-        return await super.compactIfNeeded(agent, 'context-overflow', signal)
+        const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
+        if (forced === null) {
+          const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+          this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+          this.compressor.recordFoldFailure(
+            stallKey,
+            new Error('narrowed-window force: no safe compaction range'),
+          )
+          void this.ctx.memoryContext.probeModel(target.model)
+        }
+        return forced
       }
       // 'delegate' — narrowed >= declared (override == declared, or the probe
       // matched the declaration). The base pressure path handles this with
@@ -2035,7 +2237,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // and it gets the same deal: a region whose net saving does not cover its
     // summary plus the call cost waits for a deeper occasion.
     const regionTokens = Math.max(0, measurement.totalTokens - Math.min(retainTokens, measurement.totalTokens))
-    if (isThinFold(regionTokens, summarizationTargetTokens(this.config, regionTokens), window)) {
+    if (isThinFold(regionTokens, summarizationTargetTokens(this.config, regionTokens), window,
+      thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
       this.ctx.logger.info(
         `[ContextGovernor] Thin durable fold skipped: region ~${regionTokens} tokens nets under `
           + `${Math.floor(window * GOV_MIN_NET_SAVING_RATIO)} (window ${window}); waiting for a deeper occasion`,
@@ -2590,6 +2793,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // time the deadline approximates, so divide by the attempt count.
     if (!outcome.degraded && route !== undefined && signal?.aborted !== true) {
       this.recordSummarizerLatency(route, Math.round((Date.now() - startedAt) / Math.max(1, outcome.attempts)))
+      // A success refutes the overflow suspicion: reset the strike counter so
+      // one garbage 400 followed by healthy calls cannot accumulate evidence.
+      this.overflowStrikes.delete(route)
       // Self-healing widen: this call carried MORE tokens than the recorded
       // window and SUCCEEDED — the window bound was too tight (a transient
       // busy-server 400, say). The success is its own evidence; widen
@@ -2626,22 +2832,47 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // context size (32)"). The summarizer replays the range as a prefix,
       // so inputTokens + slack is a hard UPPER BOUND on the real window —
       // adopt it narrow-only, and the next fold plans against the truth.
-      const overflow = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
-        ?? reason.match(/\((\d+) tokens\) exceeds/i)
-      if (overflow !== null && inputTokens > 0) {
+      // Two server-side numbers are hard evidence, each with its own shape:
+      // "exceeds the context size (32768)" reports the WINDOW itself;
+      // "(40000 tokens) exceeds" reports the server's count of the REJECTED
+      // input (the window is below it). A placeholder answer from a busy
+      // server ("available context size (32)") is garbage: for those require
+      // the evidence to REPEAT, and then adopt a deliberately generous bound
+      // (estimate + slack). Asymmetry: too generous costs one more failed
+      // summarizer call (and the next 400 tightens the bound —
+      // self-correcting); too tight strangles every later budget, disables
+      // the self-heal, and made the fit-guard compact every step against a
+      // ~20k "window" (the 2026-11-03 checkpoint storm).
+      const windowReported = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
+      const inputReported = reason.match(/\((\d+) tokens\) exceeds/i)
+      const serverNumber = (match: RegExpMatchArray | null): number | undefined => {
+        const parsed = Number.parseInt(match?.[1] ?? '', 10)
+        return Number.isFinite(parsed) && parsed >= 1024 ? parsed : undefined
+      }
+      const serverBound = serverNumber(windowReported) ?? serverNumber(inputReported)
+      if ((windowReported !== null || inputReported !== null) && inputTokens > 0) {
         try {
           const target = resolveSummarizationTarget(this.config, agent.session)
           if (target !== undefined) {
-            this.ctx.memoryContext.updateModelContext({
-              provider: target.provider,
-              model: target.model,
-              contextWindow: inputTokens,
-              source: 'overflow',
-            })
-            this.ctx.logger.warn(
-              `[ContextGovernor] summarizer overflow 400: adopting real window <= ${inputTokens} `
-                + `for ${target.provider}/${target.model}`,
-            )
+            const route = `${target.provider}/${target.model}`
+            const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
+            const strike = { count: strikes.count + 1, lastAt: Date.now() }
+            this.overflowStrikes.set(route, strike)
+            const adopted = serverBound
+              ?? (strike.count >= 2 ? inputTokens + 4096 : undefined)
+            if (adopted !== undefined) {
+              this.ctx.memoryContext.updateModelContext({
+                provider: target.provider,
+                model: target.model,
+                contextWindow: adopted,
+                source: 'overflow',
+              })
+              this.ctx.logger.warn(
+                `[ContextGovernor] summarizer overflow 400: adopting real window <= ${adopted} `
+                  + `for ${route} (server number ${serverBound === undefined ? 'absent/garbage' : 'plausible'},`
+                  + ` strike ${strike.count})`,
+              )
+            }
           }
         } catch {
           // Overflow learning is best-effort; the fold continues degraded.
@@ -2833,7 +3064,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       next: () => Promise<PreStepDecision>,
     ): Promise<PreStepDecision> => {
       // Periodic cleanup of stale session counters + stale forced-pressure marks
-      this.compressor.cleanupStale()
+      this.evictIdleSessions(this.compressor.cleanupStale())
 
       // --- Tool-result archive (exact-text CCR) ---
       // Stub oversized tool results that appeared since the last pass BEFORE the
@@ -2884,8 +3115,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             ...requestContext.contextWindow === undefined ? {} : { contextWindow: requestContext.contextWindow },
           })
           sessionWindow = ctx.memoryContext.windowForModel(requestContext.model)
+            ?? requestContext.contextWindow
         }
-        const effectiveWindow = sessionWindow ?? ctx.memoryContext.contextWindow
+        // Route-aware to the end: never budget this session off another
+        // model's globally last-observed window.
+        const effectiveWindow = sessionWindow
+          ?? ctx.memoryContext.windowForModelOrDeclared(requestContext?.model)
         // Deep copy here to avoid side effects.
         // Type is Message[] (not UserMessage[]) because compression injects a
         // user-role summary and fallbackTruncate can reshape the array; the
@@ -2940,12 +3175,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           // short-context local model keeps room for the conversation itself
           // (the configured rag_token_budget remains the ceiling for large
           // windows). The task-state block above is paid first.
-          const injectionCap = Math.max(256, Math.min(
+          // The task-state block is paid FIRST; when it consumes the whole
+          // share the RAG cap legitimately reaches zero (a CJK-heavy state
+          // block used to push the cap negative and disable RAG silently —
+          // floor at 0 and skip cleanly instead).
+          const injectionCap = Math.max(0, Math.min(
             this.injectionBudget,
             Math.max(256, Math.floor(effectiveWindow * RAG_WINDOW_SHARE)),
           ) - taskStateTokens)
           const userText = this.latestUserText(currentMessages)
-          if (userText !== undefined) {
+          if (userText !== undefined && injectionCap > 0) {
             const excludeIds = this.lastInjectedIds.get(session)
             const retrieval = await this.retriever.retrieve(
               userText,

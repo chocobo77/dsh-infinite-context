@@ -299,6 +299,11 @@ export class MemoryStore {
     if (path !== IN_MEMORY_STORE) mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL')
+    // node:sqlite's default busy timeout is 0: any concurrent writer (a second
+    // harness instance, a standalone script against the same store) makes every
+    // write throw immediately — including Service.init's backfill transaction,
+    // which would take the whole plugin down. Wait instead of failing.
+    this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memories (
         id                TEXT PRIMARY KEY,
@@ -373,6 +378,10 @@ export class MemoryStore {
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_created ON tool_results (created_at)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results (session_id, created_at)')
+    // findToolResultByCallId runs per oversized node on every archive pass and
+    // SELECT * materializes the payload — without this index each lookup is a
+    // full scan over rows carrying 40k+ char texts.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_call ON tool_results (call_id, created_at)')
     // Context-accounting ledger (see usage-ledger.ts): append-only, pruned by
     // age, and never read by retrieval. One row per measurement.
     this.db.exec(`
@@ -512,7 +521,10 @@ export class MemoryStore {
     // or a stale created_at lets that retention delete a row the live
     // transcript still references — the payload would be unrecoverable.
     this.db.prepare(
-      'UPDATE tool_results SET created_at = ?, call_id = ?, session_id = ? WHERE ref = ?',
+      `UPDATE tool_results SET created_at = ?,
+       call_id = COALESCE(call_id, ?),
+       session_id = COALESCE(session_id, ?)
+       WHERE ref = ?`,
     ).run(record.createdAt, record.callId ?? null, record.sessionId ?? null, record.ref)
     // Backfill a digest computed on a later rewrite, but never overwrite one
     // that is already there.

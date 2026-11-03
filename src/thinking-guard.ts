@@ -261,38 +261,50 @@ export interface ThinkingGuardDeps {
  */
 export function registerThinkingGuard(ctx: Context, deps: ThinkingGuardDeps): () => void {
   return ctx.on('llm/stream', (options: GenerateOptions, next) => {
-    if (!deps.enabled) return next()
-    // Only agent-loop requests are guarded; the plugin's own summarization
-    // calls (purpose 'compaction') are never marked and pass through.
-    if (!deps.isAgentLoopRequest(options)) return next()
-    if (options.sessionId === undefined || options.sessionId.length === 0) return next()
-    const window = deps.windowForSession(options.sessionId)
-    if (window === undefined || window <= 0) return next()
-    const inputTokens = estimateRequestTokens(options)
-    const systemToolsTokens = estimateSystemToolsTokens(options)
-    const guardLine = computeGuardLine(window, inputTokens, systemToolsTokens, deps.maxTokens, deps.ratio)
-    if (guardLine === undefined) return next()
-    if (inputTokens >= guardLine) {
-      // Takeover backstop: the input ALONE already reaches the dynamic line —
-      // force the durable compaction before any generation instead of
-      // streaming one useless (and failing) model call.
-      deps.log(
-        `[ContextGovernor] Thinking guard: input ~${inputTokens} tokens already over the `
-          + `dynamic line ${guardLine} (window ${window}); compacting before generation`,
-      )
-      return (async function* () {
-        yield overflowFinishChunk(
-          `mid-thinking context guard: input ~${inputTokens} tokens already over the dynamic line `
-          + `${guardLine} (window ${window}); compacting durably before generation`,
+    // Fail-open: this listener sits on EVERY agent request, and the session
+    // accessors it calls can throw on partial session objects (the same
+    // reason summarization-target.ts wraps requestContext in try/catch). A
+    // guard bug must degrade to "no guard", never fail the request itself.
+    try {
+      if (!deps.enabled) return next()
+      // Only agent-loop requests are guarded; the plugin's own summarization
+      // calls (purpose 'compaction') are never marked and pass through.
+      if (!deps.isAgentLoopRequest(options)) return next()
+      if (options.sessionId === undefined || options.sessionId.length === 0) return next()
+      const window = deps.windowForSession(options.sessionId)
+      if (window === undefined || window <= 0) return next()
+      const inputTokens = estimateRequestTokens(options)
+      const systemToolsTokens = estimateSystemToolsTokens(options)
+      const guardLine = computeGuardLine(window, inputTokens, systemToolsTokens, deps.maxTokens, deps.ratio)
+      if (guardLine === undefined) return next()
+      if (inputTokens >= guardLine) {
+        // Takeover backstop: the input ALONE already reaches the dynamic line —
+        // force the durable compaction before any generation instead of
+        // streaming one useless (and failing) model call.
+        deps.log(
+          `[ContextGovernor] Thinking guard: input ~${inputTokens} tokens already over the `
+            + `dynamic line ${guardLine} (window ${window}); compacting before generation`,
         )
-      })()
-    }
-    const onTrigger = (outputTokens: number, line: number): void => {
+        return (async function* () {
+          yield overflowFinishChunk(
+            `mid-thinking context guard: input ~${inputTokens} tokens already over the dynamic line `
+            + `${guardLine} (window ${window}); compacting durably before generation`,
+          )
+        })()
+      }
+      const onTrigger = (outputTokens: number, line: number): void => {
+        deps.log(
+          `[ContextGovernor] Thinking guard triggered mid-generation: output ~${outputTokens} reached `
+            + `the dynamic line ${line} (window ${window}, reserve ${window - line}); compacting durably and retrying`,
+        )
+      }
+      return guardedStream(next(), { inputTokens, guardLine, onTrigger })
+    } catch (error) {
       deps.log(
-        `[ContextGovernor] Thinking guard triggered mid-generation: output ~${outputTokens} reached `
-          + `the dynamic line ${line} (window ${window}, reserve ${window - line}); compacting durably and retrying`,
+        '[ContextGovernor] Thinking guard skipped after an internal error: '
+          + (error instanceof Error ? error.message : String(error)),
       )
+      return next()
     }
-    return guardedStream(next(), { inputTokens, guardLine, onTrigger })
   })
 }

@@ -65,9 +65,8 @@ export interface MaintenanceReport {
  * based on the fraction of normalized shared words. Used by the maintenance
  * audit to flag duplicates/conflicts without embedding work.
  */
-function similarityEstimate(a: string, b: string): number {
-  const na = normalizeForDedup(a)
-  const nb = normalizeForDedup(b)
+/** Jaccard-style similarity over PRENORMALIZED texts (see normalizeForDedup). */
+function similarityEstimateNormalized(na: string, nb: string): number {
   if (na.length === 0 || nb.length === 0) return 0
   const tokensA = new Set(na.split(/\s+/))
   const tokensB = new Set(nb.split(/\s+/))
@@ -75,6 +74,10 @@ function similarityEstimate(a: string, b: string): number {
   let overlap = 0
   for (const token of tokensA) if (tokensB.has(token)) overlap++
   return 2 * overlap / (tokensA.size + tokensB.size)
+}
+
+function similarityEstimate(a: string, b: string): number {
+  return similarityEstimateNormalized(normalizeForDedup(a), normalizeForDedup(b))
 }
 
 /** Dependencies the engine needs; all injected for testability. */
@@ -141,11 +144,28 @@ export class MemoryEngine {
   loadFromStore(): number {
     const all = this.store.list()
     let loaded = 0
+    let dimensionMismatches = 0
     for (const doc of all) {
       if (doc.embedding !== undefined && doc.embedding.length > 0) {
+        // An embedder kind/dimension switch (lightweight-256 → transformers-384)
+        // makes old-dimension vectors score 0 against everything: silently
+        // indexing them would make those memories permanently un-retrievable
+        // AND defeat semantic dedup (the same content re-ingests under the new
+        // dimension). Skip and say so instead.
+        if (doc.embedding.length !== this.embedder.dimension) {
+          dimensionMismatches++
+          continue
+        }
         this.index.add(doc.id, doc.embedding)
         loaded++
       }
+    }
+    if (dimensionMismatches > 0) {
+      this.onWarn?.(
+        `${dimensionMismatches} stored memor${dimensionMismatches === 1 ? 'y' : 'ies'} have `
+          + `${this.embedder.dimension}-mismatched embedding vectors (embedder was switched?) — `
+          + 'skipped from the index; re-ingest or reset to rebuild them',
+      )
     }
     return loaded
   }
@@ -450,6 +470,10 @@ export class MemoryEngine {
       if (list === undefined) byKind.set(key, [doc])
       else list.push(doc)
     }
+    // Normalize once per doc: the pairwise loop below used to re-run the
+    // regex-heavy normalizeForDedup on BOTH texts for every pair (O(n²) full
+    // passes over whole memory texts).
+    const normalized = new Map(all.map(doc => [doc.id, normalizeForDedup(doc.text)]))
     for (const docs of byKind.values()) {
       for (let i = 0; i < docs.length; i++) {
         for (let j = i + 1; j < docs.length; j++) {
@@ -457,7 +481,7 @@ export class MemoryEngine {
           const b = docs[j]
           const key = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`
           if (seen.has(key)) continue
-          const score = similarityEstimate(a.text, b.text)
+          const score = similarityEstimateNormalized(normalized.get(a.id) ?? '', normalized.get(b.id) ?? '')
           if (score >= 0.85) {
             seen.add(key)
             if (score >= 0.95) {

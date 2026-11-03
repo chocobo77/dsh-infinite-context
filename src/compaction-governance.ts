@@ -172,10 +172,12 @@ export const GOV_IMPORTANCE_KEEP_COS = 0.35
 export const GOV_TARGET_DEVIATION_ALPHA = 0.5
 /**
  * Cap on the learned correction, as a share of the basis. 0.12 keeps the
- * pre-compensated retain at ≥ 0.43×basis on the normal 0.55 memory floor and
- * bottoms out at {@link GOV_TARGET_FLOOR} (0.25) even on the deep-probe floor
- * (0.35), so the feedback can only WIDEN the effective band inside the hard
- * bounds — it never crosses the watermark envelope or empties the memory.
+ * pre-compensated retain at ≥ 0.43×basis on the normal 0.55 memory floor; the
+ * correction NEVER crosses the memory floor itself (0.55, or 0.35 under the
+ * deep probe — `Math.max(raw − corr, memoryFloor)`), so the feedback can only
+ * WIDEN the effective band down to the floor, never empty the memory. (The
+ * 0.25 {@link GOV_TARGET_FLOOR} hard floor is a lower bound of the envelope,
+ * not the landing bottom.)
  */
 export const GOV_TARGET_DEVIATION_MAX = 0.12
 
@@ -261,9 +263,9 @@ export const GOV_DEEP_PROBE_MAX_WINDOW_FILL = 0.4
  */
 export const GOV_DEEP_PROBE_MIN_MAGNITUDE = 0.5
 /**
- * Relaxed memory floor for the deep probe. ~0.35 keeps the landing well above
- * the hard {@link GOV_TARGET_FLOOR} (0.25) even after the maximum landing
- * deviation correction (0.35 − 0.12 = 0.23, clamped to 0.25).
+ * Relaxed memory floor for the deep probe. The landing bottoms out AT this
+ * floor: the deviation correction is clamped by `Math.max(raw − corr, floor)`,
+ * so it never lands below 0.35×basis even after the maximum 0.12 correction.
  */
 export const GOV_DEEP_PROBE_MEMORY_FLOOR = 0.35
 /**
@@ -446,11 +448,24 @@ export function compactionWaterLevels(input: WaterLevelInput): WaterLevels {
   const targetRatio = Math.min(maxTarget, Math.max(b.targetFloor, triggerRatio - band))
 
   const injection = Number.isFinite(input.injectionBudget) ? Math.max(0, input.injectionBudget as number) : 0
+  // Token-space floors: the per-turn injection (RAG + task-state) is
+  // subtracted from the ratio-space levels, and on a small window that
+  // subtraction annihilates them (trigger 1 / target 0 on a 4k window —
+  // fold-every-step with zero verbatim retention, voiding the floor's
+  // contract). The floors therefore hold in TOKEN space: the injection is
+  // capped to what can be spent beyond them. The trigger floor uses
+  // min(floor, ratio) so a deliberately low anchor stays respected.
+  const triggerFloorTokens = Math.floor(budget * Math.min(b.triggerFloor, triggerRatio))
+  const targetFloorTokens = Math.floor(budget * b.targetFloor)
+  const cappedInjection = Math.min(
+    injection,
+    Math.max(0, Math.floor(budget * triggerRatio) - triggerFloorTokens),
+  )
   return {
     triggerRatio,
     targetRatio,
-    triggerTokens: Math.max(0, Math.floor(budget * triggerRatio) - injection),
-    targetTokens: Math.max(0, Math.floor(budget * targetRatio) - injection),
+    triggerTokens: Math.max(triggerFloorTokens, Math.floor(budget * triggerRatio) - cappedInjection),
+    targetTokens: Math.max(targetFloorTokens, Math.floor(budget * targetRatio) - cappedInjection),
   }
 }
 
@@ -530,8 +545,11 @@ export function toSurfaceSnapshot(input: SurfaceSnapshotInput): SurfaceSnapshot 
 /* -------------------------------------------------------------------------- */
 /*  Unified planner                                                            */
 /*  ONE policy function decides lane + water levels for a step. Each hook      */
-/*  calls it with its own capabilities, so the two executors can never use      */
-/*  different rules.                                                           */
+/*  calls it with its own capabilities, so the two executors can never use     */
+/*  different rules. (Status: the FOLD lane is fully wired through             */
+/*  planFoldCompaction; the durable lane still runs its legacy                 */
+/*  decidePressureCompaction curve — planCompaction's durable branches are     */
+/*  the wiring target, not yet the runtime.)                                   */
 /* -------------------------------------------------------------------------- */
 
 /** fit-guard reserve as a share of the window (replaces a fixed constant). */
@@ -559,7 +577,9 @@ export interface FoldBudgetInput {
  * collapse the budget to one token, which is not a plan: the fold trigger and
  * target both become meaningless. Keep a minimum prompt share, clamp the
  * completion reserve to what the window can actually spare, and never return
- * less than one token.
+ * less than one token. (The share is bounded by the caller's headroom: a
+ * headroom ≥ window − minBudget — a misconfiguration — can still push the
+ * result below the share; the caller owns that knob.)
  * @param input - window, requested completion reserve and plugin headroom.
  * @returns the usable prompt budget in tokens (>= 1).
  */
@@ -576,6 +596,38 @@ export function foldPressureBudget(input: FoldBudgetInput): number {
     : 0
   const reserve = Math.min(requested, maxReserve)
   return Math.max(1, Math.floor(window - reserve - headroom))
+}
+
+/**
+ * Completion reserve substituted for a PLACEHOLDER request cap.
+ *
+ * A `maxTokens` declared at (or above) the whole window is the "never
+ * truncate" setting, not a completion budget — it carries no usable
+ * information about how much room the next completion needs, yet honored raw
+ * it clamps to a quarter of the window and silently halves the fold budget
+ * (the 2026-11 Ubuntu low-water diagnosis: `maxTokens: 128000` on a 128000
+ * window folded at ~40% of the real context). 8192 covers a generous agent
+ * completion; `foldPressureBudget` still clamps it for windows too small to
+ * spare that much.
+ */
+export const GOV_PLACEHOLDER_COMPLETION_RESERVE = 8192
+
+/**
+ * The completion reserve a request cap contributes to the fold budget.
+ *
+ * A sane cap (0 < cap < window) passes through untouched — honest-aggressive
+ * caps included; the min-prompt-share clamp keeps its promised floor for
+ * them. Anything else (a cap at or above the window, an absent cap whose
+ * model default is unknown) degrades to
+ * {@link GOV_PLACEHOLDER_COMPLETION_RESERVE} and never to 0: a zero reserve
+ * levels the fold budget with the durable lane's, and the durable lane would
+ * then win every race.
+ */
+export function completionReserveOf(declaredMaxTokens: number, window: number): number {
+  if (Number.isFinite(declaredMaxTokens) && declaredMaxTokens > 0 && declaredMaxTokens < window) {
+    return declaredMaxTokens
+  }
+  return GOV_PLACEHOLDER_COMPLETION_RESERVE
 }
 
 /**
@@ -650,8 +702,12 @@ export function summaryCharBudget(shadowedTokens: number, share = 0.3): number {
 export function failureCooldownFor(current: number, errorMessage: string, transientCooldown = 3): number {
   const configError = /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort|TargetPressureConfigError|no message budget|leaving no pressure budget/i
     .test(errorMessage)
-  if (configError) return Math.max(Number.isFinite(current) ? current : 0, GOV_CONFIG_ERROR_COOLDOWN)
-  return Math.max(1, Math.floor(transientCooldown))
+  // Both branches take max(current, …): a transient error must not SHORTEN a
+  // longer cooldown already in force (a 60-round config backoff decaying via
+  // round-decrements must not snap to 3 because one network timeout followed).
+  const guardedCurrent = Number.isFinite(current) ? current : 0
+  if (configError) return Math.max(guardedCurrent, GOV_CONFIG_ERROR_COOLDOWN)
+  return Math.max(guardedCurrent, 1, Math.floor(transientCooldown))
 }
 /** Single-round growth (share of window) that bypasses the round rate limit. */
 export const GOV_SURGE_RATIO = 0.2
@@ -756,7 +812,8 @@ export interface GovernanceInput {
   /**
    * Denominator for the water levels. The durable lane measures the whole
    * request against the WINDOW; the fold lane measures the surface against its
-   * effective BUDGET (window × (1 − headroom)). Defaults to `snapshot.window`.
+   * effective BUDGET (foldPressureBudget: window − completion reserve −
+   * headroom). Defaults to `snapshot.window`.
    */
   readonly basisTokens?: number
   /**
@@ -925,8 +982,16 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     b.targetDeviationMax,
   )
   const targetRatio = Math.max(rawTargetRatio - deviationCorrection, memoryFloor)
-  const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - injection)
-  const targetTokens = Math.max(0, Math.floor(basis * targetRatio) - injection)
+  // Token-space floors (see compactionWaterLevels): the per-turn injection
+  // must not spend the memory floor. The cap keeps trigger ≥ target ≥ floor
+  // ordering intact even when the injection exceeds everything else.
+  const memoryFloorTokens = Math.floor(basis * memoryFloor)
+  const cappedInjection = Math.min(
+    injection,
+    Math.max(0, Math.floor(basis * triggerRatio) - memoryFloorTokens),
+  )
+  const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - cappedInjection)
+  const targetTokens = Math.max(memoryFloorTokens, Math.floor(basis * targetRatio) - cappedInjection)
   const surfaceTriggerTokens = triggerTokens
   const targetSurfaceTokens = targetTokens
 
@@ -973,7 +1038,11 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
   const turn = Number.isFinite(ledger.turn) ? ledger.turn : 0
   const lastTurn = ledger.lastCompressedTurn
   const roundsSince = lastTurn === undefined ? Number.POSITIVE_INFINITY : turn - lastTurn
-  const interval = Math.max(1, input.compressInterval)
+  // NaN guard: Math.max(1, NaN) is NaN, and every `>= interval` comparison
+  // against NaN is false — a fresh, nearly-full session would plan
+  // `rate-limited` forever (the same input IS guarded in
+  // compactionWaterLevels; mirror it here).
+  const interval = Number.isFinite(input.compressInterval) ? Math.max(1, input.compressInterval) : 1
   const delta = ledger.lastTokens === undefined
     ? Number.NEGATIVE_INFINITY
     : measured - ledger.lastTokens
@@ -994,8 +1063,13 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     && roundsSince >= interval
   ) return recommend('fold', 'nudge')
 
-  // Legacy order: below-trigger is decided BEFORE the cooldown.
-  if (measured <= triggerTokens) return recommend('none', 'below-trigger')
+  // Legacy order: below-trigger is decided BEFORE the cooldown. A non-finite
+  // measurement degrades to below-trigger (the conservative exit) — a naive
+  // `measured <= trigger` is false for NaN and would plan a positive fold
+  // from garbage.
+  if (!Number.isFinite(measured) || measured <= triggerTokens) {
+    return recommend('none', 'below-trigger')
+  }
   if (ledger.failureCooldown > 0) return recommend('none', 'cooldown')
   if (surge) return recommend(input.incomingTrigger === 'pressure' ? 'durable' : 'fold', 'surge')
   if (roundsSince >= interval) {
@@ -1067,7 +1141,7 @@ export interface FoldPlanInput {
   readonly baseTriggerRatio: number
   readonly baseTargetRatio: number
   readonly compressInterval: number
-  /** Fold basis: the effective budget = window × (1 − headroom). */
+  /** Fold basis: the effective budget = window − completion reserve − headroom. */
   readonly budgetTokens: number
   readonly injectionBudget: number
   readonly nudge: boolean

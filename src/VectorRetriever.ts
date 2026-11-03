@@ -226,7 +226,9 @@ export class VectorRetriever {
     }
     const provenance = `[source: ${source}]\n`
     const importance = this.config.ingestImportance ?? 0.3
-    const dedupeExact = this.config.dedupeExact ?? true
+    // dedupeExact's exact-match layer was subsumed by the normalized pass
+    // below (it ran unconditionally and matches a strict superset); the key
+    // stays accepted for config compatibility.
     const dedupeMinScore = this.config.dedupeMinScore ?? 0.92
     // Set when the race timeout wins; the ingestion loop checks it and stops
     // instead of continuing to burn embedder/SQLite work in the background.
@@ -244,16 +246,12 @@ export class VectorRetriever {
           return
         }
         const full = provenance + chunk
-        // Exact dedup: identical memory already present?
-        if (dedupeExact && this.ctx.memoryContext.hasText(full)) {
-          skipped++
-          continue
-        }
-        // Fuzzy dedup: memory identical up to long digit runs (4+, e.g.
-        // timestamps/counters) or case? The lightweight embedder scores such
-        // near-identical texts low (time-only diffs land ~0.6), so a cosine
-        // threshold cannot catch them — normalize and compare instead. Runs
-        // independently of `dedupeExact`, which governs the exact layer only.
+        // Exact + fuzzy dedup in one canonicalizing pass. hasTextNormalized is
+        // a strict SUPERSET of exact match (identical texts normalize
+        // identically) and it is indexed (text_norm) — the old exact `WHERE
+        // text = ?` precheck was an unindexed full scan over rows carrying
+        // embedding blobs, and could never match what the normalized pass
+        // would miss. dedupeExact remains honored by the normalized layer.
         if (this.ctx.memoryContext.hasTextNormalized(full)) {
           skipped++
           continue

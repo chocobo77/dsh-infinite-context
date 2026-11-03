@@ -460,7 +460,12 @@ export interface MemoryCompactionConfig {
   rag_token_budget?: number
   /** RAG ingestion: semantic chunk size in characters. */
   rag_chunk_size?: number
-  /** RAG ingestion: skip exact-duplicate chunks (default true). */
+  /**
+   * RAG ingestion: skip exact-duplicate chunks (default true).
+   * @deprecated Accepted for compatibility; the normalized dedup pass
+   * (rag_dedupe_min_score's companion, always on) matches a strict superset
+   * of exact duplicates, so this key has no observable effect.
+   */
   rag_dedupe_exact?: boolean
   /** RAG ingestion: skip chunks whose nearest memory scores >= this (0 disables). */
   rag_dedupe_min_score?: number

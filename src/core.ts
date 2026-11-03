@@ -40,6 +40,7 @@ export {
 export {
   ModelContextTracker,
   PROBE_RETRY_MS,
+  PROBE_MAX_FAILURES,
   type ModelContextAdoption,
   type ModelRouteObservation,
 } from './model-context.ts'
@@ -118,7 +119,9 @@ export {
   type SurfaceSnapshotInput,
   type WaterLevels,
   GOV_MIN_PROMPT_SHARE,
+  GOV_PLACEHOLDER_COMPLETION_RESERVE,
   GOV_CONFIG_ERROR_COOLDOWN,
+  completionReserveOf,
   failureCooldownFor,
   foldPressureBudget,
   minimumFoldTokens,

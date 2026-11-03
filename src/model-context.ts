@@ -31,6 +31,14 @@ export interface ModelContextAdoption {
  */
 export const PROBE_RETRY_MS = 60_000
 
+/**
+ * Give up auto-probing a model after this many "answered but reported no
+ * window" probes (≈10 min of retries at the cooldown). A server that never
+ * advertises a context field would otherwise be probed forever. A manual
+ * `memory_model_probe` clears the count and always tries.
+ */
+export const PROBE_MAX_FAILURES = 10
+
 /** Tracks the effective model context window and probe-once-per-model state. */
 export class ModelContextTracker {
   private modelContext: ModelContextInfo | null = null
@@ -45,6 +53,8 @@ export class ModelContextTracker {
   private readonly resolvedModels = new Set<string>()
   /** Last probe attempt per model (for the retry cooldown). */
   private readonly lastProbeAttempt = new Map<string, number>()
+  /** "Answered but no window reported" count per model (give-up cap). */
+  private readonly probeFailures = new Map<string, number>()
   private readonly fallbackWindow: number
   private readonly probeEnabled: boolean
 
@@ -127,16 +137,46 @@ export class ModelContextTracker {
     contextWindow: number
     source: ModelContextSource
   }): void {
-    if (info.model === undefined) return
+    // Guard the falsy case, not just undefined: an empty-string id would
+    // create a registry entry that every model-less `windowFor('')` read
+    // would pick up.
+    if (!info.model) return
     if (!Number.isSafeInteger(info.contextWindow) || info.contextWindow <= 0) return
     const existing = this.windowsByModel.get(info.model)
+    // An 'overflow' bound is a HEURISTIC estimate (the plugin's own token
+    // estimate of the rejected text, or a server error number), not a
+    // measurement: it may not NARROW an explicit config pin (modelWindows),
+    // which the operator declared authoritatively — a transient busy-server
+    // 400 answering "context size (32)" must not pin a pinned model. A live
+    // 'probe' may narrow it: that is the documented modelWindows design (the
+    // pin declares the catalog value, the probe corrects it to the runtime).
+    if (existing !== undefined && existing.source === 'config'
+      && info.source === 'overflow' && info.contextWindow < existing.contextWindow) {
+      return
+    }
     const wider = existing !== undefined && info.contextWindow > existing.contextWindow
-    // Narrow-only, with two exceptions: 'config' (an explicit override is the
-    // operator's word) and 'overflow' WIDENING (self-healing — the call
-    // SUCCEEDED carrying more tokens than the recorded bound, which is its
-    // own evidence that a transient busy-server narrowing was too tight).
-    if (wider && info.source !== 'config' && info.source !== 'overflow') return
-    if (existing !== undefined && info.contextWindow === existing.contextWindow) return
+    // Narrow-only, with three exceptions:
+    // - 'config' — the operator's word, may always (re)write.
+    // - 'overflow' WIDENING its OWN earlier record (self-healing — a call
+    //   SUCCEEDED carrying more tokens than the recorded bound).
+    // - 'probe' WIDENING a provisional 'overflow' estimate-bound: the probe
+    //   is a live measurement, the overflow bound an inference from a
+    //   heuristic estimate. Without this a too-tight bound could never be
+    //   corrected — the plan clamps future inputs below it, so no success
+    //   could ever refute it, and the fit-guard would hammer against it
+    //   forever. A probe still never widens a declaration or a config pin.
+    if (wider && info.source !== 'config'
+      && !(info.source === 'overflow' && existing?.source === 'overflow')
+      && !(info.source === 'probe' && existing?.source === 'overflow')) return
+    if (existing !== undefined && info.contextWindow === existing.contextWindow) {
+      // Same window from a different route: refresh the provider attribution —
+      // which server PRODUCED the evidence matters for locality checks and
+      // for aiming a manual re-probe.
+      if (info.provider !== undefined && info.provider !== existing.provider) {
+        this.windowsByModel.set(info.model, { ...existing, provider: info.provider })
+      }
+      return
+    }
     this.windowsByModel.set(info.model, {
       ...(info.provider === undefined ? {} : { provider: info.provider }),
       model: info.model,
@@ -176,12 +216,33 @@ export class ModelContextTracker {
       })
     }
     const model = route.model
-    if (model === undefined || !this.probeEnabled || options.probe === false) return undefined
+    if (model === undefined || model.length === 0 || !this.probeEnabled || options.probe === false) {
+      return undefined
+    }
     if (this.resolvedModels.has(model)) return undefined
+    // Give up after repeated "answered but reported no window" probes: a
+    // server that never advertises a context field would otherwise be
+    // re-probed every cooldown forever (two requests per attempt).
+    if ((this.probeFailures.get(model) ?? 0) >= PROBE_MAX_FAILURES) return undefined
     const lastAttempt = this.lastProbeAttempt.get(model) ?? 0
     if (Date.now() - lastAttempt < PROBE_RETRY_MS) return undefined
     this.lastProbeAttempt.set(model, Date.now())
     return model
+  }
+
+  /**
+   * Record one probe that ran but reported no usable window (the model is
+   * loaded, the server answered — it just never advertises a context field).
+   * Counted toward {@link PROBE_MAX_FAILURES}; a probe that THREW does not
+   * count (a downed server is transient and must keep being retried).
+   */
+  noteProbeFailure(model: string): void {
+    this.probeFailures.set(model, (this.probeFailures.get(model) ?? 0) + 1)
+  }
+
+  /** Clear the failure count for one model (a manual probe always tries). */
+  clearProbeFailures(model: string): void {
+    this.probeFailures.delete(model)
   }
 
   /**
@@ -193,6 +254,7 @@ export class ModelContextTracker {
   markResolved(model: string): void {
     this.resolvedModels.add(model)
     this.lastProbeAttempt.delete(model)
+    this.probeFailures.delete(model)
   }
 
   /**

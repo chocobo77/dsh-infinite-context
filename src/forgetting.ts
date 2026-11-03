@@ -68,7 +68,10 @@ export class ForgettingPolicy {
   selectToForget(docs: readonly MemoryDoc[], now: number): MemoryDoc[] {
     const scored = docs
       .map(doc => ({ doc, score: this.score(doc, now) }))
-      .sort((a, b) => a.score - b.score) // worst first
+      // Worst first; ties drop the OLDER memory first (the store lists
+      // newest-first, so a naive tie order would retire the freshest
+      // memories — e.g. halfLifeDays: 0 makes every score tie).
+      .sort((a, b) => (a.score - b.score) || (a.doc.createdAt - b.doc.createdAt))
     const toDrop = new Set<string>()
     for (const { doc, score } of scored) {
       if (score < this.config.minScore) toDrop.add(doc.id)
