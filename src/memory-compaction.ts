@@ -1137,7 +1137,18 @@ function fallbackTruncate(
  * skipped entirely.
  */
 interface SpeculativeSummary {
+  /** Full-input fingerprint (roles+texts+tool names) — layer-1 range check. */
   readonly fingerprint: number
+  /**
+   * Region-message fingerprint (roles+texts only, no preamble, no tools) —
+   * the consume contract. The full-input hash compares the BASE engine's
+   * rebuilt input against the plugin's own builder; any preamble or tool
+   * churn between prepare and consume breaks it (production: 0 hits in 11
+   * launches, every fold paying a blocking live call). The summary stays
+   * valid exactly while the region MESSAGES are verbatim — that, and only
+   * that, is what the consume must verify.
+   */
+  readonly regionFingerprint: number
   readonly summary: ContentBlock[]
   readonly start: SessionSeq
   readonly end: SessionSeq
@@ -1155,6 +1166,20 @@ export function summarizationFingerprint(input: SummarizationInput): number {
     tools: input.tools === undefined ? null : input.tools.map(tool => tool.name),
     messages: input.messages.map(message => [message.role, messageText(message)]),
   }))
+}
+
+/**
+ * Fingerprint of the folded messages PROPER: role+text projection, no tool
+ * names, no leading system preamble. This is the speculation consume
+ * contract: a prepared summary stays valid exactly while these messages are
+ * verbatim. The base engine rebuilds the input with its own preamble (own
+ * system prompt) under the request's CURRENT header — any preamble or
+ * tool-churn difference between prepare and consume breaks the full-input
+ * hash without invalidating a single folded word, so the consume verifies
+ * the region projection instead.
+ */
+export function regionMessagesFingerprint(messages: readonly Message[]): number {
+  return fnv1a(JSON.stringify(messages.map(message => [message.role, messageText(message)])))
 }
 
 /** The multi-tier memory compaction backend. */
@@ -1839,17 +1864,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
           + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
       }
-      // Forced-door stall: after repeated fold failures the fit-guard reason
-      // (downgraded to a fold by the capability table) stands down too — the
-      // probe path re-verifies the narrowed record in the meantime.
-      if (plan.reason === 'fit-guard') {
-        const stall = this.forcedFoldsStalled.get(sessionId)
-        if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
-          && now - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
-          diag(`fit-guard-stall:${stall.count};surf=${snapshot.surfaceTokens}`)
-        }
-        return null
-      }
       // Close to the trigger but not a clean seam: precompute the fold
       // summary in the background so the eventual fold does not block. The
       // rejection is contained here — an unhandled promise rejection would
@@ -1864,6 +1878,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           diag('spec-error:' + brief)
         })
       return null
+    }
+    // Forced-door stall: the fit-guard reason arrives DOWNGRADED to the fold
+    // lane (fold-only capabilities), and it bypasses the failure cooldown and
+    // the frequency gate by design — this ledger is its only brake. After
+    // repeated barren or failed attempts, stand down for the backoff window;
+    // the probe path re-verifies the narrowed record in the meantime.
+    if (plan.reason === 'fit-guard') {
+      const stall = this.forcedFoldsStalled.get(sessionId)
+      if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
+        diag(`fit-guard-stall:${stall.count};surf=${snapshot.surfaceTokens}`)
+        return null
+      }
     }
     // Frequency gate: a routine fold must not fire again within a short
     // window. Force, surge and the fit-guard still bypass it. The window is
@@ -1968,7 +1995,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
     // node); treat it as unknown and let compaction-basic's own size check decide.
     if (!force && foldTokens > 0 && foldTokens < minFoldTokens) {
-      diag(`small-fold:${foldTokens}<${minFoldTokens};escalated=${pressured};surf=${snapshot.surfaceTokens};`
+      diag(`small-fold:${foldTokens}<${minFoldTokens};escalated=${escalated};surf=${snapshot.surfaceTokens};`
         + `target=${plan.targetSurfaceTokens};`
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
       return null
@@ -2478,9 +2505,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const specTokens = estimateTokens(specInput.messages.map(message => messageText(message)).join('\n'))
       if (input.snapshot.totalTokens + specTokens > realWindow) return
       const fingerprint = summarizationFingerprint(specInput)
+      const regionFingerprint = regionMessagesFingerprint(shadowedMessages(specInput))
       this.speculativeInFlight.add(input.sessionId)
       const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
-      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, timeoutMs)
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, timeoutMs)
       return
     }
     // REFRESH: merge the delta (everything after the cached range end) into
@@ -2499,10 +2527,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // tight server skip instead of firing a merge that cannot succeed.
     // The entry survives; the refresh retries on a later pass.
     if (input.snapshot.totalTokens + mergeTokens > realWindow) return
-    const mergedFingerprint = summarizationFingerprint(this.buildRegionInput(input.session, range.start, range.end))
+    // Both fingerprints cover the REFRESHED entry's true region: the entry
+    // keeps previous.start, so a full-input hash over range.start would make
+    // every refreshed entry miss the layer-1 range check at consume time.
+    const refreshedRegion = this.buildRegionInput(input.session, existing.start, range.end)
+    const mergedFingerprint = summarizationFingerprint(refreshedRegion)
+    const mergedRegionFingerprint = regionMessagesFingerprint(shadowedMessages(refreshedRegion))
     this.speculativeInFlight.add(input.sessionId)
     const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
-    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, timeoutMs, existing)
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, timeoutMs, existing)
   }
 
   /**
@@ -2551,6 +2584,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     range: { start: SessionSeq; end: SessionSeq },
     specInput: SummarizationInput,
     fingerprint: number,
+    regionFingerprint: number,
     deadlineMs: number,
   ): Promise<void> {
     const record = (detail: string): void => {
@@ -2565,13 +2599,21 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // super.summarize = the RAW summarizer (no resilience fallback, no
       // post-processing): a failed speculation is dropped silently, and the
       // committing fold then runs the live path with its own telemetry.
-      const result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      // ONE bounded retry: local models intermittently return an empty
+      // summary (reasoning-only output) — a second attempt with a fresh
+      // deadline recovers it cheaply, and the call is optional anyway.
+      let result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) {
+        record('speculative:empty-retry')
+        result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      }
       if (result.summary.length === 0) {
         record('speculative:empty')
         return
       }
       this.speculative.set(sessionId, {
         fingerprint,
+        regionFingerprint,
         summary: result.summary,
         start: range.start,
         end: range.end,
@@ -2598,6 +2640,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     endNow: SessionSeq,
     mergeInput: SummarizationInput,
     mergedFingerprint: number,
+    mergedRegionFingerprint: number,
     deadlineMs: number,
     previous: SpeculativeSummary,
   ): Promise<void> {
@@ -2610,13 +2653,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     record('speculative:refresh-merge')
     try {
-      const result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      // Same one bounded retry as the launch path: an empty merge result is
+      // usually a transient local-model answer, and the previous checkpoint
+      // would otherwise be dropped for nothing (the entry is replaced only
+      // on success, so a failed merge leaves the old checkpoint standing).
+      let result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) {
+        record('speculative:refresh-empty-retry')
+        result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      }
       if (result.summary.length === 0) {
         record('speculative:refresh-empty')
         return
       }
       this.speculative.set(sessionId, {
         fingerprint: mergedFingerprint,
+        regionFingerprint: mergedRegionFingerprint,
         summary: result.summary,
         start: previous.start,
         end: endNow,
@@ -2899,15 +2951,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
-    // Consume a speculative summary when the input fingerprint matches: the
+    // Consume a speculative summary when the REGION MESSAGES match: the
     // summary LLM call already ran in the background, so the fold commits
     // without blocking on it. One-shot: consumed or mismatched, the entry is
     // gone (a miss falls through to the live summarizer with its telemetry).
+    // The contract is the region projection, NOT the full-input hash: the
+    // base engine rebuilds the input under its own preamble and the request's
+    // CURRENT header, so tool churn or a preamble tweak between prepare and
+    // consume breaks the full hash while every folded word stays identical
+    // (production evidence: 0 hits in 11 launches, all on preamble drift).
     const sessionIdStr = String(agent.session.id)
     const speculation = this.speculative.get(sessionIdStr)
     if (speculation !== undefined) {
       this.speculative.delete(sessionIdStr)
-      if (summarizationFingerprint(input) === speculation.fingerprint) {
+      if (regionMessagesFingerprint(shadowedMessages(input)) === speculation.regionFingerprint) {
         this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:hit' })
         // A precomputed summary is a genuine live-LLM result: record it so the

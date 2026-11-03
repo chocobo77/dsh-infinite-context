@@ -111,7 +111,17 @@ export class ModelContextTracker {
    * resolved, capping by it under-caps the probed model permanently.
    */
   probeCeilingFor(model: string, fallback: number): number {
-    return this.windowsByModel.get(model)?.contextWindow ?? fallback
+    const recorded = this.windowsByModel.get(model)
+    // Only an AUTHORITATIVE declaration (operator config or the route's
+    // declared context window) caps a fresh probe. A measurement must not:
+    // an 'overflow' estimate is exactly the heuristic this probe exists to
+    // correct — capping the probe at a poisoned ~20k bound would make the
+    // fit-guard's re-probe unable to ever clear it.
+    if (recorded === undefined) return fallback
+    if (recorded.source === 'config' || recorded.source === 'request-context') {
+      return recorded.contextWindow
+    }
+    return fallback
   }
 
   /** All per-model windows currently known, in insertion order. */
