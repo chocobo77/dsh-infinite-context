@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { estimateTokens } from './token-budget.ts'
+import { redactCredentials } from './redact.ts'
 
 /** Configuration for the vector retriever. */
 export interface VectorRetrieverConfig {
@@ -245,7 +246,10 @@ export class VectorRetriever {
           )
           return
         }
-        const full = provenance + chunk
+        // Redact BEFORE dedup/embed/store: the memory store and every
+        // later retrieval re-send this text; the raw payload stays only in
+        // the tr_ archive (reversibility contract, local store).
+        const full = redactCredentials(provenance + chunk)
         // Exact + fuzzy dedup in one canonicalizing pass. hasTextNormalized is
         // a strict SUPERSET of exact match (identical texts normalize
         // identically) and it is indexed (text_norm) — the old exact `WHERE

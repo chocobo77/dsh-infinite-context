@@ -24,6 +24,8 @@
  * @module dsh-infinite-context/task-state
  */
 
+import { redactCredentials } from './redact.ts'
+
 /** Marker for the injected block; mirrors the conciseness directive's style. */
 export const TASK_STATE_MARKER = 'scope="dsh-infinite-context:task-state"'
 
@@ -161,7 +163,9 @@ export function buildTaskStateBlock(input: TaskStateInput): string | undefined {
     lines.push(section.label + ':', ...body)
     used += cost
   }
-  const text = lines.join('\n')
+  // Secrets typed mid-session (the production case: a sudo password) must
+  // not be re-injected into every later turn via the task-state block.
+  const text = redactCredentials(lines.join('\n'))
   // The marker line alone carries no state.
   return lines.length > 1 ? text : undefined
 }

@@ -25,6 +25,7 @@ export { TokenBudget, estimateTokens } from './token-budget.ts'
 export { ForgettingPolicy, recencyFactor, scoreMemory } from './forgetting.ts'
 export { MemoryEngine, type MemoryEngineDeps, type StoreMemoryOptions, type SummarizeFn, type MaintenanceReport } from './memory-engine.ts'
 export { oneLine } from './strings.ts'
+export { REDACTED, redactCredentials } from './redact.ts'
 export {
   probeModelContext,
   probeLlama,

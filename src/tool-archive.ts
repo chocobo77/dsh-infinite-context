@@ -28,6 +28,7 @@ import type { Session, SessionEvent, SessionSeq, ToolResultMessage } from '@deep
 import type {} from '@deepseek-ai/dsh-compaction'
 import type { ToolResultMeta, ToolResultRecord } from './memory-store.ts'
 import { DEFAULT_ABSORB_OPTIONS, buildDigest } from './absorb.ts'
+import { redactCredentials } from './redact.ts'
 import type { AbsorbOptions } from './absorb.ts'
 
 /**
@@ -327,8 +328,11 @@ export class ToolResultArchive {
     // distilling but sits just under the archive threshold still contributes
     // its signal lines (to the stub policy and to the caller).
     const digest = buildDigest(tool, text, this.absorbOptions)
+    // The digest becomes the surface stub AND a memory — redact it; the
+    // archived full text stays verbatim (the reversibility contract).
+    const redactedDigest = digest === null ? null : redactCredentials(digest)
     if (chars <= this.options.thresholdChars) {
-      return digest === null ? null : { chars, inserted: false, digest }
+      return redactedDigest === null ? null : { chars, inserted: false, digest: redactedDigest }
     }
     const ref = archiveRef(text)
     let inserted: boolean

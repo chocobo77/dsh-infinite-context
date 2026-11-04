@@ -98,6 +98,7 @@ import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
+import { redactCredentials } from './redact.ts'
 import {
   GOV_GUARD_RESERVE_MIN,
   GOV_MIN_NET_SAVING_RATIO,
@@ -1236,6 +1237,22 @@ export function speculationAnchorsAlive(
     if (seq === end) endAlive = true
   }
   return startAlive && endAlive
+}
+
+/**
+ * Redact credential-shaped secrets from a summary's text blocks. The
+ * checkpoint is re-injected into model context on every later turn and
+ * persisted into the memory store — the amplification point for anything the
+ * user or a tool result carried. Applied at the summarize() exits so the
+ * live, speculative-consumed and extractive paths all share one choke point.
+ */
+function redactedSummary(result: SummaryResult): SummaryResult {
+  return {
+    ...result,
+    summary: result.summary.map(block => isTextBlock(block)
+      ? { ...block, text: redactCredentials(block.text) }
+      : block),
+  }
 }
 
 /** The multi-tier memory compaction backend. */
@@ -2882,7 +2899,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // Diagnostics must never break the degraded path.
       }
     }
-    return outcome.value
+    return redactedSummary(outcome.value)
   }
 
   /**
@@ -2927,7 +2944,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // fold path publishes the route prior (the flag would otherwise hold a
         // STALE value from an earlier call and wrongly suppress publishing).
         this.lastSummarizeDegraded.set(agent, false)
-        return { summary: speculation.summary, provider: 'precomputed', model: 'speculative' }
+        return redactedSummary({ summary: speculation.summary, provider: 'precomputed', model: 'speculative' })
       }
       // Mismatch: the caller may be ANOTHER LANE. summarize() serves the
       // durable/base compaction too, and that lane shadows a DIFFERENT range
