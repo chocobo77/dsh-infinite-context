@@ -1140,8 +1140,8 @@ interface SpeculativeSummary {
   /** Full-input fingerprint (roles+texts+tool names) — layer-1 range check. */
   readonly fingerprint: number
   /**
-   * Region-message fingerprint (roles+texts only, no preamble, no tools) —
-   * the consume contract. The full-input hash compares the BASE engine's
+   * STRICT region fingerprint (roles+texts of everything) — first-choice
+   * consume contract. The full-input hash compares the BASE engine's
    * rebuilt input against the plugin's own builder; any preamble or tool
    * churn between prepare and consume breaks it (production: 0 hits in 11
    * launches, every fold paying a blocking live call). The summary stays
@@ -1149,6 +1149,15 @@ interface SpeculativeSummary {
    * that, is what the consume must verify.
    */
   readonly regionFingerprint: number
+  /**
+   * STABLE region fingerprint (conversational texts + tool callIds) — the
+   * drift-tolerant tier. Tool-result text is rewritten in place by archive
+   * stubbing / memory_expand / absorb digests while the information stays
+   * recoverable, so a strict mismatch with only tool-text differences must
+   * not waste the prepared summary (production: 7 of 9 prepared summaries
+   * died this way in session 7ed44333).
+   */
+  readonly stableFingerprint: number
   readonly summary: ContentBlock[]
   readonly start: SessionSeq
   readonly end: SessionSeq
@@ -1170,16 +1179,38 @@ export function summarizationFingerprint(input: SummarizationInput): number {
 
 /**
  * Fingerprint of the folded messages PROPER: role+text projection, no tool
- * names, no leading system preamble. This is the speculation consume
- * contract: a prepared summary stays valid exactly while these messages are
- * verbatim. The base engine rebuilds the input with its own preamble (own
- * system prompt) under the request's CURRENT header — any preamble or
- * tool-churn difference between prepare and consume breaks the full-input
- * hash without invalidating a single folded word, so the consume verifies
- * the region projection instead.
+ * names, no leading system preamble. This is the STRICT tier of the
+ * speculation consume contract: a prepared summary stays valid exactly while
+ * these messages are verbatim. The base engine rebuilds the input with its
+ * own preamble (own system prompt) under the request's CURRENT header — any
+ * preamble or tool-churn difference between prepare and consume breaks the
+ * full-input hash without invalidating a single folded word, so the consume
+ * verifies the region projection instead.
  */
 export function regionMessagesFingerprint(messages: readonly Message[]): number {
   return fnv1a(JSON.stringify(messages.map(message => [message.role, messageText(message)])))
+}
+
+/**
+ * The STABLE tier: role+text for conversational messages, role+callId for
+ * tool messages. Tool-result TEXT is the volatile layer of a frozen region —
+ * archive stubbing rewrites it to a ref+digest, `memory_expand` restores it
+ * to the full payload, and both preserve the callId and the recoverable
+ * information (the full text lives in the tool_results archive regardless of
+ * what the surface carries). A summary prepared over the RICHER pre-stub
+ * text stays a valid replacement for the post-stub region, so this tier —
+ * and only this tier — tolerates tool-text drift while still catching
+ * conversational edits, inserted/removed messages, and wholesale tool-message
+ * replacement (callId change). Production evidence for the tier: session
+ * 7ed44333 kept a checkpoint alive through 7 other-region calls yet lost 7
+ * of 9 prepared summaries to layer-1 strict mismatches before their fold.
+ */
+export function regionStableFingerprint(messages: readonly Message[]): number {
+  return fnv1a(JSON.stringify(messages.map(message => {
+    const source = (message as { source?: { kind?: string; callId?: unknown } }).source
+    if (source?.kind === 'tool') return ['tool', source.callId]
+    return [message.role, messageText(message)]
+  })))
 }
 
 /**
@@ -1944,8 +1975,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (!speculationAnchorsAlive(session.surface.nodes, speculation.start, speculation.end)) {
         this.speculative.delete(sessionId)
       } else {
-        const fingerprint = summarizationFingerprint(this.buildRegionInput(session, speculation.start, speculation.end))
-        if (fingerprint === speculation.fingerprint) {
+        const projection = shadowedMessages(this.buildRegionInput(session, speculation.start, speculation.end))
+        // STRICT first, STABLE fallback: tool-text drift (stub write, expand
+        // restore, absorb digest) must not waste the checkpoint — the stable
+        // tier still proves the conversational thread is verbatim.
+        if (regionMessagesFingerprint(projection) === speculation.regionFingerprint
+          || regionStableFingerprint(projection) === speculation.stableFingerprint) {
           range = { start: speculation.start, end: speculation.end }
           speculationUsed = true
         } else {
@@ -2399,9 +2434,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (input.snapshot.totalTokens + specTokens > realWindow) return
       const fingerprint = summarizationFingerprint(specInput)
       const regionFingerprint = regionMessagesFingerprint(shadowedMessages(specInput))
+      const stableFingerprint = regionStableFingerprint(shadowedMessages(specInput))
       this.speculativeInFlight.add(input.sessionId)
       const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
-      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, timeoutMs)
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, timeoutMs)
       return
     }
     // REFRESH: merge the delta (everything after the cached range end) into
@@ -2435,9 +2471,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const refreshedRegion = this.buildRegionInput(input.session, existing.start, range.end)
     const mergedFingerprint = summarizationFingerprint(refreshedRegion)
     const mergedRegionFingerprint = regionMessagesFingerprint(shadowedMessages(refreshedRegion))
+    const mergedStableFingerprint = regionStableFingerprint(shadowedMessages(refreshedRegion))
     this.speculativeInFlight.add(input.sessionId)
     const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
-    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, timeoutMs, existing)
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, timeoutMs, existing)
   }
 
   /**
@@ -2487,6 +2524,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     specInput: SummarizationInput,
     fingerprint: number,
     regionFingerprint: number,
+    stableFingerprint: number,
     deadlineMs: number,
   ): Promise<void> {
     const record = (detail: string): void => {
@@ -2516,6 +2554,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.speculative.set(sessionId, {
         fingerprint,
         regionFingerprint,
+        stableFingerprint,
         summary: result.summary,
         start: range.start,
         end: range.end,
@@ -2543,6 +2582,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     mergeInput: SummarizationInput,
     mergedFingerprint: number,
     mergedRegionFingerprint: number,
+    mergedStableFingerprint: number,
     deadlineMs: number,
     previous: SpeculativeSummary,
   ): Promise<void> {
@@ -2571,6 +2611,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.speculative.set(sessionId, {
         fingerprint: mergedFingerprint,
         regionFingerprint: mergedRegionFingerprint,
+        stableFingerprint: mergedStableFingerprint,
         summary: result.summary,
         start: previous.start,
         end: endNow,
@@ -2865,10 +2906,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const sessionIdStr = String(agent.session.id)
     const speculation = this.speculative.get(sessionIdStr)
     if (speculation !== undefined) {
-      if (regionMessagesFingerprint(shadowedMessages(input)) === speculation.regionFingerprint) {
+      const incoming = shadowedMessages(input)
+      const strictHit = regionMessagesFingerprint(incoming) === speculation.regionFingerprint
+      // STABLE tier: tool-result text is rewritten in place by archive
+      // stubbing / memory_expand / absorb digests while the callIds (and the
+      // recoverable information) stay constant — a strict mismatch with only
+      // tool-text differences still leaves the prepared summary a valid
+      // replacement for the region. The full payloads remain recoverable via
+      // tr_ refs after the fold either way.
+      const stableHit = strictHit
+        || regionStableFingerprint(incoming) === speculation.stableFingerprint
+      if (stableHit) {
         this.speculative.delete(sessionIdStr)
         this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
-        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:hit' })
+        this.usage.record(USAGE_KIND.foldCheck, 1, {
+          sessionId: sessionIdStr,
+          detail: strictHit ? 'speculative:hit' : 'speculative:hit:stable',
+        })
         // A precomputed summary is a genuine live-LLM result: record it so the
         // fold path publishes the route prior (the flag would otherwise hold a
         // STALE value from an earlier call and wrongly suppress publishing).
@@ -2885,9 +2939,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // rewrite invalidates it and the next fold-lane check drops it there.
       let stillValid = false
       try {
-        stillValid = regionMessagesFingerprint(
-          shadowedMessages(this.buildRegionInput(agent.session, speculation.start, speculation.end)),
-        ) === speculation.regionFingerprint
+        const ownProjection = shadowedMessages(
+          this.buildRegionInput(agent.session, speculation.start, speculation.end),
+        )
+        // Same two tiers as the consume: a region that only drifted in tool
+        // text keeps the checkpoint valid for its own lane.
+        stillValid = regionMessagesFingerprint(ownProjection) === speculation.regionFingerprint
+          || regionStableFingerprint(ownProjection) === speculation.stableFingerprint
       } catch {
         stillValid = false
       }
