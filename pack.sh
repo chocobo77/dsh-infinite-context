@@ -16,6 +16,10 @@
 #   ./pack.sh --skip-install  # 跳过依赖安装检查
 #   ./pack.sh --keep-out-dir  # 保留输出目录里的旧文件
 #
+# dash (`sh pack.sh`) 不认识 pipefail/BASH_SOURCE：自动以 bash 重执行。
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 OUT_DIR="release"
