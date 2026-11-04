@@ -316,6 +316,17 @@ export function resolveMemoryContextConfig(raw: MemoryContextConfig): ResolvedMe
 export interface MemoryCompactionConfig {
   /** Delegated to BasicCompactionConfig: pressure threshold ratio (0-1). */
   thresholdRatio?: number
+  /**
+   * Delegated: the base durable lane's headroom in tokens. The base lane
+   * compacts at `window − maxTokens − headroomTokens`; left at the base
+   * default (65536) that line sits BELOW the plugin's fold trigger and the
+   * durable lane becomes the routine compactor (production 2026-11-04:
+   * durable compactions at surf ~54k while the fold trigger waited at
+   * ~64.6k, burning the prepared fold checkpoint). Set it to ~0.25 × the
+   * context window (32000 on 128k) so the durable line lands at the fold
+   * budget and the fold lane stays the routine owner.
+   */
+  headroomTokens?: number
   /** Delegated: retained recent tail ratio (0-1). */
   retainRatio?: number
   /** Delegated: retained recent tail in tokens. */
@@ -544,6 +555,7 @@ export interface MemoryCompactionConfig {
 /** Schemastery schema for {@link MemoryCompactionConfig} (validates types only). */
 export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object({
   thresholdRatio: z.number().min(0).max(1),
+  headroomTokens: z.number().step(1).min(0),
   retainRatio: z.number().min(0).max(1),
   retainTokens: z.number().step(1).min(0),
   // Summarization target is deliberately EMPTY ('') so the compaction backend

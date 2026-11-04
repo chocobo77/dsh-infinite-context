@@ -2963,8 +2963,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const sessionIdStr = String(agent.session.id)
     const speculation = this.speculative.get(sessionIdStr)
     if (speculation !== undefined) {
-      this.speculative.delete(sessionIdStr)
       if (regionMessagesFingerprint(shadowedMessages(input)) === speculation.regionFingerprint) {
+        this.speculative.delete(sessionIdStr)
         this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:hit' })
         // A precomputed summary is a genuine live-LLM result: record it so the
@@ -2973,7 +2973,28 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         this.lastSummarizeDegraded.set(agent, false)
         return { summary: speculation.summary, provider: 'precomputed', model: 'speculative' }
       }
-      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:miss' })
+      // Mismatch: the caller may be ANOTHER LANE. summarize() serves the
+      // durable/base compaction too, and that lane shadows a DIFFERENT range
+      // — the one-shot delete here wasted a checkpoint that was still
+      // verbatim-valid for its own lane (production 2026-11-04: the durable
+      // compaction consumed-and-dropped the fold checkpoint three minutes
+      // before the fold lane could use it). Keep the entry while its OWN
+      // region is still verbatim in the surface; the durable fold's surface
+      // rewrite invalidates it and the next fold-lane check drops it there.
+      let stillValid = false
+      try {
+        stillValid = regionMessagesFingerprint(
+          shadowedMessages(this.buildRegionInput(agent.session, speculation.start, speculation.end)),
+        ) === speculation.regionFingerprint
+      } catch {
+        stillValid = false
+      }
+      if (stillValid) {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:other-region' })
+      } else {
+        this.speculative.delete(sessionIdStr)
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:miss' })
+      }
     }
     // Spread once: the resilience wrapper's declared type keeps the summary
     // read-only, while the clipping below rewrites it in place.
