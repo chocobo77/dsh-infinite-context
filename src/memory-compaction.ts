@@ -1182,6 +1182,31 @@ export function regionMessagesFingerprint(messages: readonly Message[]): number 
   return fnv1a(JSON.stringify(messages.map(message => [message.role, messageText(message)])))
 }
 
+/**
+ * Whether BOTH anchor seqs of a speculative range still exist in the live
+ * surface. Absorb/archive rewrites replace surface ranges and retire their
+ * seqs; {@link buildRegionInput} silently SKIPS missing seqs, so a refresh
+ * can fingerprint the surviving subrange and re-arm a dead anchor as a
+ * plausible-looking entry — which then commits a range whose start is gone
+ * and hard-fails compactRegion every step (the 2026-11-04 fold-lane lockout:
+ * 'start seq 918 not found in surface' ×5 over 20 minutes). The fingerprint
+ * contract alone cannot catch this: the hash is computed over whatever the
+ * projection still yields. The anchors must exist verbatim.
+ */
+export function speculationAnchorsAlive(
+  surfaceNodes: readonly SessionSeq[],
+  start: SessionSeq,
+  end: SessionSeq,
+): boolean {
+  let startAlive = false
+  let endAlive = false
+  for (const seq of surfaceNodes) {
+    if (seq === start) startAlive = true
+    if (seq === end) endAlive = true
+  }
+  return startAlive && endAlive
+}
+
 /** The multi-tier memory compaction backend. */
 export class MemoryCompactionEngine extends BasicCompactionEngine {
   static override inject = ['llm', 'tokenMeter', 'sessions', 'memoryContext']
@@ -1914,12 +1939,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     let range: { start: SessionSeq; end: SessionSeq } | null = null
     let speculationUsed = false
     if (speculation !== undefined) {
-      const fingerprint = summarizationFingerprint(this.buildRegionInput(session, speculation.start, speculation.end))
-      if (fingerprint === speculation.fingerprint) {
-        range = { start: speculation.start, end: speculation.end }
-        speculationUsed = true
-      } else {
+      // Ghost-anchor guard BEFORE the fingerprint: buildRegionInput skips
+      // missing seqs, so a hash match proves nothing about dead anchors.
+      if (!speculationAnchorsAlive(session.surface.nodes, speculation.start, speculation.end)) {
         this.speculative.delete(sessionId)
+      } else {
+        const fingerprint = summarizationFingerprint(this.buildRegionInput(session, speculation.start, speculation.end))
+        if (fingerprint === speculation.fingerprint) {
+          range = { start: speculation.start, end: speculation.end }
+          speculationUsed = true
+        } else {
+          this.speculative.delete(sessionId)
+        }
       }
     }
     // Under real pressure the selector may ESCALATE: widen the range
@@ -2070,7 +2101,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // step through a door that bypasses the failure cooldown.
       const stall = this.forcedFoldsStalled.get(sessionId) ?? { count: 0, lastAt: 0 }
       this.forcedFoldsStalled.set(sessionId, { count: stall.count + 1, lastAt: Date.now() })
-      diag(`error:${error instanceof Error ? error.message : String(error)}`)
+      // Ghost-anchor containment (defense in depth behind the alive-anchor
+      // guards): a commit-time 'not found in surface' means the folded range
+      // anchored on a seq that was retired mid-step. Clearing the speculation
+      // here breaks any residual lock so the next pass selects fresh.
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes('not found in surface')) this.speculative.delete(sessionId)
+      diag(`error:${message}`)
       throw error
     }
   }
@@ -2369,6 +2406,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     // REFRESH: merge the delta (everything after the cached range end) into
     // the carried checkpoint. Skipped when the delta is insignificant.
+    // Ghost-anchor guard first: refreshing an entry whose start seq was
+    // retired by an absorb/archive rewrite would fingerprint the surviving
+    // subrange (buildRegionInput skips missing seqs) and re-arm the dead
+    // anchor — hard-locking the fold lane at commit time. Drop it; the next
+    // pass launches a fresh checkpoint from the current surface.
+    if (!speculationAnchorsAlive(input.session.surface.nodes, existing.start, existing.end)) {
+      this.speculative.delete(input.sessionId)
+      return
+    }
     if (range.end <= existing.end) return
     let deltaTokens = 0
     for (const node of input.meter.nodes) {
