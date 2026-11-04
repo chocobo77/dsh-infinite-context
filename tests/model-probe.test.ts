@@ -1,0 +1,269 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PROBE_TIMEOUT_MS } from '../src/model-probe.ts'
+import {
+  isLocalBaseURL,
+  isLocalHostname,
+  probeLlama,
+  probeModelContext,
+  probeOllama,
+  probeOpenAI,
+  providerBaseURL,
+  providerProfile,
+} from '../src/core.ts'
+
+const originalFetch = globalThis.fetch
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
+
+function mockFetchOnce(handler: (url: string, init?: RequestInit) => Response | Promise<Response>): void {
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => handler(String(input), init))
+}
+
+function jsonResponse(body: unknown, ok = true): Response {
+  return new Response(JSON.stringify(body), {
+    status: ok ? 200 : 500,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+describe('model probe', () => {
+  it('reads llama-server n_ctx from default_generation_settings', async () => {
+    mockFetchOnce(url => {
+      expect(url).toBe('http://127.0.0.1:8080/props')
+      return jsonResponse({ default_generation_settings: { n_ctx: 8192 } })
+    })
+    await expect(probeLlama('http://127.0.0.1:8080')).resolves.toBe(8192)
+  })
+
+  it('falls back to the top-level llama-server n_ctx', async () => {
+    mockFetchOnce(() => jsonResponse({ n_ctx: 4096 }))
+    await expect(probeLlama('http://127.0.0.1:8080/')).resolves.toBe(4096)
+  })
+
+  it('reads ollama context_length from model_info', async () => {
+    mockFetchOnce((url, init) => {
+      expect(url).toBe('http://127.0.0.1:11434/api/show')
+      expect(JSON.parse(String(init?.body))).toEqual({ model: 'qwen2.5:7b' })
+      return jsonResponse({ model_info: { 'llama.context_length': 32_768 } })
+    })
+    await expect(probeOllama('http://127.0.0.1:11434', 'qwen2.5:7b')).resolves.toBe(32_768)
+  })
+
+  it('needs a model name for ollama', async () => {
+    await expect(probeOllama('http://127.0.0.1:11434')).resolves.toBeUndefined()
+  })
+
+  it('reads the matching model entry from an OpenAI listing', async () => {
+    mockFetchOnce((url, init) => {
+      expect(url).toBe('http://127.0.0.1:8000/v1/models')
+      expect(init?.method).toBeUndefined()
+      return jsonResponse({
+        data: [
+          { id: 'other', context_length: 2048 },
+          { id: 'llama-3.1-8b', context_length: 131_072 },
+        ],
+      })
+    })
+    await expect(probeOpenAI('http://127.0.0.1:8000/v1', 'llama-3.1-8b')).resolves.toBe(131_072)
+  })
+
+  it('reads max_model_len when context_length is absent', async () => {
+    mockFetchOnce(() => jsonResponse({ data: [{ id: 'vllm-model', max_model_len: 32_768 }] }))
+    await expect(probeOpenAI('http://127.0.0.1:8000/v1', 'vllm-model')).resolves.toBe(32_768)
+  })
+
+  it('reads llama-server meta.n_ctx from the OpenAI-compatible listing', async () => {
+    mockFetchOnce((url, init) => {
+      expect(url).toBe('http://127.0.0.1:1234/v1/models')
+      expect(init?.method).toBeUndefined()
+      return jsonResponse({
+        data: [
+          { id: 'other', meta: { n_ctx: 8192 } },
+          { id: 'Qwen3.8-27B-UD-Q2_K_XL', meta: { n_ctx: 131_072, n_ctx_train: 262_144 } },
+        ],
+      })
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'Qwen3.8-27B-UD-Q2_K_XL')).resolves.toBe(131_072)
+  })
+
+  it('prefers a top-level context field over the nested llama meta', async () => {
+    mockFetchOnce(() => jsonResponse({
+      data: [{ id: 'qwen3.8-27b', context_length: 32_768, meta: { n_ctx: 4096 } }],
+    }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBe(32_768)
+  })
+
+  it('ignores llama meta.n_ctx when the model id does not match', async () => {
+    mockFetchOnce(() => jsonResponse({
+      data: [{ id: 'other', meta: { n_ctx: 131_072 } }],
+    }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'Qwen3.8-27B-UD-Q2_K_XL')).resolves.toBeUndefined()
+  })
+
+  it('falls back to LM Studio /api/v0/models max_total_tokens', async () => {
+    mockFetchOnce(url => {
+      if (url === 'http://127.0.0.1:1234/v1/models') {
+        // LM Studio's OpenAI-compatible listing advertises no context length.
+        return jsonResponse({ data: [{ id: 'qwen3.8-27b' }] })
+      }
+      if (url === 'http://127.0.0.1:1234/api/v0/models') {
+        return jsonResponse({ data: [
+          { id: 'qwen3.8-27b', max_total_tokens: 8192, max_completion_tokens: 4096 },
+        ] })
+      }
+      throw new Error(`unexpected url ${url}`)
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBe(8192)
+  })
+
+  it('ignores the LM Studio fallback when the model id does not match', async () => {
+    mockFetchOnce(url => {
+      if (url.endsWith('/v1/models')) return jsonResponse({ data: [{ id: 'other' }] })
+      return jsonResponse({ data: [{ id: 'other', max_total_tokens: 4096 }] })
+    })
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1', 'qwen3.8-27b')).resolves.toBeUndefined()
+  })
+
+  it('returns undefined on a non-2xx reply', async () => {
+    mockFetchOnce(() => jsonResponse({ error: 'nope' }, false))
+    await expect(probeLlama('http://127.0.0.1:8080')).resolves.toBeUndefined()
+  })
+
+  it('returns undefined on a transport failure', async () => {
+    mockFetchOnce(() => { throw new TypeError('ECONNREFUSED') })
+    await expect(probeLlama('http://127.0.0.1:8080')).resolves.toBeUndefined()
+  })
+
+  it('returns undefined when probing is disabled or baseURL is blank', async () => {
+    await expect(probeModelContext({ enabled: false, kind: 'llama', baseURL: 'http://x' })).resolves.toBeUndefined()
+    await expect(probeModelContext({ enabled: true, kind: 'llama', baseURL: '' })).resolves.toBeUndefined()
+  })
+})
+
+describe('isLocalHostname', () => {
+  it('classifies loopback hosts as local', () => {
+    expect(isLocalHostname('127.0.0.1')).toBe(true)
+    expect(isLocalHostname('localhost')).toBe(true)
+    expect(isLocalHostname('::1')).toBe(true)
+    expect(isLocalHostname('0.0.0.0')).toBe(true)
+    expect(isLocalHostname(' LOCALHOST ')).toBe(true)
+  })
+
+  it('classifies RFC1918 private hosts as local', () => {
+    expect(isLocalHostname('10.0.0.5')).toBe(true)
+    expect(isLocalHostname('192.168.1.10')).toBe(true)
+    expect(isLocalHostname('172.16.0.1')).toBe(true)
+    expect(isLocalHostname('172.31.255.255')).toBe(true)
+  })
+
+  it('classifies public online hosts as non-local', () => {
+    expect(isLocalHostname('open.bigmodel.cn')).toBe(false)
+    expect(isLocalHostname('api.xiaomimimo.com')).toBe(false)
+    expect(isLocalHostname('ark.cn-beijing.volces.com')).toBe(false)
+    expect(isLocalHostname('8.8.8.8')).toBe(false)
+    expect(isLocalHostname('')).toBe(false)
+  })
+})
+
+describe('isLocalBaseURL', () => {
+  it('classifies loopback base URLs as local', () => {
+    expect(isLocalBaseURL('http://127.0.0.1:1234/v1')).toBe(true)
+    expect(isLocalBaseURL('http://localhost:8080')).toBe(true)
+  })
+
+  it('classifies RFC1918 private base URLs as local', () => {
+    expect(isLocalBaseURL('http://192.168.1.10:8080/v1')).toBe(true)
+    expect(isLocalBaseURL('http://10.0.0.5/v1')).toBe(true)
+  })
+
+  it('classifies IPv6 loopback literals as local', () => {
+    // URL.hostname keeps the brackets ([::1]) and Node normalizes an
+    // IPv4-mapped literal to hex (:0:0:0:0:0:ffff:127.0.0.1 → ::ffff:7f00:1).
+    expect(isLocalHostname('[::1]')).toBe(true)
+    expect(isLocalHostname('::ffff:7f00:1')).toBe(true)
+    expect(isLocalBaseURL('http://[::1]:1234/v1')).toBe(true)
+    expect(isLocalBaseURL('http://[::ffff:127.0.0.1]:1234/v1')).toBe(true)
+  })
+
+  it('classifies public online base URLs as non-local (never probed)', () => {
+    expect(isLocalBaseURL('https://open.bigmodel.cn/api/paas/v4')).toBe(false)
+    expect(isLocalBaseURL('https://api.xiaomimimo.com/v1')).toBe(false)
+    expect(isLocalBaseURL('https://ark.cn-beijing.volces.com/api/coding/v3')).toBe(false)
+  })
+
+  it('treats empty and unparseable base URLs as non-local (safe default)', () => {
+    expect(isLocalBaseURL('')).toBe(false)
+    expect(isLocalBaseURL('not a url')).toBe(false)
+  })
+})
+
+describe('probe timeout coverage', () => {
+  it('bounds the response body read too, not just the headers', async () => {
+    vi.useFakeTimers()
+    try {
+      mockFetchOnce((_url, init) => {
+        const signal = (init as RequestInit | undefined)?.signal as AbortSignal | undefined
+        return {
+          ok: true,
+          // Headers arrived; the body stalls until the probe's own abort fires.
+          json: () => new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')))
+          }),
+        } as unknown as Response
+      })
+      const pending = probeLlama('http://127.0.0.1:8080')
+      await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS + 50)
+      await expect(pending).resolves.toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('malformed listings', () => {
+  it('skips null and primitive entries instead of throwing', async () => {
+    // The listing is remote input: `{data:[null]}` used to make entryContext
+    // throw a TypeError, breaking the "never throws into the caller" contract.
+    mockFetchOnce(() => jsonResponse({ data: [null, 'nope', { id: 'm', context_length: 4096 }] }))
+    await expect(probeOpenAI('http://127.0.0.1:1234/v1')).resolves.toBe(4096)
+  })
+})
+
+describe('provider settings resolution', () => {
+  const namespaces = [
+    {
+      ns: 'llm-pi-ai',
+      value: {
+        providers: {
+          qwen3: { baseURL: 'http://127.0.0.1:1234/v1' },
+          cloud: { baseURL: 'https://api.example.com/v1' },
+          blank: { baseURL: '' },
+        },
+      },
+    },
+  ]
+  const local = { provider: 'qwen3', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'qwen3'] }
+
+  it('walks the provider settings path inside its namespace', () => {
+    expect(providerProfile(namespaces, local)).toEqual({ baseURL: 'http://127.0.0.1:1234/v1' })
+    expect(providerBaseURL(namespaces, local)).toBe('http://127.0.0.1:1234/v1')
+    expect(isLocalBaseURL(providerBaseURL(namespaces, local) ?? '')).toBe(true)
+  })
+
+  it('classifies a remote profile as non-local', () => {
+    const remote = { provider: 'cloud', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'cloud'] }
+    expect(isLocalBaseURL(providerBaseURL(namespaces, remote) ?? '')).toBe(false)
+  })
+
+  it('returns undefined for a missing namespace, path, profile or URL', () => {
+    expect(providerProfile([], local)).toBeUndefined()
+    expect(providerBaseURL([], local)).toBeUndefined()
+    expect(providerBaseURL(namespaces, undefined)).toBeUndefined()
+    expect(providerBaseURL(namespaces, { ...local, settingsPath: ['providers', 'ghost'] })).toBeUndefined()
+    expect(providerBaseURL(namespaces, { ...local, settingsPath: [] })).toBeUndefined()
+    expect(providerBaseURL(namespaces, { provider: 'blank', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'blank'] })).toBeUndefined()
+    expect(providerProfile([{ ns: 'llm-pi-ai', value: 42 }], local)).toBeUndefined()
+  })
+})

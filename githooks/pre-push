@@ -1,0 +1,10 @@
+#!/bin/sh
+# Pre-push gate: the three checks must pass before any commit leaves this
+# machine. Both dev machines opt in once with:
+#   git config core.hooksPath githooks
+# Bypass deliberately requires an explicit `git push --no-verify`.
+echo "[githooks] pre-push: typecheck + test + build"
+npm run verify || {
+  echo "[githooks] pre-push: verification FAILED — push aborted (use --no-verify to override)"
+  exit 1
+}

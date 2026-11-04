@@ -59,10 +59,13 @@ scripts/install-dsh-plugin.cfg
 
 # === Local development only (not published) ===
 docs/
-tests/
 scripts/
 ARCHITECTURE.md
-vitest.config.ts
-tsconfig.typecheck.json
+# tests/, vitest.config.ts and tsconfig.typecheck.json are TRACKED since
+# 0.8.9: the suite is the project's regression asset and must sync across
+# the two dev machines through git (they were local-only 2026-10-31..11-04,
+# which is how the two sides drifted). tsconfig.typecheck.json carries
+# per-machine absolute path candidates (D:/… first, /home/… second) — both
+# are the operators' own checkouts.
 
 release/

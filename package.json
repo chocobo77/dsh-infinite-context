@@ -57,10 +57,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
-    "prepack": "npm run build",
+    "prepack": "npm run verify",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "verify": "npm run typecheck && vitest run && npm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",

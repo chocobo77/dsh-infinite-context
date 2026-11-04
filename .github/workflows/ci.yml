@@ -1,0 +1,53 @@
+name: ci
+
+# The three gates (typecheck / test / build). They need the plugin's HOST
+# packages (`@deepseek-ai/*`), which live in a DSH source snapshot that has
+# no public repository — a plain runner cannot provision them.
+#
+# Without provisioning the job SKIPS (green, with a notice) — the gates still
+# run locally: `githooks/pre-push` (enable once with
+# `git config core.hooksPath githooks`) and `prepack` both call `npm run verify`.
+#
+# Provisioning a runner: see .github/workflows/README.md (push the DSH
+# snapshot to a private repo, set DSH_CHECKOUT_REPO / DSH_CHECKOUT_REF /
+# DSH_CHECKOUT_TOKEN).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    if: vars.DSH_CHECKOUT_REPO != ''
+    env:
+      DSH_CHECKOUT: ${{ github.workspace }}/dsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the DSH source snapshot (host packages)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.DSH_CHECKOUT_REPO }}
+          ref: ${{ vars.DSH_CHECKOUT_REF || 'master' }}
+          token: ${{ secrets.DSH_CHECKOUT_TOKEN || github.token }}
+          path: dsh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Point the host-package candidates at the checked-out snapshot
+        run: |
+          sed -i "s|D:/Program files/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.typecheck.json
+          sed -i "s|/home/[^/]*/.local/share/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.typecheck.json
+          grep -c "$DSH_CHECKOUT" tsconfig.typecheck.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Verify (typecheck + test + build)
+        run: npm run verify
