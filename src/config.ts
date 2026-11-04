@@ -322,9 +322,11 @@ export interface MemoryCompactionConfig {
    * default (65536) that line sits BELOW the plugin's fold trigger and the
    * durable lane becomes the routine compactor (production 2026-11-04:
    * durable compactions at surf ~54k while the fold trigger waited at
-   * ~64.6k, burning the prepared fold checkpoint). Set it to ~0.25 × the
-   * context window (32000 on 128k) so the durable line lands at the fold
-   * budget and the fold lane stays the routine owner.
+   * ~64.6k, burning the prepared fold checkpoint). NO LONGER REQUIRED for
+   * lane alignment: since 0.8.6 the lane takeover disables the base lane's
+   * routine path entirely, so its threshold is irrelevant outside the
+   * emergency doors. Accepted for operators who want to tune the emergency
+   * threshold anyway.
    */
   headroomTokens?: number
   /** Delegated: retained recent tail ratio (0-1). */
@@ -423,12 +425,11 @@ export interface MemoryCompactionConfig {
    */
   compress_dynamic_levels?: boolean
   /**
-   * Master switch for the UNIFIED governor: one policy function
-   * (planCompaction) decides lane + water levels for both the durable-region
-   * and progressive-fold executors, and the two hooks obey that single
-   * decision. When false, each lane keeps its own legacy trigger (the P1
-   * shared curves still apply). Defaults to the OR of the two legacy dynamic
-   * switches, so existing configs behave as before.
+   * @deprecated Accepted for compatibility; a NO-OP since 0.8.6. The lane
+   * takeover is unconditional: with the plugin installed the fold lane owns
+   * routine pressure compaction and the base durable lane stands down
+   * (fit-guard / provider-overflow recovery remain as emergency doors).
+   * There is no longer a legacy per-lane mode to switch back to.
    */
   compaction_governance?: boolean
   /**

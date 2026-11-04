@@ -1266,12 +1266,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * resilience wrapper records it here for the fold path (prior learning).
    */
   private readonly lastSummarizeDegraded = new WeakMap<Agent, boolean>()
-  /**
-   * Master switch for the unified governor (planCompaction). When on, both the
-   * durable and fold hooks obey one decision; when off, each lane keeps its
-   * legacy trigger (the shared P1 curves still bound both).
-   */
-  private readonly governance: boolean
   /** Whether the narrowed-window (probe/override) compaction override is on. */
   private readonly dynamicThreshold: boolean
   /** Lower bound of the dynamic trigger ratio as the real window fills. */
@@ -1367,18 +1361,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const injectionBudget = rag_token_budget ?? 3000
     this.retainRecent = retainRecent
     this.injectionBudget = injectionBudget
-    // Explicit opt-in: an existing config without the key keeps the legacy
-    // per-lane trigger (the P1 shared curves still bound both). The shipped
-    // cordis.yml sets it true so the unified governor is exercised by default
-    // for new installs and can be turned off with one key.
-    this.governance = compaction_governance ?? false
-    if (this.governance) {
-      this.ctx.logger.info(
-        '[ContextGovernor] Unified compaction governance ON: one planCompaction '
-        + 'decision drives the fold lane; compaction_dynamic_threshold still gates '
-        + 'the durable lane.',
-      )
-    }
+    // LANE TAKEOVER (unconditional since 0.8.6): with the plugin installed,
+    // the fold lane owns routine pressure compaction and the base durable
+    // lane stands down — its legacy threshold (window − maxTokens − 65536
+    // default headroom) sat BELOW the fold trigger and silently became the
+    // routine compactor, bypassing every fold-lane feature. Only the
+    // fit-guard / provider-overflow emergency doors still run base
+    // machinery. (compaction_governance is a deprecated no-op kept for
+    // config compatibility; compaction_dynamic_threshold now only feeds the
+    // narrowed-lane decision curve.)
+    this.ctx.logger.info(
+      '[ContextGovernor] Lane takeover: the fold lane owns routine pressure '
+        + 'compaction; the base durable lane stands down (fit-guard and '
+        + 'provider-overflow recovery remain as emergency doors).',
+    )
     this.dynamicThreshold = compaction_dynamic_threshold ?? true
     this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
     this.thinkingGuardEnabled = thinking_guard_enabled ?? true
@@ -1602,30 +1598,24 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       )
     }
     this.lastAgentBySession.set(String(agent.session.id), agent)
-    if (trigger === 'pressure' && (this.dynamicThreshold || this.governance) && !signal.aborted) {
+    if (trigger === 'pressure' && !signal.aborted) {
       const handled = await this.forceNarrowedPressure(agent, signal)
-      if (handled === null) {
-        // The narrowed-window override said "skip" (authoritative for the
-        // DURABLE lane). It must NOT short-circuit the fold lane: the fold is a
-        // separate surface rewrite with its own real-window budget. Try it, but
-        // keep the durable lane suppressed.
-        return await this.tryFold(agent, signal)
-      }
-      if (handled !== undefined) return handled
+      // LANE TAKEOVER: with this plugin installed, the fold lane owns routine
+      // pressure compaction and the base durable lane STANDS DOWN — never
+      // falls through to super with 'pressure'. The base's legacy threshold
+      // (window − maxTokens − 65536 default headroom) sat BELOW the fold
+      // trigger and silently became the routine compactor (production
+      // 2026-11-04), bypassing every fold-lane feature and wasting prepared
+      // speculation checkpoints. The narrowed-window override's force RESULT
+      // (real-window fit-guard / overflow) is the only durable machinery that
+      // still runs here, and only under real emergency; 'null' (skip) and
+      // 'undefined' (undecided) both fall to the fold.
+      if (handled !== undefined && handled !== null) return handled
+      return await this.tryFold(agent, signal)
     }
-    // Fold FIRST: its trigger is below the durable threshold, so asking the
-    // durable lane first starves it forever. The fold is a surface rewrite with
-    // the same semantics as durable; only when it is not due does the durable
-    // lane (and its overflow path) run.
-    if (trigger === 'pressure') {
-      const folded = await this.tryFold(agent, signal)
-      // Under the unified governor the fold lane is the SOLE pressure
-      // executor. Falling through to the durable lane here would compact
-      // again at its own (often lower) threshold right after the fold and
-      // produce churn. Overflow/context-overflow still delegates below.
-      if (this.governance) return folded
-      if (folded !== null) return folded
-    }
+    // 'context-overflow' (provider overflow recovery, thinking-guard takeover,
+    // fit-guard force calls) delegates to the base machinery unchanged — that
+    // is the plugin-supervised emergency door, not the routine lane.
     return await super.compactIfNeeded(agent, trigger, signal)
   }
 
@@ -1636,7 +1626,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * @returns the fold result, or null when not due / failed.
    */
   private async tryFold(agent: Agent, signal: AbortSignal): Promise<CompactionResult | null> {
-    if (!this.governance || signal.aborted) return null
+    // No governance flag here: with the plugin installed the fold lane IS the
+    // routine executor (the durable lane stands down unconditionally).
+    if (signal.aborted) return null
     try {
       return await this.foldNow(agent, signal)
     } catch (error) {
@@ -2193,31 +2185,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         return forced
       }
       // 'delegate' — narrowed >= declared (override == declared, or the probe
-      // matched the declaration). The base pressure path handles this with
-      // proper tail retention, BUT it uses the STATIC thresholdRatio. When the
-      // dynamic ratio has already pulled the trigger line below the static one,
-      // we must NOT wait for the static threshold: a local model whose declared
-      // window equals its probed window (e.g. qwen3 at 167936) would otherwise
-      // run into the slow long-context zone before the static 0.7 line fires.
-      // Fire the base-style balanced compaction at the DYNAMIC line instead.
-      // Under the unified governor the fold lane owns routine pressure, so the
-      // dynamic-line durable path would be a second compaction at a different
-      // threshold (the churn seen on a 64k local model). Only the real-window
-      // force/fit-guard above still bypasses the fold.
-      if (this.governance) return undefined
-      const baseThresholdTokens = Math.max(1, Math.floor(
-        (declared ?? narrowed) * this.thresholdRatioFor(target),
-      ))
-      if (decision.thresholdTokens !== undefined
-        && decision.thresholdTokens < baseThresholdTokens
-        && measurement.totalTokens >= decision.thresholdTokens) {
-        this.ctx.logger.info(
-          `[ContextGovernor] Dynamic delegate line: ${measurement.totalTokens} tokens >= `
-          + `${decision.thresholdTokens} (below the static base line ${baseThresholdTokens}; `
-          + `model=${target.model}); compacting with tail retention`,
-        )
-        return await this.compactWithDynamicLine(agent, signal, decision.thresholdTokens, narrowed)
-      }
+      // matched the declaration). Under the lane takeover the fold lane owns
+      // routine pressure unconditionally — a dynamic-line durable compaction
+      // here would be a second compaction at a different threshold (the churn
+      // seen on a 64k local model). Only the real-window force/fit-guard
+      // above still bypasses the fold.
       return undefined
     } catch (error) {
       // Unknown route, resolveModelInfo rejection, aborted probe — fall back to
@@ -2227,122 +2199,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         + `${error instanceof Error ? error.message : String(error)}`,
       )
       return undefined
-    }
-  }
-
-  /**
-   * Run ONE balanced compaction (base-style: retains the configured recent
-   * tail, never the overflow-style retain-0 full squeeze) once the measured
-   * conversation crosses the given dynamic threshold.
-   *
-   * Mirrors the base pressure path's single attempt (prune → select →
-   * compactRegion) so the delegate case honors the dynamic ratio without
-   * duplicating the whole retry loop; the next step re-checks if still over.
-   */
-  private async compactWithDynamicLine(
-    agent: Agent,
-    signal: AbortSignal,
-    thresholdTokens: number,
-    window: number,
-  ): Promise<CompactionResult | null> {
-    const meter = this.ctx.tokenMeter
-    let measurement = meter.measure(agent.session)
-    const prune = this.ctx.get('toolResultPruner')
-    if (prune !== undefined) {
-      prune.pruneSession(agent.session)
-      measurement = meter.measure(agent.session)
-    }
-    if (measurement.totalTokens < thresholdTokens) return null
-    // Resolve the retained-tail budget for the effective window, mirroring the
-    // base resolveCompactSpec (retainRatio defaults to 0.16 in compaction-basic).
-    const retainTokens = this.config.retainTokens === undefined
-      ? Math.max(0, Math.floor(window * (this.config.retainRatio ?? 0.16)))
-      : this.config.retainTokens
-    // Thin-fold gate for the legacy durable routine path. Under the unified
-    // governor routine pressure belongs to the fold lane (which has its own
-    // gate); this method is the one durable path the plugin owns end-to-end,
-    // and it gets the same deal: a region whose net saving does not cover its
-    // summary plus the call cost waits for a deeper occasion.
-    const regionTokens = Math.max(0, measurement.totalTokens - Math.min(retainTokens, measurement.totalTokens))
-    if (isThinFold(regionTokens, summarizationTargetTokens(this.config, regionTokens), window,
-      thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
-      this.ctx.logger.info(
-        `[ContextGovernor] Thin durable fold skipped: region ~${regionTokens} tokens nets under `
-          + `${Math.floor(window * GOV_MIN_NET_SAVING_RATIO)} (window ${window}); waiting for a deeper occasion`,
-      )
-      return null
-    }
-    // Head-anchored range selection (mirrors compaction-basic's
-    // selectCompactableRange): walk from the tail accumulating prices until the
-    // retained tail is covered, then step back to a tool-pairing-balanced cut.
-    const nodes = measurement.nodes
-    if (nodes.length === 0) return null
-    const surfaceNodes = agent.session.surface.nodes
-    // Base contract guard #1: the priced nodes must still match the live
-    // surface seq-for-seq. A stale measurement (surface mutated between
-    // measure and now) would make every positional index below a lie — the
-    // base path throws the same error, and the caller falls back to it.
-    if (surfaceNodes.length !== nodes.length
-      || surfaceNodes.some((seq, index) => seq !== nodes[index]?.seq)) {
-      throw new Error(
-        'dsh-infinite-context: token-meter surface does not match the current session surface',
-      )
-    }
-    // Base contract guard #2: a leading system/message node is NEVER inside the
-    // compactable range — summarizing it would corrupt the system prompt.
-    const firstIdx = this.isSystemHeadNode(agent.session, surfaceNodes[0]!) ? 1 : 0
-    let accumulated = 0
-    let keepFromIdx = nodes.length
-    for (let index = nodes.length - 1; index >= 0; index -= 1) {
-      // oxlint-disable-next-line typescript/no-non-null-assertion -- guarded by length
-      accumulated += nodes[index]!.tokens
-      keepFromIdx = index
-      if (accumulated >= retainTokens) break
-    }
-    if (keepFromIdx <= firstIdx) return null
-    while (keepFromIdx > firstIdx) {
-      if (toolPairingBalancedBefore(agent.session, surfaceNodes[keepFromIdx]!)) break
-      keepFromIdx -= 1
-    }
-    if (keepFromIdx <= firstIdx) return null
-    // Base contract guard #3: never enter a second compaction transaction while
-    // one is still open (the base pressure path asserts the same before its
-    // async decision gap; this call has the same gap after resolveModelInfo).
-    this.assertNoActiveCompaction(agent.session, 'dynamic-line pressure compaction')
-    const start = surfaceNodes[firstIdx]!
-    const end = surfaceNodes[keepFromIdx - 1]!
-    return await this.compactRegion(start, end, agent, signal)
-  }
-
-  /**
-   * Whether the surface node at `seq` is the session's system prompt head
-   * (mirrors compaction-basic's `systemHead`): the event at that seq must be a
-   * `system/message`. Such nodes are never compacted.
-   */
-  private isSystemHeadNode(session: Session, seq: number): boolean {
-    const head = session.eventAt(seq as SessionSeqOf)
-    return head !== undefined && (head as { type?: unknown }).type === 'system/message'
-  }
-
-  /**
-   * Lightweight mirror of compaction-basic's internal compaction-lock check:
-   * scan the event log backwards for the most recent `compaction/start` vs
-   * `compaction/end` marker. An unmatched start (with no later `session/end-seed`
-   * releasing it) means a compaction transaction is already open on this
-   * session — entering a second one would interleave two surface replacements.
-   */
-  private assertNoActiveCompaction(session: Session, stage: string): void {
-    let endSeedSeen = false
-    for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
-      const event = session.eventAt(seq as SessionSeqOf)
-      if (event === undefined) break
-      if (!endSeedSeen && (event as { type?: unknown }).type === 'session/end-seed') endSeedSeen = true
-      const type = (event as { type?: unknown }).type
-      if (type === 'compaction/start') {
-        if (endSeedSeen) return
-        throw new Error(`${stage}: compaction already in progress; the session compaction lock is already active`)
-      }
-      if (type === 'compaction/end') return
     }
   }
 
