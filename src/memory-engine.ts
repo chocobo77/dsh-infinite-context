@@ -65,19 +65,22 @@ export interface MaintenanceReport {
  * based on the fraction of normalized shared words. Used by the maintenance
  * audit to flag duplicates/conflicts without embedding work.
  */
-/** Jaccard-style similarity over PRENORMALIZED texts (see normalizeForDedup). */
-function similarityEstimateNormalized(na: string, nb: string): number {
-  if (na.length === 0 || nb.length === 0) return 0
-  const tokensA = new Set(na.split(/\s+/))
-  const tokensB = new Set(nb.split(/\s+/))
-  if (tokensA.size === 0 || tokensB.size === 0) return 0
+/** Jaccard-style similarity over PRE-TOKENIZED text (see normalizeForDedup). */
+function similarityEstimateSets(tokensA: Set<string> | undefined, tokensB: Set<string> | undefined): number {
+  if (tokensA === undefined || tokensB === undefined || tokensA.size === 0 || tokensB.size === 0) return 0
+  // Iterate the SMALLER set: overlap is symmetric, and the smaller side is
+  // usually much shorter than the store's typical memory text.
+  const [small, large] = tokensA.size <= tokensB.size ? [tokensA, tokensB] : [tokensB, tokensA]
   let overlap = 0
-  for (const token of tokensA) if (tokensB.has(token)) overlap++
+  for (const token of small) if (large.has(token)) overlap++
   return 2 * overlap / (tokensA.size + tokensB.size)
 }
 
 function similarityEstimate(a: string, b: string): number {
-  return similarityEstimateNormalized(normalizeForDedup(a), normalizeForDedup(b))
+  return similarityEstimateSets(
+    new Set(normalizeForDedup(a).split(/\s+/)),
+    new Set(normalizeForDedup(b).split(/\s+/)),
+  )
 }
 
 /** Dependencies the engine needs; all injected for testability. */
@@ -389,7 +392,7 @@ export class MemoryEngine {
    */
   async forget(now?: number): Promise<ForgettingResult> {
     const reference = now ?? this.now()
-    const all = this.store.list()
+    const all = this.store.list(undefined, { withEmbeddings: false })
     const toDrop = this.forgetting.selectToForget(all, reference)
     for (const doc of toDrop) {
       this.store.delete(doc.id)
@@ -422,8 +425,26 @@ export class MemoryEngine {
       + 'Preserve decisions, goals, file paths, and open questions; drop stale detail.',
       target,
     )
+    // A whitespace-only response must not become a blank long memory
+    // (storeMemory rejects empty text; consolidation holds itself to the same bar).
+    if (mergedText.trim().length === 0) {
+      throw new Error('pyramid consolidation: the summarizer returned an empty summary')
+    }
     const embedding = await this.embedder.embed(mergedText)
     const importance = Math.max(...batch.map(doc => doc.importance))
+    // Carry the batch's MAJORITY kind: merging user/feedback mids into a
+    // hardcoded 'project' misfiled them in generateIndex groups and in
+    // maintain()'s by-kind pairwise scans.
+    const kindCounts = new Map<MemoryKind, number>()
+    for (const doc of batch) {
+      if (doc.kind === undefined) continue
+      kindCounts.set(doc.kind, (kindCounts.get(doc.kind) ?? 0) + 1)
+    }
+    let mergedKind: MemoryKind = 'project'
+    let bestCount = -1
+    for (const [kind, count] of kindCounts) {
+      if (count > bestCount) { mergedKind = kind; bestCount = count }
+    }
     const longDoc: MemoryDoc = {
       id: randomUUID(),
       tier: 'long',
@@ -432,19 +453,22 @@ export class MemoryEngine {
       importance,
       embedding,
       mergedFrom: batch.map(doc => doc.id),
-      kind: 'project',
+      kind: mergedKind,
     }
-    this.store.insert(longDoc)
-    this.index.add(longDoc.id, embedding)
-    // Demote the merged mids to the SHORT tier instead of deleting them: the
-    // long memory is a lossy re-compression, and destroying the mid originals
-    // made that loss irreversible (a merged fact that got dropped could never
-    // be recovered). The demoted mids keep their full text at a LOW importance
-    // so the forgetting policy retires them naturally before the long memory —
-    // while still being retrievable until then.
+    // DEMOTE FIRST, insert the long memory second: the two writes are
+    // separate autocommit statements, and a crash between them must leave a
+    // BENIGN state. Demoted-first means a crash loses the merge but leaves
+    // nothing re-mergeable; insert-first (the old order) left a long memory
+    // whose source mids were still mid-tier — re-merged later into duplicated
+    // long content.
     for (const doc of batch) {
       this.store.upsert({ ...doc, tier: 'short', importance: Math.min(doc.importance, 0.3) })
     }
+    this.store.insert(longDoc)
+    this.index.add(longDoc.id, embedding)
+    // The demoted mids keep their full text at a LOW importance so the
+    // forgetting policy retires them naturally before the long memory —
+    // while still being retrievable until then.
     this.trimLongMemories()
     return { merged: longDoc, demotedMids: batch.map(doc => doc.id) }
   }
@@ -556,7 +580,7 @@ export class MemoryEngine {
    * @returns the rendered index text.
    */
   generateIndex(limit = 10): string {
-    const all = this.store.list()
+    const all = this.store.list(undefined, { withEmbeddings: false })
     const order: MemoryKind[] = ['project', 'reference', 'feedback', 'user']
     const lines: string[] = []
     let unclassified = 0
@@ -579,6 +603,17 @@ export class MemoryEngine {
         lines.push(`- ${oneLine(doc.text)}`)
       }
     }
+    // The unclassified group gets the same overflow hint as the kind groups.
+    if (unclassified > 0) {
+      const unclassifiedDocs = all.filter(doc => doc.kind === undefined)
+      lines.push(`## unclassified (${unclassified})`)
+      for (const doc of unclassifiedDocs.slice(0, limit)) {
+        lines.push(`- ${oneLine(doc.text)} (id: ${doc.id})`)
+      }
+      if (unclassifiedDocs.length > limit) {
+        lines.push(`- … +${unclassifiedDocs.length - limit} more (search to fetch)`)
+      }
+    }
     if (lines.length === 0) return '(memory store is empty)'
     lines.unshift(`# Memory index (${all.length} memories${unclassified > 0 ? `, ${unclassified} unclassified` : ''})`)
     return lines.join('\n')
@@ -592,7 +627,7 @@ export class MemoryEngine {
    * @returns the maintenance report.
    */
   maintain(now?: number): MaintenanceReport {
-    const all = this.store.list()
+    const all = this.store.list(undefined, { withEmbeddings: false })
     const reference = now ?? this.now()
     const duplicates: [MemoryDoc, MemoryDoc][] = []
     const conflicts: { a: MemoryDoc; b: MemoryDoc; score: number }[] = []
@@ -607,7 +642,9 @@ export class MemoryEngine {
     // Normalize once per doc: the pairwise loop below used to re-run the
     // regex-heavy normalizeForDedup on BOTH texts for every pair (O(n²) full
     // passes over whole memory texts).
-    const normalized = new Map(all.map(doc => [doc.id, normalizeForDedup(doc.text)]))
+    // Pre-tokenize once per doc: the pairwise loop used to build token Sets
+    // from full texts for BOTH sides of every pair (O(n²) Set constructions).
+    const tokenSets = new Map(all.map(doc => [doc.id, new Set(normalizeForDedup(doc.text).split(/\s+/))]))
     for (const docs of byKind.values()) {
       for (let i = 0; i < docs.length; i++) {
         for (let j = i + 1; j < docs.length; j++) {
@@ -615,7 +652,7 @@ export class MemoryEngine {
           const b = docs[j]
           const key = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`
           if (seen.has(key)) continue
-          const score = similarityEstimateNormalized(normalized.get(a.id) ?? '', normalized.get(b.id) ?? '')
+          const score = similarityEstimateSets(tokenSets.get(a.id), tokenSets.get(b.id))
           if (score >= 0.85) {
             seen.add(key)
             if (score >= 0.95) {

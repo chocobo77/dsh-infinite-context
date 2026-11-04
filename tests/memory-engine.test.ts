@@ -149,7 +149,10 @@ describe('similarity-clustered consolidation', () => {
     const { store, engine } = buildEngine()
     // Seed (oldest) + a topically-identical sibling + a topically-unrelated one.
     await engine.storeMemory('persistence layer stores memories in the sqlite database', 'mid')
-    await engine.storeMemory('deploy the web server over https with a tls certificate', 'mid')
+    // Genuinely zero-overlap with the seed (no shared 'the'): before this
+    // fixture, deploy-web and rotate-keys TIED at one shared token and the
+    // unrelated exclusion depended on insertion order.
+    await engine.storeMemory('provision ubuntu workstations using scripted tooling', 'mid')
     await engine.storeMemory('rotate the api keys and update the access log', 'mid')
     await engine.storeMemory('persistence layer sqlite database schema migration', 'mid')
     const result = await engine.consolidate()
@@ -157,7 +160,7 @@ describe('similarity-clustered consolidation', () => {
     const ids = new Set(result?.merged.mergedFrom ?? [])
     const byText = new Map(store.list('short').map(doc => [doc.text, doc.id]))
     const sibling = byText.get('persistence layer sqlite database schema migration')
-    const unrelated = byText.get('deploy the web server over https with a tls certificate')
+    const unrelated = byText.get('provision ubuntu workstations using scripted tooling')
     // The similar sibling made the batch; the unrelated one did not (it stays
     // a mid... actually it is demoted only when merged, so it remains mid).
     expect(sibling).toBeDefined()

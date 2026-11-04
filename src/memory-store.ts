@@ -270,7 +270,7 @@ const DEDUP_RULE_KEY = 'dedup:normalize-version'
  * every stored `text_norm`, instead of comparing new texts against keys an older
  * rule produced (which would silently defeat dedup).
  */
-const DEDUP_RULE_VERSION = '2'
+const DEDUP_RULE_VERSION = '3'
 
 export function normalizeForDedup(text: string): string {
   return text
@@ -279,7 +279,10 @@ export function normalizeForDedup(text: string): string {
     .replace(/\b\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?\b/g, '#')
     .replace(/\d{8,}/g, '#')
     .replace(
-      /\b(?:port|pid)\s+\d{1,7}\b|\blisten(?:ing)? on\s+\d{1,7}\b|\b(\d{4,7})\b/g,
+      // Bare runs mask at 5+ digits: 4-digit runs are YEARS and amounts
+      // ("预算 5000" vs "预算 6000" are DIFFERENT facts that a 4-digit mask
+      // silently deduplicated away).
+      /\b(?:port|pid)\s+\d{1,7}\b|\blisten(?:ing)? on\s+\d{1,7}\b|\b(\d{5,7})\b/g,
       (match, bare) => (bare === undefined ? match : '#'),
     )
     .replace(/\s+/g, ' ')
@@ -980,13 +983,18 @@ export class MemoryStore {
   /**
    * List documents, optionally restricted to a tier, ordered newest first.
    * @param tier - optional tier filter.
+   * @param opts - `withEmbeddings: false` skips the embedding column: the
+   *   vectors are the bulk of each row, and most readers (forget, maintain,
+   *   generateIndex, status) never look at them.
    * @returns the matching documents.
    */
-  list(tier?: Tier): MemoryDoc[] {
+  list(tier?: Tier, opts?: { withEmbeddings?: boolean }): MemoryDoc[] {
     this.assertOpen()
+    const withEmbeddings = opts?.withEmbeddings ?? true
+    const columns = withEmbeddings ? '*' : 'id, tier, text, created_at, importance, source_session_id, source_turn_start, source_turn_end, merged_from, kind, text_norm'
     const rows = tier === undefined
-      ? (this.db.prepare('SELECT * FROM memories ORDER BY created_at DESC').all() as unknown as MemoryRow[])
-      : (this.db.prepare('SELECT * FROM memories WHERE tier = ? ORDER BY created_at DESC').all(tier) as unknown as MemoryRow[])
+      ? (this.db.prepare(`SELECT ${columns} FROM memories ORDER BY created_at DESC, rowid DESC`).all() as unknown as MemoryRow[])
+      : (this.db.prepare(`SELECT ${columns} FROM memories WHERE tier = ? ORDER BY created_at DESC, rowid DESC`).all(tier) as unknown as MemoryRow[])
     return rows.map(row => this.rowToDoc(row))
   }
 

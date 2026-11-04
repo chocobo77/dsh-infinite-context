@@ -41,7 +41,7 @@ export class TransformersEmbedder implements Embedder {
 
   private async pipeline(): Promise<Pipeline> {
     if (this.pipelinePromise === null) {
-      this.pipelinePromise = (async () => {
+      const attempt = (async () => {
         let mod: { pipeline: (task: string, model: string) => Promise<Pipeline> }
         try {
           mod = await import('@huggingface/transformers')
@@ -54,6 +54,15 @@ export class TransformersEmbedder implements Embedder {
         }
         return mod.pipeline('feature-extraction', this.modelName)
       })()
+      this.pipelinePromise = attempt
+      // A REJECTED init must not be memoized: the first download can fail for
+      // transient reasons (hub outage, OOM in ONNX init), and caching the
+      // rejection would brick the embedder for the process lifetime — every
+      // later embed() awaits the same rejected promise, defeating even the
+      // migration retry loop. Later callers re-attempt the download.
+      attempt.catch(() => {
+        if (this.pipelinePromise === attempt) this.pipelinePromise = null
+      })
     }
     return this.pipelinePromise
   }
@@ -61,11 +70,6 @@ export class TransformersEmbedder implements Embedder {
   async embed(text: string): Promise<number[]> {
     const run = await this.pipeline()
     const result = await run(text, { pooling: 'mean', normalize: true })
-    const data = Array.from(result.data)
-    if (data.length !== this.dimension) {
-      // The model's real dimension wins; record it so callers stay consistent.
-      this.dimension = data.length
-    }
-    return normalize(data)
+    return normalize(Array.from(result.data))
   }
 }

@@ -193,7 +193,20 @@ export async function createEmbedder(config: EmbedderConfig): Promise<Embedder> 
       )
     }
     const { TransformersEmbedder } = await import('./transformers-embedder.ts')
-    return new TransformersEmbedder(config.model ?? 'sentence-transformers/all-MiniLM-L6-v2', config.dimension)
+    const embedder = new TransformersEmbedder(config.model ?? 'sentence-transformers/all-MiniLM-L6-v2', config.dimension)
+    // Probe the REAL output dimension once, before any caller computes an
+    // embedder signature or reads `dimension`: the model's true output wins
+    // over the configured guess (all-MiniLM is 384, all-mpnet is 768), and a
+    // late mutation would race the engine's signature math (permanent
+    // re-migration loop or silent zero-index loads). The probe text is tiny;
+    // the model is already downloaded/initialized by the pre-import above
+    // only when the package was present — first real init happens here.
+    const probe = await embedder.embed('dimension probe')
+    if (embedder.dimension !== probe.length) {
+      // The embedder already adopted the real length; surface the drift.
+      console.warn(`[dsh-infinite-context] transformers embedder reports ${probe.length} dimensions, config expected ${embedder.dimension} — using ${probe.length}`)
+    }
+    return embedder
   }
   throw new Error(`unknown embedder kind: ${String(config.kind)}`)
 }
