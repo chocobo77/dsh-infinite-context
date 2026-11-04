@@ -26,9 +26,13 @@ describe('createEmbedder', () => {
 })
 
 describe('tokenize', () => {
-  it('splits ASCII words and individual Han characters', () => {
+  it('splits ASCII words, Han unigrams and Han bigrams', () => {
     expect(tokenize('Hello world')).toEqual(['hello', 'world'])
-    expect(tokenize('Hello World, 你好世界')).toEqual(['hello', 'world', '你', '好', '世', '界'])
+    // Han runs: unigrams PLUS adjacent bigrams — the standard CJK
+    // lexical-retrieval feature set (compounds like 世界 become first-class
+    // tokens; single characters alone carry almost no discriminative power).
+    expect(tokenize('Hello World, 你好世界'))
+      .toEqual(['hello', 'world', '你', '好', '世', '界', '你好', '好世', '世界'])
   })
 })
 

@@ -262,7 +262,8 @@ export class VectorRetriever {
         }
         // Semantic dedup: near-duplicate memory already present?
         if (dedupeMinScore > 0) {
-          const near = await this.ctx.memoryContext.retrieve(chunk, 1, dedupeMinScore)
+          // A similarity probe is not a use: no importance reinforcement.
+          const near = await this.ctx.memoryContext.retrieve(chunk, 1, dedupeMinScore, { reinforce: false })
           if (near.length > 0 && near[0].score >= dedupeMinScore) {
             skipped++
             continue
@@ -339,6 +340,7 @@ export class VectorRetriever {
     excludeIds?: ReadonlySet<string>,
     tokenBudget?: number,
     surfaceTexts?: readonly string[],
+    currentSessionId?: string,
   ): Promise<{ message: UserMessage; hitCount: number; ids: string[]; skipped: number } | null> {
     try {
       // Memories dropped because the model already reads their text on the
@@ -346,7 +348,8 @@ export class VectorRetriever {
       let surfaceSkipped = 0
       let timer: NodeJS.Timeout | undefined
       const hits = await Promise.race([
-        this.ctx.memoryContext.retrieve(query, this.config.topK, this.config.minScore),
+        this.ctx.memoryContext.retrieve(query, this.config.topK, this.config.minScore,
+          ...(currentSessionId === undefined ? [] : [{ currentSessionId }])),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error('memory retrieval timeout')), MEMORY_STORE_TIMEOUT_MS)
           // Never hold the event loop open for a lost race (process shutdown).

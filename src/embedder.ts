@@ -92,10 +92,35 @@ export function fnv1a(str: string): number {
 export function tokenize(text: string): string[] {
   const lower = text.toLowerCase()
   const tokens: string[] = []
-  const re = /[a-z0-9_]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g
+  // CJK runs additionally emit adjacent BIGRAMS: single Han characters carry
+  // almost no discriminative power (的/了/是 appear everywhere, and compound
+  // words like 部署/软件 are the actual retrieval units) — the unigram+bigram
+  // mix is the standard CJK lexical-retrieval feature set (the same shape as
+  // Lucene's cjk analyzer). ASCII word runs stay whole words.
+  const re = /[a-z0-9_]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+/g
   let m: RegExpExecArray | null
-  while ((m = re.exec(lower)) !== null) tokens.push(m[0])
+  while ((m = re.exec(lower)) !== null) {
+    const run = m[0]
+    if (isHanRun(run) && run.length > 1) {
+      // Han run: unigrams + adjacent bigrams (see the comment above).
+      for (const ch of run) tokens.push(ch)
+      for (let i = 0; i + 1 < run.length; i += 1) tokens.push(run.slice(i, i + 2))
+    } else if (/^[a-z0-9_]+$/.test(run)) {
+      // ASCII word: stays WHOLE (splitting it would flood the vector with
+      // single-letter noise and destroy word-level discrimination).
+      tokens.push(run)
+    } else {
+      // Kana/hangul runs and single characters: per-character tokens
+      // (phonetic scripts have no compound-word structure to capture).
+      for (const ch of run) tokens.push(ch)
+    }
+  }
   return tokens
+}
+
+/** Whether every code point of `run` is CJK (i.e. the run supports bigrams). */
+function isHanRun(run: string): boolean {
+  return /^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$/.test(run)
 }
 
 /**
@@ -106,7 +131,10 @@ export function tokenize(text: string): string[] {
  */
 export class LightweightEmbedder implements Embedder {
   readonly dimension: number
-  readonly name = 'lightweight-feature-hash'
+  // v2: the tokenizer emits Han bigrams (weighted 1.5) alongside unigrams —
+  // the name bump is what drives the stored-vector migration in
+  // MemoryEngine.loadFromStore. Never rename without shipping that migration.
+  readonly name = 'lightweight-feature-hash-v2'
 
   /**
    * @param dimension - vector dimension (default 256). Higher = fewer hash
@@ -129,7 +157,12 @@ export class LightweightEmbedder implements Embedder {
       const h = fnv1a(token)
       const bucket = h % this.dimension
       const sign = (h >>> 31) & 1 ? 1 : -1
-      vector[bucket] += sign * (1 + Math.log(count))
+      // Bigrams outweigh unigrams 1.5:1 — a two-character compound (部署,
+      // 卸载, 软件) is the actual unit of meaning in Chinese and should
+      // dominate the single characters it is made of.
+      const bigram = token.length === 2 && isHanRun(token)
+      const weight = bigram ? 1.5 : 1
+      vector[bucket] += sign * weight * (1 + Math.log(count))
     }
     return normalize(vector)
   }

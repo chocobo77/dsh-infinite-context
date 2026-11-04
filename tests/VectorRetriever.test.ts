@@ -102,7 +102,8 @@ describe('ingest dedup layers', () => {
     })
     const retriever = new VectorRetriever(ctx, makeConfig())
     await retriever.ingest('slightly different memory', 'bash')
-    expect(spies.retrieve).toHaveBeenCalledWith(expect.any(String), 1, 0.92)
+    // A similarity probe is not a use: reinforcement is off for dedup lookups.
+  expect(spies.retrieve).toHaveBeenCalledWith(expect.any(String), 1, 0.92, { reinforce: false })
     expect(spies.storeMemory).not.toHaveBeenCalled()
   })
 

@@ -537,6 +537,32 @@ export class MemoryStore {
   }
 
   /**
+   * Nudge one memory's importance up (capped): retrieval-reinforcement —
+   * a memory the model actually got shown is worth keeping longer than an
+   * identical-scored one that was never retrieved.
+   * @param id - the memory id.
+   * @param delta - the importance increment (positive).
+   * @param max - the ceiling the bumped value is clamped to.
+   */
+  bumpImportance(id: string, delta: number, max = 0.95): void {
+    this.assertOpen()
+    this.db.prepare(
+      'UPDATE memories SET importance = MIN(?, importance + ?) WHERE id = ?',
+    ).run(max, delta, id)
+  }
+
+  /**
+   * Replace one memory's embedding vector in place (embedder migration:
+   * the recorded signature changed, so every stored vector must be rebuilt
+   * under the current embedder before it means anything again).
+   */
+  updateEmbedding(id: string, embedding: readonly number[]): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE memories SET embedding = ? WHERE id = ?')
+      .run(vectorToBlob(embedding), id)
+  }
+
+  /**
    * Read an archived tool result by ref.
    * @param ref - the content-addressed ref.
    * @returns the record, or `undefined` when unknown.

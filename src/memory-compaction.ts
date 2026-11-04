@@ -3246,6 +3246,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
               excludeIds,
               injectionCap,
               surface(),
+              // Same-session memories get the recency boost in the ranking.
+              String(session.id),
             )
             if (retrieval !== null) {
               injections.push(retrieval.message)

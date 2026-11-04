@@ -166,3 +166,42 @@ describe('similarity-clustered consolidation', () => {
     expect(store.count('mid')).toBe(1)
   })
 })
+
+describe('retrieval intelligence (2026-11-05)', () => {
+  it('retrieval reinforces importance (use-based decay resistance)', async () => {
+    const { engine } = buildEngine()
+    await engine.storeMemory('configure the token budget for the context window', 'mid', { importance: 0.3 })
+    const hits = await engine.retrieve('how do I tune the token budget?')
+    expect(hits[0].doc.importance).toBeCloseTo(0.32, 5) // 0.3 + 0.02, capped later
+    // The bump is persisted, and a similarity probe (reinforce: false) does
+    // NOT reinforce again — dedup lookups are not uses.
+    const stored = await engine.retrieve('how do I tune the token budget?', undefined, undefined, { reinforce: false })
+    expect(stored[0].doc.importance).toBeCloseTo(0.32, 5)
+  })
+
+  it('ranks memories from the current session first on equal score', async () => {
+    const { engine } = buildEngine()
+    await engine.storeMemory('shared topic alpha', 'mid', { sourceSessionId: 's-old' })
+    await engine.storeMemory('shared topic beta', 'mid', { sourceSessionId: 's-current' })
+    const hits = await engine.retrieve('shared topic', undefined, undefined, { currentSessionId: 's-current' })
+    expect(hits[0].doc.sourceSessionId).toBe('s-current')
+    // The boost is recorded on the returned score (ranking basis).
+    expect(hits[0].score).toBeGreaterThan(hits[1].score)
+  })
+
+  it('re-embeds the store when the embedder signature changes (migration)', async () => {
+    const { store, engine } = buildEngine()
+    // Simulate a store written by an OLDER embedder generation.
+    store.kvSet('embedder:signature', 'lightweight-feature-hash-v1:64')
+    await engine.storeMemory('configure the token budget', 'mid')
+    expect(engine.needsEmbedderMigration).toBe(false) // loadFromStore has not run yet
+    expect(engine.loadFromStore()).toBe(0) // mismatch: hydrate nothing, defer
+    expect(engine.needsEmbedderMigration).toBe(true)
+    const reembedded = await engine.migrateEmbeddings()
+    expect(reembedded).toBe(1)
+    expect(engine.needsEmbedderMigration).toBe(false)
+    expect(store.kvGet('embedder:signature')).toContain('v2')
+    // Idempotent: a second run is a no-op.
+    expect(await engine.migrateEmbeddings()).toBe(0)
+  })
+})

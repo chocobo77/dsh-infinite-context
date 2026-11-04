@@ -168,6 +168,9 @@ export class MemoryContext extends Service {
     // retrieval works across restarts (not only for memories stored in this
     // process).
     const loaded = this.engine.loadFromStore()
+    // A signature mismatch left the index empty: rebuild the embeddings in
+    // the background (retrieval degrades gracefully until it finishes).
+    if (this.engine.needsEmbedderMigration) void this.engine.migrateEmbeddings()
     this.context.logger.info(
       `memoryContext ready: embedder=${embedder.name}(${embedder.dimension}) `
       + `store=${this.resolved.storePath} budget=${budget.total}/${budget.maxTotal} `
@@ -425,8 +428,13 @@ export class MemoryContext extends Service {
    * @param minScore - optional per-call similarity floor.
    * @returns sorted, filtered hits.
    */
-  retrieve(query: string, k?: number, minScore?: number): Promise<RetrievalHit[]> {
-    return this.requireEngine().retrieve(query, k, minScore)
+  retrieve(
+    query: string,
+    k?: number,
+    minScore?: number,
+    options?: { reinforce?: boolean; currentSessionId?: string },
+  ): Promise<RetrievalHit[]> {
+    return this.requireEngine().retrieve(query, k, minScore, options)
   }
 
   /** Whether any stored memory has exactly this text (ingest dedup helper). */

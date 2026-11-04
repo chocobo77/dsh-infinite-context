@@ -105,6 +105,15 @@ export interface StoreMemoryOptions {
   readonly kind?: MemoryKind
 }
 
+/** The embedder identity recorded in the KV store (drives migration). */
+const EMBEDDER_SIGNATURE_KEY = 'embedder:signature'
+/** Importance bump applied to memories the model actually got shown. */
+export const RETRIEVAL_REINFORCE_DELTA = 0.02
+/** Ceiling the retrieval reinforcement is clamped to. */
+export const RETRIEVAL_IMPORTANCE_MAX = 0.95
+/** Ranking boost for memories distilled from the CURRENT session. */
+export const SESSION_RECENCY_BOOST = 0.05
+
 /** The multi-tier memory engine. */
 export class MemoryEngine {
   private readonly store: MemoryStore
@@ -116,6 +125,13 @@ export class MemoryEngine {
   private summarize: SummarizeFn | undefined
   private readonly now: () => number
   private readonly onWarn: ((message: string) => void) | undefined
+  /** Set when the stored vectors were built by a different embedder. */
+  private pendingMigration = false
+
+  /** Whether loadFromStore found a signature mismatch awaiting migration. */
+  get needsEmbedderMigration(): boolean {
+    return this.pendingMigration
+  }
 
   /**
    * @param deps - the injected dependencies.
@@ -143,6 +159,21 @@ export class MemoryEngine {
    */
   loadFromStore(): number {
     const all = this.store.list()
+    // Embedder identity gate: the stored vectors only mean something under
+    // the embedder that produced them (tokenizer/hashing changes silently
+    // corrupt every score otherwise). On a mismatch the index stays EMPTY —
+    // retrieval degrades gracefully for the migration window — and
+    // migrateEmbeddings() rebuilds everything under the current embedder.
+    const signature = `${this.embedder.name}:${this.embedder.dimension}`
+    const recorded = this.store.kvGet(EMBEDDER_SIGNATURE_KEY)
+    if (recorded !== signature) {
+      this.pendingMigration = true
+      this.onWarn?.(
+        `embedder signature changed (${recorded ?? 'none'} → ${signature}): `
+        + `${all.length} memories will be re-embedded in the background`,
+      )
+      return 0
+    }
     let loaded = 0
     let dimensionMismatches = 0
     for (const doc of all) {
@@ -167,7 +198,52 @@ export class MemoryEngine {
           + 'skipped from the index; re-ingest or reset to rebuild them',
       )
     }
+    this.store.kvSet(EMBEDDER_SIGNATURE_KEY, signature)
     return loaded
+  }
+
+  /**
+   * Rebuild every stored embedding under the CURRENT embedder and rehydrate
+   * the index. Scheduled (fire-and-forget) by the service constructor when
+   * {@link loadFromStore} detected a signature mismatch — an embedder or
+   * tokenizer upgrade without a migration would otherwise leave the store
+   * scoring garbage forever. Lightweight hash embedding re-builds hundreds
+   * of memories in milliseconds; a model-backed embedder takes as long as
+   * the model needs, and retrieval simply stays empty until it finishes.
+   * @returns the number of memories re-embedded.
+   */
+  async migrateEmbeddings(): Promise<number> {
+    if (!this.pendingMigration) return 0
+    this.pendingMigration = false
+    const all = this.store.list()
+    const started = Date.now()
+    try {
+      let count = 0
+      for (const doc of all) {
+        const vector = await this.embedder.embed(doc.text)
+        this.store.updateEmbedding(doc.id, vector)
+        this.index.add(doc.id, vector)
+        count += 1
+        if (count % 100 === 0) {
+          this.onWarn?.(`embedder migration: ${count}/${all.length} memories re-embedded`)
+        }
+      }
+      this.store.kvSet(EMBEDDER_SIGNATURE_KEY, `${this.embedder.name}:${this.embedder.dimension}`)
+      this.onWarn?.(
+        `embedder migration complete: ${count} memories re-embedded `
+        + `in ${Date.now() - started}ms`,
+      )
+      return count
+    } catch (error) {
+      // Leave the pending flag set: the next service start retries the
+      // migration instead of stranding the store on a half-finished rebuild.
+      this.pendingMigration = true
+      this.onWarn?.(
+        'embedder migration failed; it will retry on the next start: '
+        + (error instanceof Error ? error.message : String(error)),
+      )
+      return 0
+    }
   }
 
   /**
@@ -235,7 +311,12 @@ export class MemoryEngine {
    *   configured `retrievalMinScore` when provided.
    * @returns hits sorted by descending similarity, filtered by the floor.
    */
-  async retrieve(query: string, k?: number, minScore?: number): Promise<RetrievalHit[]> {
+  async retrieve(
+    query: string,
+    k?: number,
+    minScore?: number,
+    options?: { reinforce?: boolean; currentSessionId?: string },
+  ): Promise<RetrievalHit[]> {
     const topK = k ?? this.config.retrievalTopK
     const floor = minScore ?? this.config.retrievalMinScore
     const queryVector = await this.embedder.embed(query)
@@ -244,6 +325,34 @@ export class MemoryEngine {
     for (const hit of hits) {
       const doc = this.store.get(hit.id)
       if (doc !== undefined) results.push({ doc, score: hit.score })
+    }
+    // Same-session recency: for the RAG use case ("context for THIS turn") a
+    // memory distilled from the current session is disproportionately likely
+    // to be the one the user means — a flat additive boost re-ranks those
+    // above equally-scoring entries from older sessions without needing
+    // semantics the lexical embedder does not have.
+    if (options?.currentSessionId !== undefined) {
+      for (const hit of results) {
+        if (hit.doc.sourceSessionId === options.currentSessionId) {
+          results[results.indexOf(hit)] = { doc: hit.doc, score: hit.score + SESSION_RECENCY_BOOST }
+        }
+      }
+      results.sort((a, b) => b.score - a.score)
+    }
+    // Use-based reinforcement: a memory the model actually got shown decays
+    // slower than an identical-scored one that was never retrieved. Skipped
+    // for the ingest dedup lookups (a similarity probe is not a use).
+    if (options?.reinforce !== false) {
+      return results.map(hit => {
+        const importance = Math.min(
+          RETRIEVAL_IMPORTANCE_MAX,
+          hit.doc.importance + RETRIEVAL_REINFORCE_DELTA,
+        )
+        if (importance > hit.doc.importance) {
+          this.store.bumpImportance(hit.doc.id, RETRIEVAL_REINFORCE_DELTA, RETRIEVAL_IMPORTANCE_MAX)
+        }
+        return { doc: { ...hit.doc, importance }, score: hit.score }
+      })
     }
     return results
   }
