@@ -50,6 +50,22 @@ describe('extractiveSummary', () => {
     expect(text).not.toContain('plain line')
   })
 
+  it('keeps tool signals when the budget squeezes (signals rank before assistant lines)', () => {
+    // Fat user + assistant items fill the budget under the OLD section order
+    // (users → assistants → tools), and the all-or-nothing section accounting
+    // then dropped exactly the signal lines this fallback exists to preserve.
+    const busy: ExtractiveMessage[] = [
+      { role: 'user', text: 'user instruction ' + 'x'.repeat(120) },
+      { role: 'assistant', text: 'assistant narration ' + 'y'.repeat(120) },
+      { role: 'tool', text: 'error: TS2304 cannot find name\nexit code 1' },
+      { role: 'user', text: 'another instruction ' + 'z'.repeat(120) },
+      { role: 'assistant', text: 'more narration ' + 'w'.repeat(120) },
+      { role: 'tool', text: '12 passed, 3 failed\nplain line' },
+    ]
+    const text = extractiveSummary(busy, { maxChars: 1_500 })
+    expect(text).toContain('exit code 1')
+  })
+
   it('drops duplicate tool signal lines', () => {
     const text = extractiveSummary(messages)
     expect(text.match(/exit code 1/g)?.length).toBe(1)

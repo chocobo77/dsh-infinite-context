@@ -113,6 +113,14 @@ export const RETRIEVAL_REINFORCE_DELTA = 0.02
 export const RETRIEVAL_IMPORTANCE_MAX = 0.95
 /** Ranking boost for memories distilled from the CURRENT session. */
 export const SESSION_RECENCY_BOOST = 0.05
+/**
+ * A failed migration retries in-process after this delay (up to
+ * {@link MIGRATION_RETRY_MAX} attempts) instead of stranding retrieval on an
+ * empty index until the next restart. The timer is unref'd so it never holds
+ * the process open.
+ */
+const MIGRATION_RETRY_MS = 60_000
+const MIGRATION_RETRY_MAX = 5
 
 /** The multi-tier memory engine. */
 export class MemoryEngine {
@@ -127,6 +135,8 @@ export class MemoryEngine {
   private readonly onWarn: ((message: string) => void) | undefined
   /** Set when the stored vectors were built by a different embedder. */
   private pendingMigration = false
+  /** Failed in-process migration attempts (reset on success / service start). */
+  private migrationRetries = 0
 
   /** Whether loadFromStore found a signature mismatch awaiting migration. */
   get needsEmbedderMigration(): boolean {
@@ -229,19 +239,30 @@ export class MemoryEngine {
         }
       }
       this.store.kvSet(EMBEDDER_SIGNATURE_KEY, `${this.embedder.name}:${this.embedder.dimension}`)
+      this.migrationRetries = 0
       this.onWarn?.(
         `embedder migration complete: ${count} memories re-embedded `
         + `in ${Date.now() - started}ms`,
       )
       return count
     } catch (error) {
-      // Leave the pending flag set: the next service start retries the
-      // migration instead of stranding the store on a half-finished rebuild.
+      // Leave the pending flag set and retry IN-PROCESS (bounded): stranding
+      // retrieval on an empty index until the next restart is worse than a
+      // bounded background retry. A model-backed embedder that is still
+      // downloading its weights recovers within a couple of attempts.
       this.pendingMigration = true
+      const attempt = this.migrationRetries + 1
+      this.migrationRetries = attempt
+      const retry = attempt <= MIGRATION_RETRY_MAX
       this.onWarn?.(
-        'embedder migration failed; it will retry on the next start: '
+        `embedder migration failed (attempt ${attempt}/${MIGRATION_RETRY_MAX + 1}); `
+        + (retry ? `retrying in ${MIGRATION_RETRY_MS / 1000}s: ` : 'giving up until the next start: ')
         + (error instanceof Error ? error.message : String(error)),
       )
+      if (retry) {
+        const timer = setTimeout(() => void this.migrateEmbeddings(), MIGRATION_RETRY_MS)
+        timer.unref()
+      }
       return 0
     }
   }
@@ -320,7 +341,11 @@ export class MemoryEngine {
     const topK = k ?? this.config.retrievalTopK
     const floor = minScore ?? this.config.retrievalMinScore
     const queryVector = await this.embedder.embed(query)
-    const hits = this.index.search(queryVector, topK, floor)
+    // With a session boost in play, search a WIDER candidate pool: the boost
+    // can only re-rank what the raw-score search returned, so a current-
+    // session memory sitting at raw rank topK+1 would never be rescued.
+    const poolSize = options?.currentSessionId !== undefined ? topK * 3 + 5 : topK
+    const hits = this.index.search(queryVector, poolSize, floor)
     const results: RetrievalHit[] = []
     for (const hit of hits) {
       const doc = this.store.get(hit.id)
@@ -332,18 +357,19 @@ export class MemoryEngine {
     // above equally-scoring entries from older sessions without needing
     // semantics the lexical embedder does not have.
     if (options?.currentSessionId !== undefined) {
-      for (const hit of results) {
+      for (let i = 0; i < results.length; i += 1) {
+        const hit = results[i]!
         if (hit.doc.sourceSessionId === options.currentSessionId) {
-          results[results.indexOf(hit)] = { doc: hit.doc, score: hit.score + SESSION_RECENCY_BOOST }
+          results[i] = { doc: hit.doc, score: hit.score + SESSION_RECENCY_BOOST }
         }
       }
       results.sort((a, b) => b.score - a.score)
     }
-    // Use-based reinforcement: a memory the model actually got shown decays
-    // slower than an identical-scored one that was never retrieved. Skipped
-    // for the ingest dedup lookups (a similarity probe is not a use).
-    if (options?.reinforce !== false) {
-      return results.map(hit => {
+    // Now cut to the caller's topK (post-boost), and reinforce only the
+    // survivors — a memory crowded out of the final answer was not used.
+    const top = (options?.currentSessionId !== undefined ? results.slice(0, topK) : results)
+      .map(hit => {
+        if (options?.reinforce === false) return hit
         const importance = Math.min(
           RETRIEVAL_IMPORTANCE_MAX,
           hit.doc.importance + RETRIEVAL_REINFORCE_DELTA,
@@ -353,8 +379,7 @@ export class MemoryEngine {
         }
         return { doc: { ...hit.doc, importance }, score: hit.score }
       })
-    }
-    return results
+    return top
   }
 
   /**

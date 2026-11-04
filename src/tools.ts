@@ -36,7 +36,10 @@ function renderHits(hits: { doc: { tier: string; text: string }; score: number }
 export function matchWindows(original: string, query: string, maxWindows: number, pad = 200): string[] {
   const points = Array.from(original)
   const haystack = original.toLowerCase()
-  const needle = query.toLowerCase()
+  // Cap the needle: every window carries the whole query text, so a
+  // multi-10k-char query would blow the tool output past the paging contract
+  // the banner promises. 300 code points is ample for a search phrase.
+  const needle = Array.from(query.toLowerCase()).slice(0, 300).join('')
   const windows: string[] = []
   let from = 0
   while (windows.length < maxWindows) {
@@ -139,7 +142,9 @@ export function apply(ctx: Context) {
       render: (_args, value: string) => [{ type: 'text', text: value }],
     },
     async execute(args: { query: string; k?: number }) {
-      const hits = await ctx.memoryContext.retrieve(args.query, args.k ?? 5)
+      // Clamp: a huge k renders the whole store into one model-visible result.
+      const k = Math.max(1, Math.min(20, Math.floor(args.k ?? 5)))
+      const hits = await ctx.memoryContext.retrieve(args.query, k)
       const base = renderHits(hits)
       // Upstream `search_context` parity: a keyword sweep over the folded
       // (compressed) ranges, which the semantic store only keeps as
@@ -222,7 +227,9 @@ export function apply(ctx: Context) {
       render: (_args, value: string) => [{ type: 'text', text: value }],
     },
     async execute(args: { limit?: number }) {
-      return ctx.memoryContext.generateIndex(args.limit ?? 10)
+      // Clamp: negative slice(0, -n) and huge limits both render wrong scopes.
+      const limit = Math.max(1, Math.min(50, Math.floor(args.limit ?? 10)))
+      return ctx.memoryContext.generateIndex(limit)
     },
     presentCall: args => ({ card: 'generic', title: 'Memory index', kind: 'other', rawInput: args }),
   }))

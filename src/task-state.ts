@@ -67,7 +67,14 @@ function clip(text: string, maxChars: number): string {
  */
 export function parseCheckpointSection(text: string, heading: string): Section {
   const lines = text.split(/\r?\n/)
-  const start = lines.findIndex(line => line.trim() === '## ' + heading)
+  // Prefer the LAST exact heading: user content the summarizer quoted
+  // verbatim can carry the same '## <section>' shape earlier in the text,
+  // and harvesting the first occurrence would inject the user's words as
+  // carried working-memory state.
+  let start = -1
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i]?.trim() === '## ' + heading) { start = i; break }
+  }
   if (start < 0) return []
   const bullets: string[] = []
   for (let i = start + 1; i < lines.length; i += 1) {

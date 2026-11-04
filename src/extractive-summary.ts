@@ -99,9 +99,13 @@ export function extractiveSummary(
       .map(item => '- ' + clipLineByCodePoints(item, o.maxItemChars))
       .join('\n'))
   }
+  // Tool signals come BEFORE assistant first-lines: on a busy range the
+  // users+assistants sections can consume the whole budget, and the
+  // all-or-nothing per-section accounting would then drop exactly the
+  // errors/exit-codes lines this fallback exists to preserve.
   section('User instructions (verbatim)', users, o.maxUserItems)
-  section('Assistant turns (first line)', assistants, o.maxAssistantItems)
   section('Tool signal lines', toolSignals, o.maxToolItems)
+  section('Assistant turns (first line)', assistants, o.maxAssistantItems)
 
   // Budget accounting in CODE POINTS (matching maxChars' documented unit and
   // the final clip); a UTF-16 length here would overcount astral text and

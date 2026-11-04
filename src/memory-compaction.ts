@@ -194,6 +194,17 @@ const FORCED_PRESSURE_COOLDOWN_MS = 10_000
  */
 const FORCED_FOLD_STALL_MAX = 2
 const FORCED_FOLD_STALL_BACKOFF_MS = 5 * 60_000
+/**
+ * The speculative background call has the same failure-loop shape as the
+ * fit-guard doors (a hung route re-fires a full-price summarizer call every
+ * pre-step while the surface sits above the ahead-ratio), so it gets the
+ * same medicine: after {@link SPECULATIVE_STALL_MAX} consecutive failed
+ * launches/merges, speculation stands down for
+ * {@link SPECULATIVE_STALL_BACKOFF_MS}. Cleared by any prepared/refreshed
+ * checkpoint.
+ */
+const SPECULATIVE_STALL_MAX = 2
+const SPECULATIVE_STALL_BACKOFF_MS = 10 * 60_000
 
 /**
  * Share of the session's model window the per-turn RAG injection may occupy.
@@ -1059,7 +1070,7 @@ export class HistoryCompressor {
  * @param tokenBudget - maximum allowed estimated tokens.
  * @param retainRecent - minimum number of newest messages to preserve (default 4).
  */
-function fallbackTruncate(
+export function fallbackTruncate(
   messages: Message[],
   tokenBudget: number,
   retainRecent = 4,
@@ -1096,8 +1107,26 @@ function fallbackTruncate(
   tokens = estimate(result)
   if (tokens <= tokenBudget) return result
 
-  // Phase 3: drop oldest messages one by one (preserve the newest retainRecent)
+  // Phase 3: drop oldest messages one by one (preserve the newest retainRecent).
+  // Two pins beyond the count:
+  //   - the LATEST user message — a tail of tool results (parallel calls) can
+  //     push it outside a count-only window, and the request would keep the
+  //     answers while losing the question they reply to;
+  //   - tool-call/tool-result carrying messages — shifting one side of a pair
+  //     orphans the other and 400s on strict providers. When the shift
+  //     candidate is pinned, the text-trim last resort below takes over.
+  const lastUserIndex = (msgs: readonly Message[]): number => {
+    for (let i = msgs.length - 1; i >= 0; i -= 1) if (msgs[i]!.role === 'user') return i
+    return -1
+  }
+  const hasToolBlocks = (msg: Message): boolean =>
+    Array.isArray(msg.content)
+      && msg.content.some(block => (block as { type?: unknown }).type === 'tool-call'
+        || (block as { type?: unknown }).type === 'tool-result')
   while (result.length > retainRecent && tokens > tokenBudget) {
+    if (lastUserIndex(result) === 0) break // shifting would drop the last user message
+    const head = result[0]!
+    if (hasToolBlocks(head)) break // would orphan a tool-call/result pair
     result.shift()
     tokens = estimate(result)
   }
@@ -1106,9 +1135,11 @@ function fallbackTruncate(
     // Last resort: trim the oldest remaining message's TEXT payload. Only text
     // blocks are rewritten (preserving images and every other block so the
     // message keeps its modality and the DSH ContentBlock[] contract), and the
-    // message object is rebuilt instead of mutating readonly fields.
+    // message object is rebuilt instead of mutating readonly fields. The same
+    // two pins apply: the last user message's text is the question itself.
     const oldest = result[0]
-    if (oldest !== undefined && result.length > 1 && Array.isArray(oldest.content)) {
+    if (oldest !== undefined && result.length > 1 && lastUserIndex(result) !== 0
+      && !hasToolBlocks(oldest) && Array.isArray(oldest.content)) {
       const overBy = tokens - tokenBudget
       const charsToDrop = overBy * 4 // rough reverse estimate
       if (charsToDrop > 0) {
@@ -1289,6 +1320,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly speculative = new Map<string, SpeculativeSummary>()
   /** Sessions with a speculative summarization currently running. */
   private readonly speculativeInFlight = new Set<string>()
+  /** Consecutive failed speculative calls per session (stand-down ledger). */
+  private readonly speculativeStalls = new Map<string, { count: number; lastAt: number }>()
+
+  /** Whether speculation may launch for this session now (stall backoff). */
+  private speculationStalled(sessionId: string): boolean {
+    const stall = this.speculativeStalls.get(sessionId)
+    return stall !== undefined && stall.count >= SPECULATIVE_STALL_MAX
+      && Date.now() - stall.lastAt < SPECULATIVE_STALL_BACKOFF_MS
+  }
   /** fl_ recall count observed at each session's last fold (quality delta). */
   private readonly lastRecallAtFold = new Map<string, number>()
   /**
@@ -1306,6 +1346,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.lastFoldCheckAt.delete(sessionId)
       this.lastRecallAtFold.delete(sessionId)
       this.speculative.delete(sessionId)
+      this.speculativeStalls.delete(sessionId)
     }
     this.ctx.memoryContext.evictFlRecalls(stale)
     // Route-keyed overflow strikes age out on the counter retention clock.
@@ -2452,8 +2493,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const fingerprint = summarizationFingerprint(specInput)
       const regionFingerprint = regionMessagesFingerprint(shadowedMessages(specInput))
       const stableFingerprint = regionStableFingerprint(shadowedMessages(specInput))
+      if (this.speculationStalled(input.sessionId)) return
       this.speculativeInFlight.add(input.sessionId)
       const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
+      // Wrapper disabled (timeout 0): the speculative path cannot honor it
+      // (its calls are raw super.summarize with a hard AbortSignal) — skip;
+      // the live fold path bypasses the wrapper itself.
+      if (timeoutMs <= 0) {
+        this.speculativeInFlight.delete(input.sessionId)
+        return
+      }
       void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, timeoutMs)
       return
     }
@@ -2489,8 +2538,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const mergedFingerprint = summarizationFingerprint(refreshedRegion)
     const mergedRegionFingerprint = regionMessagesFingerprint(shadowedMessages(refreshedRegion))
     const mergedStableFingerprint = regionStableFingerprint(shadowedMessages(refreshedRegion))
+    if (this.speculationStalled(input.sessionId)) return
     this.speculativeInFlight.add(input.sessionId)
     const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
+    if (timeoutMs <= 0) {
+      this.speculativeInFlight.delete(input.sessionId)
+      return
+    }
     void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, timeoutMs, existing)
   }
 
@@ -2576,6 +2630,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         start: range.start,
         end: range.end,
       })
+      this.speculativeStalls.delete(sessionId)
       record('speculative:prepared')
       this.ctx.logger.info(
         `[ContextGovernor] speculative fold summary prepared (session …${sessionId.slice(-8)}, `
@@ -2586,6 +2641,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120)
+      const stalls = this.speculativeStalls.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.speculativeStalls.set(sessionId, { count: stalls.count + 1, lastAt: Date.now() })
       record('speculative:failed:' + brief)
     } finally {
       this.speculativeInFlight.delete(sessionId)
@@ -2633,6 +2690,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         start: previous.start,
         end: endNow,
       })
+      this.speculativeStalls.delete(sessionId)
       record('speculative:refreshed')
       this.ctx.logger.info(
         `[ContextGovernor] speculative checkpoint refreshed (session …${sessionId.slice(-8)}, `
@@ -2643,6 +2701,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120)
+      const stalls = this.speculativeStalls.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.speculativeStalls.set(sessionId, { count: stalls.count + 1, lastAt: Date.now() })
       record('speculative:refresh-failed:' + brief)
     } finally {
       this.speculativeInFlight.delete(sessionId)
@@ -2747,6 +2807,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     )
     const target = resolveSummarizationTarget(this.config, agent.session)
     const route = target === undefined ? undefined : `${target.provider}/${target.model}`
+    // An explicitly DISABLED wrapper (summarization_timeout_ms: 0) must reach
+    // the `timeoutMs <= 0` bypass in summarize(): deadlineFrom clamps every
+    // input to >= 15s, so without this early return the disable contract was
+    // dead and slow local folds degraded to extractive on a 15s hard timeout.
+    if (baseMs <= 0) return { timeoutMs: 0, retryMs: 0 }
     const learned = route === undefined || isSummarizationTimeoutExplicit(this.config)
       ? undefined
       : this.summarizerLatencyOf(route)
@@ -3278,10 +3343,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // A local model's narration is re-sent as input on every later request
         // (and re-paid after each cache expiry), so one short directive that
         // suppresses it usually pays for itself within the same turn. Injected
-        // at most once per surface — see the module doc for why the check, and
-        // not a turn counter, is what makes this idempotent.
+        // at most once per DURABLE surface: the guard scans the session's
+        // committed nodes — the step's inbox delta alone never contains the
+        // previous turn's directive, so scanning only it made the guard dead
+        // and re-injected a ~60-token copy every turn. A user quoting the
+        // marker suppresses one injection; compaction re-arms afterwards.
         if (this.conciseLocalMode && ctx.memoryContext.isLocalRoute(requestContext?.provider)) {
-          if (!hasConciseDirective(surface())) {
+          const durableTexts: string[] = []
+          for (const seq of session.surface.nodes.slice(-200)) {
+            const event = session.eventAt(seq)
+            if (event === undefined) continue
+            const data = event.data as { message?: { content?: unknown }; content?: unknown } | undefined
+            const content = data?.message?.content ?? data?.content
+            if (content === undefined) continue
+            durableTexts.push(messageText({ role: 'user', content }))
+          }
+          if (!hasConciseDirective([...durableTexts, ...surface()])) {
             injections.push(createConciseMessage(this.conciseLocalDirective))
             ctx.logger.info(
               `[ContextGovernor] local conciseness directive injected (provider=${requestContext?.provider ?? 'unknown'})`,
@@ -3323,12 +3400,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           )
         }
 
-        this.lastInjectedTurn.set(session, payload.turn)
         return { kind: 'enter', messages: currentMessages as UserMessage[] }
       } catch (error) {
         ctx.logger.warn(
           `[ContextGovernor] Governance hook error: ${error instanceof Error ? error.message : String(error)}`,
         )
+      } finally {
+        // Set on success AND failure: a mid-splice throw must not re-run the
+        // whole pipeline on the next step of the SAME turn (the usage ledger
+        // would double-count, and retrieval would re-pay its embed cost).
+        // The next turn has a different turn number and retries normally.
+        this.lastInjectedTurn.set(session, payload.turn)
       }
       return decision
     })
