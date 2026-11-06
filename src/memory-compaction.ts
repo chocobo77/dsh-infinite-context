@@ -2223,16 +2223,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .context?.contextWindow
       if (signal.aborted) return undefined
       const measurement = this.ctx.tokenMeter.measure(agent.session)
-      // Forced-door stall (see FORCED_FOLD_STALL_*): repeated barren/failed
-      // attempts stand down here too — the fold door and these doors share
-      // the stall ledger, and a dead summarizer must not be re-asked through
-      // whichever door comes first.
+      // Fold-lane health (see FORCED_FOLD_STALL_*): the ledger shared by the
+      // fold door and these doors decides WHO acts at this line.
       const stallKey = String(agent.session.id)
       const stall = this.forcedFoldsStalled.get(stallKey)
-      if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
-        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
-        return null
-      }
+      const foldStalled = stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS
       // Sanity guard against a POISONED narrowed record: an 'overflow' bound
       // is a heuristic estimate, and one far below the declared window (a
       // garbage busy-server 400) turns every guard keyed on the "real window"
@@ -2252,7 +2248,31 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         void this.ctx.memoryContext.probeModel(target.model)
         return null
       }
-      // Hard fit-guard: the request is about to run out of the REAL window.
+      // LANE DEFERRAL (2026-11-06): the fold lane IS the overflow-prevention
+      // mechanism — its budget math reserves completion + headroom against
+      // the same real window this guard reads (windowForModel), and its
+      // plan's fit-guard reason fires at the same line. A healthy fold
+      // therefore acts at this line too, and forcing FIRST would rewrite the
+      // surface under the fold's prepared checkpoint and waste it
+      // (production: 7 of 8 folds in session 230b5f4c were each preceded
+      // 2-3 minutes by a durable force whose rewrite killed the checkpoint —
+      // hit rate 1/8 with a fully healthy funnel). Defer; the pre-step's
+      // tryFold runs right after this returns null. The force doors below
+      // are reserved for a STALLED fold lane — one that has exhausted its
+      // own retry budget and is in its stand-down window.
+      if (!foldStalled) {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Real-window line reached (${measurement.totalTokens} tokens, `
+            + `window ${narrowed}, model=${target.model}) but the fold lane can act — deferring the durable force`,
+        )
+        return null
+      }
+      // Hard fit-guard: the request is about to run out of the REAL window
+      // while the fold lane is STALLED (exhausted retries): force the durable
+      // path so the session still gets room — the 'ensure no overflow'
+      // backstop of last resort. If compaction cannot shrink, the provider's
+      // own overflow path is the final backstop (the 10s force cooldown
+      // prevents a per-step storm).
       // Force the durable path regardless of the dynamic threshold so the
       // plugin's own summarization always gets room — the 'ensure no overflow'
       // backstop, reached whenever the override OR the unified governor is on.
@@ -2268,14 +2288,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         )
         const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
         if (forced === null) {
-          // Nothing safe to fold even at the fit-guard line: the narrowed
-          // record may be wrong. Count the barren attempt (the stand-down
-          // applies once it repeats), back off via the failure cooldown and
-          // ask for a fresh probe rather than hammering every step.
-          const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
-          this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
-          this.compressor.recordFoldFailure(stallKey, new Error('fit-guard: no safe compaction range'))
-          void this.ctx.memoryContext.probeModel(target.model)
+          // Nothing safe to fold even at the fit-guard line. During a stall
+          // the backoff must NOT be extended by barren forces — refreshing
+          // lastAt here would lock the fold lane out forever; leave the
+          // ledger alone and let the backoff expire so the fold retries.
+          if (!foldStalled) {
+            const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+            this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+            this.compressor.recordFoldFailure(stallKey, new Error('fit-guard: no safe compaction range'))
+            void this.ctx.memoryContext.probeModel(target.model)
+          }
+        } else {
+          // A durable success proves the summarizer is alive again: release
+          // the fold lane from its stall so it resumes on its next occasion.
+          this.forcedFoldsStalled.delete(stallKey)
         }
         return forced
       }
@@ -2304,13 +2330,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         )
         const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
         if (forced === null) {
-          const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
-          this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
-          this.compressor.recordFoldFailure(
-            stallKey,
-            new Error('narrowed-window force: no safe compaction range'),
-          )
-          void this.ctx.memoryContext.probeModel(target.model)
+          // Same no-extension rule as the fit-guard branch above.
+          if (!foldStalled) {
+            const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+            this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+            this.compressor.recordFoldFailure(
+              stallKey,
+              new Error('narrowed-window force: no safe compaction range'),
+            )
+            void this.ctx.memoryContext.probeModel(target.model)
+          }
+        } else {
+          this.forcedFoldsStalled.delete(stallKey)
         }
         return forced
       }
