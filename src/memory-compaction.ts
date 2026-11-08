@@ -237,25 +237,27 @@ function messageText(message: { role: string; content: unknown }): string {
  * degradation fallback and the post-processing digest strip it, and they must
  * agree — a change to the system-message convention happens here once.
  */
+function shadowedMessages(input: SummarizationInput): readonly Message[] {
+  return input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
+}
+
 /**
  * Whether a message is the USER'S OWN WORDS (vs an injected artifact): the
  * session surface carries many role='user' messages that are NOT the user —
  * plugin checkpoints, the task-state block, RAG background, runtime-context
- * and time-context splices, compaction checkpoints. Quoting them in the
- * 'user instructions verbatim' digest made the digest carry the checkpoint
- * HEADER instead of the user (production 11-08: 22 of 29 folded digests
- * led with 'This is an automatically generated checkpoint…'). The source
- * attribution is the discriminator: real user messages carry
- * `source.kind === 'user'`; legacy messages without any source are kept.
+ * and time-context splices, compaction checkpoints, and every tool result
+ * (DSH tool messages are user-role with source kind 'tool'). Quoting them in
+ * the 'user instructions verbatim' digest made the digest carry the
+ * checkpoint HEADER instead of the user (production 11-08: 22 of 29 folded
+ * digests led with 'This is an automatically generated checkpoint…'). The
+ * source attribution is the discriminator: real user messages carry
+ * `source.kind === 'user'` (dsh-session types); legacy messages without any
+ * source are kept.
  */
 export function isUserAuthored(message: { source?: { kind?: string } | null }): boolean {
   const source = message.source as { kind?: string } | undefined
   const kind = source?.kind
   return kind === undefined || kind === 'user'
-}
-
-function shadowedMessages(input: SummarizationInput): readonly Message[] {
-  return input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
 }
 
 /** Whether an unknown entry is a content block carrying text. */
@@ -1133,7 +1135,12 @@ export function fallbackTruncate(
   //     orphans the other and 400s on strict providers. When the shift
   //     candidate is pinned, the text-trim last resort below takes over.
   const lastUserIndex = (msgs: readonly Message[]): number => {
-    for (let i = msgs.length - 1; i >= 0; i -= 1) if (msgs[i]!.role === 'user') return i
+    // The USER's own words, not an injected user-role splice: pinning a
+    // time-context/runtime artifact while the real question gets dropped is
+    // exactly the failure isUserAuthored exists for.
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      if (msgs[i]!.role === 'user' && isUserAuthored(msgs[i]!)) return i
+    }
     return -1
   }
   const hasToolBlocks = (msg: Message): boolean =>
@@ -3425,7 +3432,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           let insertAt = currentMessages.length
           for (let i = currentMessages.length - 1; i >= 0; i--) {
             const text = messageText(currentMessages[i]).trim()
-            if (currentMessages[i].role === 'user' && text.length > 0) {
+            // The USER's question, not the newest injected splice: parking
+            // RAG/task-state after the question is exactly the ordering
+            // break this insertion exists to avoid.
+            if (currentMessages[i].role === 'user' && text.length > 0 && isUserAuthored(currentMessages[i])) {
               insertAt = i
               break
             }
