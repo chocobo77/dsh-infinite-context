@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { REDACTED, redactCredentials } from '../src/redact.ts'
+import { isUserAuthored } from '../src/memory-compaction.ts'
 
 describe('redactCredentials', () => {
   it('masks key-value assignments, keeping the key', () => {
@@ -45,5 +46,23 @@ describe('redactCredentials', () => {
   it('is idempotent', () => {
     const once = redactCredentials('password=hunter2 and sk-abcdefghijklmnopqrstuvwx')
     expect(redactCredentials(once)).toBe(once)
+  })
+})
+
+describe('isUserAuthored (digest source filter)', () => {
+  it('accepts real user messages and legacy messages without a source', () => {
+    expect(isUserAuthored({ source: { kind: 'user' } })).toBe(true)
+    expect(isUserAuthored({})).toBe(true)
+    expect(isUserAuthored({ source: null })).toBe(true)
+  })
+
+  it('rejects injected artifacts quoting user-shaped text', () => {
+    // The production case: a fold checkpoint quoting 'This is an automatically
+    // generated checkpoint…' carried source kind compact-checkpoint, and the
+    // user-instructions digest quoted it as if the user had said it.
+    expect(isUserAuthored({ source: { kind: 'compact-checkpoint' } })).toBe(false)
+    expect(isUserAuthored({ source: { kind: 'plugin:dsh-infinite-context' } })).toBe(false)
+    expect(isUserAuthored({ source: { kind: 'runtime-context' } })).toBe(false)
+    expect(isUserAuthored({ source: { kind: 'time-context' } })).toBe(false)
   })
 })

@@ -237,6 +237,23 @@ function messageText(message: { role: string; content: unknown }): string {
  * degradation fallback and the post-processing digest strip it, and they must
  * agree — a change to the system-message convention happens here once.
  */
+/**
+ * Whether a message is the USER'S OWN WORDS (vs an injected artifact): the
+ * session surface carries many role='user' messages that are NOT the user —
+ * plugin checkpoints, the task-state block, RAG background, runtime-context
+ * and time-context splices, compaction checkpoints. Quoting them in the
+ * 'user instructions verbatim' digest made the digest carry the checkpoint
+ * HEADER instead of the user (production 11-08: 22 of 29 folded digests
+ * led with 'This is an automatically generated checkpoint…'). The source
+ * attribution is the discriminator: real user messages carry
+ * `source.kind === 'user'`; legacy messages without any source are kept.
+ */
+export function isUserAuthored(message: { source?: { kind?: string } | null }): boolean {
+  const source = message.source as { kind?: string } | undefined
+  const kind = source?.kind
+  return kind === undefined || kind === 'user'
+}
+
 function shadowedMessages(input: SummarizationInput): readonly Message[] {
   return input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
 }
@@ -2875,7 +2892,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       error => {
         const reason = error instanceof Error ? error.message : String(error ?? 'unknown')
         const text = extractiveSummary(
-          shadowed.map(message => ({ role: message.role, text: messageText(message) })),
+          shadowed
+            .filter(message => message.role !== 'user' || isUserAuthored(message))
+            .map(message => ({ role: message.role, text: messageText(message) })),
           { reason },
         )
         return {
@@ -3116,7 +3135,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // drop instructions and identifiers; this digest is deterministic and
       // survives whatever the summarizer decides to keep.
       const userInstructions = shadowed
-        .filter(message => message.role === 'user')
+        .filter(message => message.role === 'user' && isUserAuthored(message))
         .map(message => messageText(message).trim())
         .filter(value => value.length > 0)
         .slice(-12)
