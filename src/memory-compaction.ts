@@ -1217,6 +1217,14 @@ interface SpeculativeSummary {
   readonly summary: ContentBlock[]
   readonly start: SessionSeq
   readonly end: SessionSeq
+  /**
+   * Tool callIds of the anchor nodes when they are tool messages (absent for
+   * conversational anchors). Stub/absorb replaces retire the anchor SEQ while
+   * keeping the callId, so these are the anchor's identity across rewrites —
+   * the rebasing helper follows them instead of dropping the checkpoint.
+   */
+  readonly startCallId?: string
+  readonly endCallId?: string
 }
 
 /**
@@ -1292,6 +1300,38 @@ export function speculationAnchorsAlive(
     if (seq === end) endAlive = true
   }
   return startAlive && endAlive
+}
+
+/**
+ * Rebase ONE anchor across a stub replace. Tool-archive stubbing writes its
+ * replacement with `surfaceOp: replace` — the old seq is retired and a NEW
+ * seq takes its position, carrying the SAME callId. A retired anchor whose
+ * callId still lives on the surface is therefore the SAME node under a new
+ * number, and the checkpoint must follow it instead of dying (production
+ * 2026-11-08: every prepared checkpoint died silently at the next stub
+ * write inside its range — prepared 20 vs consume-visible 14). A retired
+ * anchor with NO callId (a conversational anchor, or the node was folded
+ * away) is genuinely dead: {@link speculationAnchorsAlive} semantics.
+ * @param callIdAt - resolves the tool callId of a live surface seq, or
+ *   `undefined` when the node is not a tool message.
+ * @returns the rebased seq, or `null` when the anchor is genuinely dead.
+ */
+export function rebaseAnchorSeq(
+  surfaceNodes: readonly SessionSeq[],
+  seq: SessionSeq,
+  callId: string | undefined,
+  callIdAt: (node: SessionSeq) => string | undefined,
+): SessionSeq | null {
+  let found = false
+  for (const node of surfaceNodes) {
+    if (node === seq) found = true
+  }
+  if (found) return seq
+  if (callId === undefined) return null
+  for (const node of surfaceNodes) {
+    if (callIdAt(node) === callId) return node
+  }
+  return null
 }
 
 /**
@@ -2052,18 +2092,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     let range: { start: SessionSeq; end: SessionSeq } | null = null
     let speculationUsed = false
     if (speculation !== undefined) {
-      // Ghost-anchor guard BEFORE the fingerprint: buildRegionInput skips
-      // missing seqs, so a hash match proves nothing about dead anchors.
-      if (!speculationAnchorsAlive(session.surface.nodes, speculation.start, speculation.end)) {
+      // Ghost-anchor guard BEFORE the fingerprint — with REBASING: a retired
+      // seq whose callId still lives is the same node under a new number (a
+      // stub replace), so the checkpoint follows it; only a genuinely dead
+      // anchor (folded away, or conversational with no identity) drops the
+      // entry. buildRegionInput skips missing seqs, so a hash match alone
+      // proves nothing about dead anchors.
+      const rebased = this.rebaseSpeculation(sessionId, session, speculation)
+      if (rebased === null) {
         this.speculative.delete(sessionId)
       } else {
-        const projection = shadowedMessages(this.buildRegionInput(session, speculation.start, speculation.end))
+        const projection = shadowedMessages(this.buildRegionInput(session, rebased.start, rebased.end))
         // STRICT first, STABLE fallback: tool-text drift (stub write, expand
         // restore, absorb digest) must not waste the checkpoint — the stable
         // tier still proves the conversational thread is verbatim.
-        if (regionMessagesFingerprint(projection) === speculation.regionFingerprint
-          || regionStableFingerprint(projection) === speculation.stableFingerprint) {
-          range = { start: speculation.start, end: speculation.end }
+        if (regionMessagesFingerprint(projection) === rebased.regionFingerprint
+          || regionStableFingerprint(projection) === rebased.stableFingerprint) {
+          range = { start: rebased.start, end: rebased.end }
           speculationUsed = true
         } else {
           this.speculative.delete(sessionId)
@@ -2533,7 +2578,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       ? undefined
       : this.ctx.memoryContext.windowForModel(routed.model)
     if (realWindow === undefined) return
-    const existing = this.speculative.get(input.sessionId)
+    let existing = this.speculative.get(input.sessionId)
     // Same cut rule as the live path (importance keep included): two paths,
     // one selection rule.
     const importanceKeep = await this.importanceBoundary(input.sessionId, input.session, input.meter, input.plan)
@@ -2548,6 +2593,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const fingerprint = summarizationFingerprint(specInput)
       const regionFingerprint = regionMessagesFingerprint(shadowedMessages(specInput))
       const stableFingerprint = regionStableFingerprint(shadowedMessages(specInput))
+      // Anchor identities for rebasing across stub replaces (see
+      // rebaseAnchorSeq): absent for conversational anchors.
+      const startCallId = this.anchorCallIdOf(input.session, range.start)
+      const endCallId = this.anchorCallIdOf(input.session, range.end)
       if (this.speculationStalled(input.sessionId)) return
       this.speculativeInFlight.add(input.sessionId)
       const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
@@ -2558,20 +2607,24 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         this.speculativeInFlight.delete(input.sessionId)
         return
       }
-      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, timeoutMs)
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, startCallId, endCallId, timeoutMs)
       return
     }
     // REFRESH: merge the delta (everything after the cached range end) into
     // the carried checkpoint. Skipped when the delta is insignificant.
-    // Ghost-anchor guard first: refreshing an entry whose start seq was
-    // retired by an absorb/archive rewrite would fingerprint the surviving
-    // subrange (buildRegionInput skips missing seqs) and re-arm the dead
-    // anchor — hard-locking the fold lane at commit time. Drop it; the next
-    // pass launches a fresh checkpoint from the current surface.
-    if (!speculationAnchorsAlive(input.session.surface.nodes, existing.start, existing.end)) {
+    // Ghost-anchor guard first — with REBASING: an anchor whose seq was
+    // retired by a stub replace (same callId, new seq) follows the
+    // replacement; only an anchor with no live identity is dropped. Without
+    // the rebase, every stub write inside the frozen range silently killed
+    // the checkpoint (production 2026-11-08), and without the guard a retired
+    // anchor would re-arm via the surviving subrange's fingerprint and lock
+    // the fold lane (production 2026-11-04).
+    const rebased = this.rebaseSpeculation(input.sessionId, input.session, existing)
+    if (rebased === null) {
       this.speculative.delete(input.sessionId)
       return
     }
+    existing = rebased
     if (range.end <= existing.end) return
     let deltaTokens = 0
     for (const node of input.meter.nodes) {
@@ -2593,6 +2646,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const mergedFingerprint = summarizationFingerprint(refreshedRegion)
     const mergedRegionFingerprint = regionMessagesFingerprint(shadowedMessages(refreshedRegion))
     const mergedStableFingerprint = regionStableFingerprint(shadowedMessages(refreshedRegion))
+    // The refreshed entry's END moves to range.end: recapture its identity.
+    const endCallId = this.anchorCallIdOf(input.session, range.end)
     if (this.speculationStalled(input.sessionId)) return
     this.speculativeInFlight.add(input.sessionId)
     const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
@@ -2600,7 +2655,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.speculativeInFlight.delete(input.sessionId)
       return
     }
-    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, timeoutMs, existing)
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, endCallId, timeoutMs, existing)
   }
 
   /**
@@ -2643,6 +2698,55 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * without the launch record the funnel is unobservable (a route with zero
    * hits could mean "never fired" or "always missed").
    */
+  /**
+   * The tool callId of a surface node's message, or `undefined` when the node
+   * is not a tool message (conversational anchors carry no callId and rely on
+   * their seq alone).
+   */
+  private anchorCallIdOf(session: Session, seq: SessionSeq): string | undefined {
+    try {
+      const event = session.eventAt(seq)
+      if (event === undefined) return undefined
+      const message = session.deriveEventMessage(event)
+      if (message === null) return undefined
+      const source = (message as { source?: { kind?: string; callId?: unknown } }).source
+      if (source?.kind !== 'tool' || typeof source.callId !== 'string') return undefined
+      return source.callId
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Rebase a carried checkpoint's anchors across stub replaces (see
+   * {@link rebaseAnchorSeq}): a retired anchor whose callId still lives on
+   * the surface follows the replacement; the map is updated in place so
+   * later checks are cheap. Returns the (possibly rebased) entry, or `null`
+   * when an anchor is genuinely dead — the ghost-anchor semantics that keep
+   * a retired-and-folded range from being re-armed.
+   */
+  private rebaseSpeculation(
+    sessionId: string,
+    session: Session,
+    entry: SpeculativeSummary,
+  ): SpeculativeSummary | null {
+    const callIdAt = (node: SessionSeq): string | undefined => this.anchorCallIdOf(session, node)
+    const start = rebaseAnchorSeq(session.surface.nodes, entry.start, entry.startCallId, callIdAt)
+    if (start === null) return null
+    const end = rebaseAnchorSeq(session.surface.nodes, entry.end, entry.endCallId, callIdAt)
+    if (end === null) return null
+    if (start === entry.start && end === entry.end) return entry
+    const rebased: SpeculativeSummary = {
+      ...entry,
+      start,
+      end,
+      ...(entry.startCallId === undefined ? {} : { startCallId: entry.startCallId }),
+      ...(entry.endCallId === undefined ? {} : { endCallId: entry.endCallId }),
+    }
+    this.speculative.set(sessionId, rebased)
+    return rebased
+  }
+
   private async runSpeculativeInitial(
     agent: Agent,
     sessionId: string,
@@ -2651,6 +2755,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     fingerprint: number,
     regionFingerprint: number,
     stableFingerprint: number,
+    startCallId: string | undefined,
+    endCallId: string | undefined,
     deadlineMs: number,
   ): Promise<void> {
     const record = (detail: string): void => {
@@ -2684,6 +2790,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         summary: result.summary,
         start: range.start,
         end: range.end,
+        ...(startCallId === undefined ? {} : { startCallId }),
+        ...(endCallId === undefined ? {} : { endCallId }),
       })
       this.speculativeStalls.delete(sessionId)
       record('speculative:prepared')
@@ -2712,6 +2820,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     mergedFingerprint: number,
     mergedRegionFingerprint: number,
     mergedStableFingerprint: number,
+    endCallId: string | undefined,
     deadlineMs: number,
     previous: SpeculativeSummary,
   ): Promise<void> {
@@ -2744,6 +2853,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         summary: result.summary,
         start: previous.start,
         end: endNow,
+        ...(previous.startCallId === undefined ? {} : { startCallId: previous.startCallId }),
+        ...(endCallId === undefined ? {} : { endCallId }),
       })
       this.speculativeStalls.delete(sessionId)
       record('speculative:refreshed')

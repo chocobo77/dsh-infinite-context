@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Session } from '@deepseek-ai/dsh-session'
 import {
+  rebaseAnchorSeq,
   regionMessagesFingerprint,
   regionStableFingerprint,
   speculationAnchorsAlive,
@@ -274,5 +275,28 @@ describe('regionStableFingerprint drift tiers', () => {
       .not.toBe(stable)
     expect(regionStableFingerprint([conv[0]!, tool('call-9', 'FULL FILE CONTENT ~40KB ...'), conv[1]!]))
       .not.toBe(stable)
+  })
+})
+
+describe('rebaseAnchorSeq (stub-replace survival)', () => {
+  // The tool archive writes its stub with surfaceOp replace: the old seq is
+  // RETIRED and a new seq takes the position, carrying the SAME callId.
+  const nodes = [12, 13, 15, 40, 41] as const
+  const callIdAt = (seq: number) => (seq === 41 ? 'call-1' : undefined) // post-replace position
+
+  it('keeps a live anchor untouched', () => {
+    expect(rebaseAnchorSeq(nodes, 13, 'call-9', () => undefined)).toBe(13)
+    expect(rebaseAnchorSeq(nodes, 13, undefined, () => undefined)).toBe(13)
+  })
+
+  it('follows a stub replace: retired seq, same callId at a new seq', () => {
+    // seq 14 was retired by the replace; its callId now lives at 41.
+    expect(rebaseAnchorSeq(nodes, 14, 'call-1', callIdAt)).toBe(41)
+  })
+
+  it('rejects a genuinely dead anchor: no callId, or callId folded away', () => {
+    expect(rebaseAnchorSeq(nodes, 14, undefined, callIdAt)).toBe(null)
+    expect(rebaseAnchorSeq(nodes, 14, 'call-gone', callIdAt)).toBe(null)
+    expect(rebaseAnchorSeq([], 14, 'call-1', callIdAt)).toBe(null)
   })
 })
