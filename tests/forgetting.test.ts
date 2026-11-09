@@ -76,3 +76,41 @@ describe('ForgettingPolicy tie-break', () => {
     expect(toDrop.map(d => d.id)).toEqual(['old'])
   })
 })
+
+describe('type-based lifetimes and protected tiers (2026-11 survey absorption)', () => {
+  const DAY = 86_400_000
+  const TYPED: ForgettingConfig = {
+    halfLifeDays: 30,
+    importanceWeight: 0.6,
+    recencyWeight: 0.4,
+    minScore: 0.25,
+    maxMemories: 500,
+    kindPolicies: { checkpoint: { halfLifeDays: 7, minScore: 0.45 } },
+    protectedTiers: ['long'],
+  }
+
+  it('a 26-day-old checkpoint digest now falls below its floor (it scored 0.58 vs 0.25 before)', () => {
+    const policy = new ForgettingPolicy(TYPED)
+    const stale = doc({ id: 'cp-old', kind: 'checkpoint', importance: 0.6, createdAt: NOW - 26 * DAY })
+    const fresh = doc({ id: 'cp-new', kind: 'checkpoint', importance: 0.6, createdAt: NOW - 2 * DAY })
+    const dropped = policy.selectToForget([stale, fresh], NOW).map(d => d.id)
+    expect(dropped).toContain('cp-old')
+    expect(dropped).not.toContain('cp-new')
+  })
+
+  it('unlisted kinds keep the long default lifetime', () => {
+    const policy = new ForgettingPolicy(TYPED)
+    const project = doc({ id: 'p', kind: 'project', importance: 0.6, createdAt: NOW - 26 * DAY })
+    expect(policy.selectToForget([project], NOW)).toEqual([])
+  })
+
+  it('never selects a protected tier — not by floor, not by cap', () => {
+    const tight: ForgettingConfig = { ...TYPED, minScore: 0.99, maxMemories: 1 }
+    const policy = new ForgettingPolicy(tight)
+    const longDoc = doc({ id: 'core', tier: 'long', importance: 0, createdAt: NOW - 400 * DAY })
+    const midDoc = doc({ id: 'm', tier: 'mid', importance: 0, createdAt: NOW - 400 * DAY })
+    const dropped = policy.selectToForget([longDoc, midDoc], NOW).map(d => d.id)
+    expect(dropped).not.toContain('core')
+    expect(dropped).toContain('m')
+  })
+})

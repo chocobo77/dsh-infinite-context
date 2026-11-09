@@ -610,3 +610,43 @@ describe('MemoryStore tool results', () => {
     })
   })
 })
+
+describe('supersession chain + legacy migration (2026-11 survey absorption)', () => {
+  const PREAMBLE = 'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background.'
+
+  it('markSuperseded is idempotent (first superseder wins) and retrieval-side list carries the marker', () => {
+    const store = new MemoryStore(':memory:')
+    store.insert({ id: 'old', tier: 'mid', text: 'checkpoint A', createdAt: 1000, importance: 0.6, kind: 'checkpoint' })
+    store.insert({ id: 'new', tier: 'mid', text: 'checkpoint B', createdAt: 2000, importance: 0.6, kind: 'checkpoint' })
+    expect(store.markSuperseded(['old'], 'new')).toBe(1)
+    // A second superseder must NOT steal the chain head.
+    expect(store.markSuperseded(['old'], 'newest')).toBe(0)
+    const doc = store.get('old')
+    expect(doc?.supersededBy).toBe('new')
+    // The superseding row itself carries no marker.
+    expect(store.get('new')?.supersededBy).toBeUndefined()
+  })
+
+  it('one-time migration marks pre-0.8.13 checkpoint-preamble digests as superseded', () => {
+    // File-backed: an ':memory:' store is a NEW empty database per instance,
+    // so the reopen-runs-the-migration contract needs a real path.
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-mig-'))
+    const path = join(dir, 'mem.db')
+    const store = new MemoryStore(path)
+    store.insert({ id: 'legacy', tier: 'mid', text: PREAMBLE + ' ## Primary Request and Intent - old instructions', createdAt: 1000, importance: 0.6, kind: 'checkpoint' })
+    store.insert({ id: 'legacy-short', tier: 'short', text: PREAMBLE, createdAt: 1100, importance: 0.3 })
+    // Post-fix digest: leads with the user-instructions header.
+    store.insert({ id: 'good', tier: 'mid', text: '## 折叠区用户指令 / User instructions\n- 修复bug，启动器启动后未能接管DSH', createdAt: 1200, importance: 0.6, kind: 'checkpoint' })
+    // Long tier is protected even from the migration.
+    store.insert({ id: 'legacy-long', tier: 'long', text: PREAMBLE, createdAt: 1300, importance: 0.6 })
+    store.close()
+    // Re-open: the migration runs at init.
+    const reopened = new MemoryStore(path)
+    expect(reopened.get('legacy')?.supersededBy).toBe('legacy-pre-0.8.13')
+    expect(reopened.get('legacy-short')?.supersededBy).toBe('legacy-pre-0.8.13')
+    expect(reopened.get('good')?.supersededBy).toBeUndefined()
+    expect(reopened.get('legacy-long')?.supersededBy).toBeUndefined()
+    reopened.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+})

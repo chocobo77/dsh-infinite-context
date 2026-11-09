@@ -190,6 +190,9 @@ export class MemoryEngine {
     let loaded = 0
     let dimensionMismatches = 0
     for (const doc of all) {
+      // Superseded memories (Zep-style invalidation) stay in the store for
+      // audit but are not indexed — retrieval must never serve them.
+      if (doc.supersededBy !== undefined) continue
       if (doc.embedding !== undefined && doc.embedding.length > 0) {
         // An embedder kind/dimension switch (lightweight-256 → transformers-384)
         // makes old-dimension vectors score 0 against everything: silently
@@ -308,6 +311,35 @@ export class MemoryEngine {
   }
 
   /**
+   * Supersede a memory family: every memory of the same kind from the same
+   * session (except the new one) is marked superseded by `keepId` — Zep-style
+   * invalidation. Superseded rows leave the index and retrieval but stay in
+   * the store for audit; the forgetting policy may physically retire them
+   * later under their kind's short half-life. The supersede chain is what
+   * makes per-fold checkpoint digests "forget cleanly": the newest digest
+   * speaks for the session, the older ones stop polluting retrieval the
+   * moment the new one lands.
+   * @param sessionId - the session whose prior checkpoints are replaced.
+   * @param kind - the family kind (the fold digest uses 'checkpoint').
+   * @param keepId - the id of the NEW memory that supersedes the family.
+   * @returns how many prior memories were marked superseded.
+   */
+  supersedePrior(sessionId: string, kind: MemoryKind, keepId: string): number {
+    const prior = this.store
+      .list()
+      .filter(doc =>
+        doc.id !== keepId
+        && doc.supersededBy === undefined
+        && doc.kind === kind
+        && doc.sourceSessionId === sessionId,
+      )
+      .map(doc => doc.id)
+    const marked = this.store.markSuperseded(prior, keepId)
+    for (const id of prior) this.index.remove(id)
+    return marked
+  }
+
+  /**
    * Whether any stored memory has exactly this text (ingest dedup helper).
    * @param text - the exact text to look up.
    * @returns true when a memory with this text already exists.
@@ -352,7 +384,9 @@ export class MemoryEngine {
     const results: RetrievalHit[] = []
     for (const hit of hits) {
       const doc = this.store.get(hit.id)
-      if (doc !== undefined) results.push({ doc, score: hit.score })
+      // Superseded memories (Zep-style invalidation) stay in the store for
+      // audit but never come back from retrieval.
+      if (doc !== undefined && doc.supersededBy === undefined) results.push({ doc, score: hit.score })
     }
     // Same-session recency: for the RAG use case ("context for THIS turn") a
     // memory distilled from the current session is disproportionately likely
@@ -548,7 +582,7 @@ export class MemoryEngine {
   status(): MemoryStatus {
     const all = this.store.list()
     const byTier: Record<Tier, number> = { short: 0, mid: 0, long: 0 }
-    const byKind: Record<MemoryKind, number> = { user: 0, feedback: 0, project: 0, reference: 0 }
+    const byKind: Record<MemoryKind, number> = { user: 0, feedback: 0, project: 0, reference: 0, checkpoint: 0 }
     let oldest: number | undefined
     let newest: number | undefined
     for (const doc of all) {

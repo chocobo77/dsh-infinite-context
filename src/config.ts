@@ -43,6 +43,15 @@ export const DEFAULT_FORGETTING: ForgettingConfig = {
   recencyWeight: 0.4,
   minScore: 0.25,
   maxMemories: 500,
+  // Type-based lifetimes (absorbed from Letta/Zep/mem0 survey, 2026-11-08):
+  // checkpoint digests are superseded by the next fold — a short half-life
+  // and a HIGHER floor make the sweep actually bite on them (under the old
+  // flat parameters a 26-day-old digest still scored 0.58 vs floor 0.25),
+  // while everything else keeps the long defaults.
+  kindPolicies: {
+    checkpoint: { halfLifeDays: 7, minScore: 0.45 },
+  },
+  protectedTiers: ['long'],
 }
 
 /** Default pyramid consolidation policy. */
@@ -250,6 +259,11 @@ export const MemoryContextConfigSchema: z<MemoryContextConfig> = z.object({
     recencyWeight: z.number().min(0),
     minScore: z.number().min(0).max(1),
     maxMemories: z.number().step(1).min(1),
+    kindPolicies: z.dict(z.object({
+      halfLifeDays: z.number().min(0),
+      minScore: z.number().min(0).max(1),
+    })),
+    protectedTiers: z.array(z.string()),
   }),
   pyramid: z.object({
     mergeThreshold: z.number().step(1).min(0),

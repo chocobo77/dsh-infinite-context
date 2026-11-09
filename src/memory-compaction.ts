@@ -3290,13 +3290,27 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           })
           if (!inserted) result.summary = [{ type: 'text', text: prefix }, ...result.summary]
         }
-        // Mid-tier summaries are higher-value than raw tool results
-        // (importance 0.6 vs 0.3) so the forgetting policy keeps them longer.
-        await this.ctx.memoryContext.storeMemory(text, 'mid', {
+        // Mid-tier checkpoint digests file under their OWN kind: the
+        // supersede chain (below) retires every prior same-session digest the
+        // moment this one lands, and the per-kind forgetting policy gives
+        // them a short half-life — each fold's summary speaks for the session
+        // until the next fold replaces it (Zep-style invalidation, Letta's
+        // "forgetting = consolidation" discipline).
+        const digestDoc = await this.ctx.memoryContext.storeMemory(text, 'mid', {
           sourceSessionId: agent.session.id,
           importance: 0.6,
-          kind: 'project',
+          kind: 'checkpoint',
         })
+        const superseded = this.ctx.memoryContext.supersedePrior(
+          String(agent.session.id),
+          'checkpoint',
+          digestDoc.id,
+        )
+        if (superseded > 0) {
+          this.ctx.logger.info(
+            `[ContextGovernor] digest superseded ${superseded} prior checkpoint memor${superseded === 1 ? 'y' : 'ies'} for this session`,
+          )
+        }
       }
       const rebalance = await this.ctx.memoryContext.rebalance(
         resolveSummarizationTarget(this.config, agent.session),

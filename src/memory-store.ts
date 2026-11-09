@@ -154,6 +154,7 @@ interface MemoryRow {
   embedding: Buffer | null
   merged_from: string | null
   kind: string | null
+  superseded_by: string | null
 }
 
 interface ToolResultRow {
@@ -333,6 +334,31 @@ export class MemoryStore {
     // re-normalize it per ingested chunk, which grows linearly with the store.
     if (!columns.some(col => col.name === 'text_norm')) {
       this.db.exec('ALTER TABLE memories ADD COLUMN text_norm TEXT')
+    }
+    // Supersession chain (Zep-style invalidation): a newer memory of the same
+    // family sets superseded_by = its id on the ones it replaces. Superseded
+    // rows leave retrieval and the vector index but stay for audit.
+    if (!columns.some(col => col.name === 'superseded_by')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT')
+    }
+    // One-time migration (D): fold digests written before the 0.8.13 digest
+    // fix lead with the base engine's checkpoint preamble instead of the
+    // user's own instructions — they quote injected artifacts as if the user
+    // had said them, and retrieval kept serving them (production: 11-06
+    // entries still live on 11-09). Mark them superseded rather than delete:
+    // the audit trail survives, retrieval stops returning them. Preamble
+    // string is compaction-basic's exact CHECKPOINT_PREAMBLE opener. Idempotent
+    // (guarded by superseded_by IS NULL): a failure leaves the rows for the
+    // next init to retry.
+    try {
+      this.db.prepare(`
+        UPDATE memories SET superseded_by = 'legacy-pre-0.8.13'
+        WHERE superseded_by IS NULL
+          AND tier IN ('mid', 'short')
+          AND substr(text, 1, 220) LIKE '%This is an automatically generated checkpoint condensing%'
+      `).run()
+    } catch {
+      // Never fail store init over a cleanup migration; the next init retries.
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_text_norm ON memories (text_norm)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories (tier)')
@@ -900,6 +926,7 @@ export class MemoryStore {
       ...(row.kind !== null && row.kind !== undefined
         ? { kind: row.kind as MemoryKind }
         : {}),
+      ...(row.superseded_by != null ? { supersededBy: row.superseded_by } : {}),
     }
   }
 
@@ -991,7 +1018,7 @@ export class MemoryStore {
   list(tier?: Tier, opts?: { withEmbeddings?: boolean }): MemoryDoc[] {
     this.assertOpen()
     const withEmbeddings = opts?.withEmbeddings ?? true
-    const columns = withEmbeddings ? '*' : 'id, tier, text, created_at, importance, source_session_id, source_turn_start, source_turn_end, merged_from, kind, text_norm'
+    const columns = withEmbeddings ? '*' : 'id, tier, text, created_at, importance, source_session_id, source_turn_start, source_turn_end, merged_from, kind, text_norm, superseded_by'
     const rows = tier === undefined
       ? (this.db.prepare(`SELECT ${columns} FROM memories ORDER BY created_at DESC, rowid DESC`).all() as unknown as MemoryRow[])
       : (this.db.prepare(`SELECT ${columns} FROM memories WHERE tier = ? ORDER BY created_at DESC, rowid DESC`).all(tier) as unknown as MemoryRow[])
@@ -1009,6 +1036,36 @@ export class MemoryStore {
       ? this.db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }
       : this.db.prepare('SELECT COUNT(*) AS n FROM memories WHERE tier = ?').get(tier) as { n: number }
     return row.n
+  }
+
+  /**
+   * Mark memories as superseded (Zep-style invalidation): the rows stay for
+   * audit, retrieval stops returning them, and the caller drops them from the
+   * vector index. Idempotent — an already-superseded row keeps its FIRST
+   * superseder (COALESCE preserves the chain's head).
+   * @param ids - the memory ids to mark.
+   * @param byId - the id of the superseding memory.
+   * @returns how many rows were marked (not previously superseded).
+   */
+  markSuperseded(ids: readonly string[], byId: string): number {
+    this.assertOpen()
+    if (ids.length === 0) return 0
+    const update = this.db.prepare(`
+      UPDATE memories SET superseded_by = ?
+      WHERE id = ? AND superseded_by IS NULL
+    `)
+    let marked = 0
+    this.db.exec('BEGIN')
+    try {
+      for (const id of ids) {
+        marked += Number(update.run(byId, id).changes)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    return marked
   }
 
   /**

@@ -21,7 +21,7 @@ export type Tier = 'short' | 'mid' | 'long'
  * - `reference`: material, commands, paths, resource locations.
  * Absent/undefined means unclassified (legacy rows).
  */
-export type MemoryKind = 'user' | 'feedback' | 'project' | 'reference'
+export type MemoryKind = 'user' | 'feedback' | 'project' | 'reference' | 'checkpoint' | 'checkpoint'
 
 /**
  * A single memory document: a summarized fragment of conversation with its
@@ -59,6 +59,13 @@ export interface MemoryDoc {
    * Enables provenance and re-derivation.
    */
   readonly mergedFrom?: readonly string[]
+  /**
+   * Supersession chain (Zep-style invalidation, not deletion): set when a
+   * newer memory of the same family replaces this one. A superseded memory is
+   * excluded from retrieval and the vector index, but the row is retained for
+   * audit — and the forgetting policy may still physically retire it later.
+   */
+  readonly supersededBy?: string
 }
 
 /** A memory document plus its retrieval similarity score. */
@@ -95,6 +102,26 @@ export interface ForgettingConfig {
   readonly minScore: number
   /** Hard cap on the total number of retained memories (across tiers). */
   readonly maxMemories: number
+  /**
+   * Per-kind policy overrides (type-based lifetimes — checkpoint digests are
+   * naturally short-lived since each fold supersedes the previous one, while
+   * user-instruction extracts are long-lived). Unlisted kinds use the
+   * top-level values.
+   */
+  readonly kindPolicies?: Readonly<Record<string, ForgettingKindPolicy>>
+  /**
+   * Tiers the forgetting sweep never touches (Letta's 'core' idea: a small
+   * protected tier that survives every forgetting pass). Default: ['long'].
+   */
+  readonly protectedTiers?: string[]
+}
+
+/** Per-kind forgetting overrides. */
+export interface ForgettingKindPolicy {
+  /** Overrides {@link ForgettingConfig.halfLifeDays} for this kind. */
+  readonly halfLifeDays?: number
+  /** Overrides {@link ForgettingConfig.minScore} for this kind. */
+  readonly minScore?: number
 }
 
 /** Pyramid (long-term consolidation) parameters. */

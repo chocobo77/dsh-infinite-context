@@ -48,7 +48,7 @@ import {
 } from './model-probe.ts'
 import { ModelContextTracker } from './model-context.ts'
 import type { SanitizerConfig } from './OutputSanitizer.ts'
-import type { ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
+import type { MemoryKind, ModelContextInfo, ModelContextSource, RetrievalHit, Tier } from './types.ts'
 import { USAGE_KIND } from './usage-ledger.ts'
 import type { UsageSummary } from './usage-ledger.ts'
 
@@ -419,6 +419,19 @@ export class MemoryContext extends Service {
    */
   storeMemory(text: string, tier: Tier, options?: StoreMemoryOptions) {
     return this.requireEngine().storeMemory(text, tier, options)
+  }
+
+  /**
+   * Supersede a memory family (see MemoryEngine.supersedePrior): the newest
+   * checkpoint digest replaces every prior same-session digest in retrieval,
+   * while the rows stay for audit.
+   * @param sessionId - the session whose prior digests are replaced.
+   * @param kind - the family kind.
+   * @param keepId - the id of the NEW superseding memory.
+   * @returns how many prior memories were marked superseded.
+   */
+  supersedePrior(sessionId: string, kind: MemoryKind, keepId: string): number {
+    return this.requireEngine().supersedePrior(sessionId, kind, keepId)
   }
 
   /**
