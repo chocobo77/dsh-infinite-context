@@ -91,6 +91,17 @@ import {
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
+import {
+  learnedAnchorRatio,
+  learnedBandScale,
+  learnedMinIntervalMs,
+  parseFoldPrior,
+  serializeFoldPrior,
+  shrinkRunwayFactor,
+  updateFoldLearning,
+  type FoldCycleReport,
+  type FoldLearningState,
+} from './fold-scheduler.ts'
 import { cosineSimilarity, fnv1a } from './embedder.ts'
 import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
@@ -442,6 +453,38 @@ interface SessionCounter {
   taskState?: string
   /** Remaining rounds to wait after a failed (non-shrinking) compression. */
   failureCooldown: number
+  /**
+   * RUNWAY SCHEDULER state (learned, persisted, NOT re-derivable — the same
+   * rationale as targetDeviationEma): the EMAs below feed the learned
+   * trigger anchor, amplitude and pacing (src/fold-scheduler.ts). The
+   * runway is stored as a share of the budget so route priors port across
+   * sessions.
+   */
+  /** EMA of delivered runway (surfAtFold − previous landing) / budget. */
+  cycleRunwayRatioEma?: number
+  /** EMA of cycle duration in ms. */
+  cycleTimeEmaMs?: number
+  /** EMA of agent requests per cycle. */
+  cycleRequestsEma?: number
+  /** EMA of the cycle's cache hit ratio ([0, 1]). */
+  cycleCacheHitEma?: number
+  /** EMA of the per-cycle recall indicator (1 = folded range read back). */
+  recallEma?: number
+  /** The failure servo's runway factor (cold start 1.0). */
+  runwayFactor?: number
+  /** Surface tokens this session last LANDED at (runway's reference point). */
+  lastLandedTokens?: number
+  // --- in-cycle accumulators (in-memory; persisted with the cycle report) ---
+  /** Cache-read tokens seen since the last fold (usage telemetry). */
+  cycleCacheRead?: number
+  /** Uncached input tokens seen since the last fold. */
+  cycleCacheInput?: number
+  /** Cache-write tokens seen since the last fold. */
+  cycleCacheWrite?: number
+  /** Agent requests served since the last fold. */
+  cycleRequestsCount?: number
+  /** An agent-lane overflow / guard takeover happened this cycle. */
+  cycleHadFailure?: boolean
 }
 
 /** Persistent KV interface (backed by the SQLite plugin_kv table). */
@@ -718,6 +761,16 @@ export class HistoryCompressor {
               // Same rationale as the EMA: learned/carried state that cannot
               // be re-derived from the surface after the fold is gone.
               ...(typeof parsed.taskState === 'string' ? { taskState: parsed.taskState } : {}),
+              // Runway scheduler state (see SessionCounter): learned cycle
+              // EMAs and the servo factor — dropping any of these would
+              // restart the learned tempo from cold start on every restart.
+              ...(typeof parsed.cycleRunwayRatioEma === 'number' ? { cycleRunwayRatioEma: parsed.cycleRunwayRatioEma } : {}),
+              ...(typeof parsed.cycleTimeEmaMs === 'number' ? { cycleTimeEmaMs: parsed.cycleTimeEmaMs } : {}),
+              ...(typeof parsed.cycleRequestsEma === 'number' ? { cycleRequestsEma: parsed.cycleRequestsEma } : {}),
+              ...(typeof parsed.cycleCacheHitEma === 'number' ? { cycleCacheHitEma: parsed.cycleCacheHitEma } : {}),
+              ...(typeof parsed.recallEma === 'number' ? { recallEma: parsed.recallEma } : {}),
+              ...(typeof parsed.runwayFactor === 'number' ? { runwayFactor: parsed.runwayFactor } : {}),
+              ...(typeof parsed.lastLandedTokens === 'number' ? { lastLandedTokens: parsed.lastLandedTokens } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -941,6 +994,168 @@ export class HistoryCompressor {
     if (entry.targetDeviationEma !== undefined) return
     entry.targetDeviationEma = value
     this.persistCounter(sessionId)
+  }
+
+  // --- Runway scheduler state (src/fold-scheduler.ts) -----------------------
+
+  /** Assemble the controller state this session currently holds. */
+  cycleLearningOf(sessionId: string): FoldLearningState {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return {}
+    return {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+  }
+
+  /** The surface tokens this session last LANDED at (runway reference). */
+  lastLandedTokensOf(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.lastLandedTokens
+  }
+
+  /**
+   * Record one agent request's usage into the CURRENT cycle's accumulators.
+   * In-memory only: the totals fold into the learning EMAs at the cycle's
+   * commit (persisting per request would multiply write volume).
+   */
+  noteCycleUsage(sessionId: string, inputTokens: number, cacheRead: number, cacheWrite: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.cycleCacheRead = (entry.cycleCacheRead ?? 0) + (Number.isFinite(cacheRead) ? cacheRead : 0)
+    entry.cycleCacheInput = (entry.cycleCacheInput ?? 0) + (Number.isFinite(inputTokens) ? inputTokens : 0)
+    entry.cycleCacheWrite = (entry.cycleCacheWrite ?? 0) + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
+    entry.cycleRequestsCount = (entry.cycleRequestsCount ?? 0) + 1
+  }
+
+  /** An agent-lane overflow / guard takeover happened this cycle. */
+  markCycleFailure(sessionId: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.cycleHadFailure = true
+  }
+
+  /**
+   * The raw inputs of the OPEN cycle (before its closing fold commits): the
+   * engine builds the FoldCycleReport from these at commit time.
+   */
+  cycleReportInputsOf(sessionId: string): {
+    lastLandedTokens?: number
+    lastCompressedAt?: number
+    cycleRequests: number
+    cacheRead: number
+    cacheInput: number
+    cacheWrite: number
+    hadFailure: boolean
+  } {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      return { cycleRequests: 0, cacheRead: 0, cacheInput: 0, cacheWrite: 0, hadFailure: false }
+    }
+    return {
+      ...(entry.lastLandedTokens === undefined ? {} : { lastLandedTokens: entry.lastLandedTokens }),
+      ...(entry.lastCompressedAt === undefined ? {} : { lastCompressedAt: entry.lastCompressedAt }),
+      cycleRequests: entry.cycleRequestsCount ?? 0,
+      cacheRead: entry.cycleCacheRead ?? 0,
+      cacheInput: entry.cycleCacheInput ?? 0,
+      cacheWrite: entry.cycleCacheWrite ?? 0,
+      hadFailure: entry.cycleHadFailure === true,
+    }
+  }
+
+  /**
+   * Close one fold cycle: fold the report into the learning EMAs, stamp the
+   * landing reference for the next runway measurement, reset the
+   * accumulators, persist.
+   * @param landedTokens - this fold's post-commit surface tokens.
+   */
+  applyFoldCycle(
+    sessionId: string,
+    report: FoldCycleReport,
+    budgetTokens: number,
+    landedTokens: number,
+  ): FoldLearningState {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return {}
+    const budget = Number.isFinite(budgetTokens) && (budgetTokens as number) > 0 ? (budgetTokens as number) : 1
+    const previous: FoldLearningState = {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+    const next = updateFoldLearning(previous, report, budget)
+    if (next.runwayRatioEma !== undefined) entry.cycleRunwayRatioEma = next.runwayRatioEma
+    if (next.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = next.cycleTimeEmaMs
+    if (next.cycleRequestsEma !== undefined) entry.cycleRequestsEma = next.cycleRequestsEma
+    if (next.cycleCacheHitEma !== undefined) entry.cycleCacheHitEma = next.cycleCacheHitEma
+    if (next.recallEma !== undefined) entry.recallEma = next.recallEma
+    if (next.runwayFactor !== undefined) entry.runwayFactor = next.runwayFactor
+    if (Number.isFinite(landedTokens)) entry.lastLandedTokens = landedTokens
+    entry.cycleCacheRead = 0
+    entry.cycleCacheInput = 0
+    entry.cycleCacheWrite = 0
+    entry.cycleRequestsCount = 0
+    entry.cycleHadFailure = false
+    this.persistCounter(sessionId)
+    return {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+  }
+
+  /** The failure servo: shorten the learned runway for this session. */
+  shrinkRunwayFactor(sessionId: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    const next = shrinkRunwayFactor({
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    })
+    if (next.runwayFactor !== undefined) entry.runwayFactor = next.runwayFactor
+    this.persistCounter(sessionId)
+  }
+
+  static foldCyclePriorKey(route: string): string {
+    return HistoryCompressor.KV_PREFIX + 'fold-cycle:prior:' + route
+  }
+
+  /** Publish the route-level prior so fresh sessions warm-start the tempo. */
+  publishFoldCyclePrior(route: string, state: FoldLearningState): void {
+    if (this.kv === null) return
+    try {
+      this.kv.set(HistoryCompressor.foldCyclePriorKey(route), serializeFoldPrior(state))
+    } catch {
+      // best-effort persistence; the in-memory session state remains authoritative
+    }
+  }
+
+  /**
+   * Warm-start a never-folded session's runway state from the route prior.
+   * Only fires when the session holds no runway learning at all.
+   */
+  seedCycleLearning(sessionId: string, route: string): void {
+    if (this.kv === null) return
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined || entry.cycleRunwayRatioEma !== undefined) return
+    try {
+      const prior = parseFoldPrior(this.kv.get(HistoryCompressor.foldCyclePriorKey(route)))
+      if (prior.runwayRatioEma !== undefined) entry.cycleRunwayRatioEma = prior.runwayRatioEma
+      if (prior.runwayFactor !== undefined) entry.runwayFactor = prior.runwayFactor
+      if (prior.recallEma !== undefined) entry.recallEma = prior.recallEma
+      if (prior.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = prior.cycleTimeEmaMs
+      this.persistCounter(sessionId)
+    } catch {
+      // Prior seeding is best-effort.
+    }
   }
 
   /**
@@ -1446,6 +1661,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly lastSummarizeDegraded = new WeakMap<Agent, boolean>()
   /** Whether the narrowed-window (probe/override) compaction override is on. */
   private readonly dynamicThreshold: boolean
+  /** Whether the runway scheduler (fold_learning) owns trigger timing/amplitude. */
+  private readonly foldLearningEnabled: boolean
+  /** Whether the operator pinned a trigger/target ratio (learning stands down). */
+  private readonly foldTempoPinned: boolean
   /** Lower bound of the dynamic trigger ratio as the real window fills. */
   private readonly dynamicThresholdFloor: number
   /** Whether the mid-thinking context guard is enabled. */
@@ -1487,6 +1706,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_round_interval,
       compress_trigger_ratio,
       compress_target_ratio,
+      fold_learning,
       compaction_governance,
       compaction_dynamic_threshold,
       compaction_dynamic_floor,
@@ -1559,6 +1779,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.thinkingGuardRatio = thinking_guard_ratio ?? 0.9
     this.conciseLocalMode = concise_local_mode ?? true
     this.conciseLocalDirective = concise_local_directive ?? DEFAULT_CONCISE_DIRECTIVE
+    // Runway scheduler (fold_learning): the learned tempo owns trigger timing
+    // and amplitude UNLESS the operator pinned an anchor ratio — an explicit
+    // `compress_trigger_ratio`/`compress_target_ratio` freezes the anchor and
+    // stands the learning down (mirrors `isSummarizationTimeoutExplicit`).
+    this.foldTempoPinned = compress_trigger_ratio !== undefined || compress_target_ratio !== undefined
+    this.foldLearningEnabled = (fold_learning ?? true) && !this.foldTempoPinned
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -1757,6 +1983,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     evidence: { serverBound?: number; inputTokens: number; ledger: string; allowEstimateAdoption?: boolean },
   ): void {
     const sessionId = String(agent.session.id)
+    // Failure servo: this cycle counts as failed and the route's learned
+    // runway SHORTENS (fold earlier next time) — evidence the band was too
+    // wide for this route.
+    try {
+      this.compressor.markCycleFailure(sessionId)
+      this.compressor.shrinkRunwayFactor(sessionId)
+    } catch {
+      // The servo never breaks the error path.
+    }
     const record = (detail: string): void => {
       try {
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
@@ -2145,28 +2380,51 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // deviation EMA from the converged prior of the same summarizer route —
     // without it, every new session re-runs the systematic shortfall for two
     // folds while its EMA re-converges from zero.
+    const routeTarget = routedTargetOf(session)
+    const routeKey = routeTarget === undefined ? undefined : `${routeTarget.provider}/${routeTarget.model}`
     if (ledger.compressions === 0 && this.compressor.targetDeviationOf(sessionId) === undefined) {
-      const target = routedTargetOf(session)
-      if (target !== undefined) {
-        const prior = this.compressor.deviationPriorOf(`${target.provider}/${target.model}`)
+      if (routeKey !== undefined) {
+        const prior = this.compressor.deviationPriorOf(routeKey)
         if (prior !== undefined) this.compressor.seedDeviationEma(sessionId, prior)
       }
+    }
+    // Runway scheduler warm-start: same pattern, one cycle behind — a fresh
+    // session inherits the route's learned tempo instead of re-running the
+    // fixed band until its own first cycle closes.
+    if (this.foldLearningEnabled && ledger.compressions === 0 && routeKey !== undefined) {
+      this.compressor.seedCycleLearning(sessionId, routeKey)
     }
     const opportunity = this.compactionOpportunity(session, ledger.compressions)
     const intent = this.contextIntent(session, meter)
     const deviationEma = this.compressor.targetDeviationOf(sessionId)
+    // LEARNED TEMPO: the anchor sits one servo-scaled delivered runway above
+    // the last landing (ratio space; hard bounds clamp inside the planner).
+    // Undefined until the first cycle closes — the cold start then falls back
+    // to the configured anchor, and from fold 2 on the observed tempo owns
+    // trigger timing.
+    const learning = this.compressor.cycleLearningOf(sessionId)
+    const landedRatio = Number.isFinite(pressureBudget) && pressureBudget > 0
+      ? (this.compressor.lastLandedTokensOf(sessionId) ?? 0) / (pressureBudget as number)
+      : 0
+    const learnedAnchor = this.foldLearningEnabled
+      ? learnedAnchorRatio(landedRatio, learning)
+      : undefined
+    const tempoLearned = learnedAnchor !== undefined
+    const bandScale = tempoLearned ? learnedBandScale(learning) : undefined
     const plan = planFoldCompaction({
       surfaceTokens: snapshot.surfaceTokens,
       fixedTokens: snapshot.fixedTokens,
       window,
       ledger,
-      baseTriggerRatio: this.compressor.triggerRatio,
+      baseTriggerRatio: learnedAnchor ?? this.compressor.triggerRatio,
       baseTargetRatio: this.compressor.targetRatio,
       compressInterval: this.compressor.compressInterval,
       budgetTokens: pressureBudget,
       injectionBudget: this.compressor.injectionBudget,
       nudge: this.compressor.nudge,
       force,
+      ...(tempoLearned ? { tempoLearned: true } : {}),
+      ...(bandScale === undefined ? {} : { bandScale }),
       opportunity,
       ...(deviationEma === undefined ? {} : { deviationEmaTokens: deviationEma }),
       ...(intent === undefined ? {} : { intent }),
@@ -2217,7 +2475,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // EMA, clamped [5min, 60min]) — a slow local route folds on a minutes-
     // scale cadence, a fast route folds as soon as the interval allows.
     const learnedLatency = this.routeLatency(session)
-    const minIntervalMs = foldIntervalFor(learnedLatency)
+    // Pacing: the learned cycle time owns the floor once a cycle has closed
+    // (half the observed cadence, same envelope); the latency-based prior
+    // covers the cold start.
+    const learnedInterval = this.foldLearningEnabled
+      ? learnedMinIntervalMs(this.compressor.cycleLearningOf(sessionId))
+      : undefined
+    const minIntervalMs = learnedInterval ?? foldIntervalFor(learnedLatency)
     if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
       const last = this.compressor.lastFoldAt(sessionId)
       if (last !== undefined && Date.now() - last < minIntervalMs) {
@@ -2355,6 +2619,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
     )
     try {
+      // Cycle inputs must be captured BEFORE recordFold stamps the new
+      // lastCompressedAt / resets the accumulators.
+      const cycleInputs = this.compressor.cycleReportInputsOf(sessionId)
       const result = await this.compactRegion(range.start, range.end, agent, signal)
       // A committed fold proves the summarizer works: clear the forced-fold
       // stall so the fit-guard/force doors resume their normal cadence.
@@ -2393,10 +2660,47 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Fold-quality recall signal: an fl_ read-back since the last fold
       // means the agent had to HUNT for what the previous fold removed.
       const recallFl = this.ctx.memoryContext.flRecallCount(sessionId)
-      if (recallFl > (this.lastRecallAtFold.get(sessionId) ?? 0)) {
+      const recalled = recallFl > (this.lastRecallAtFold.get(sessionId) ?? 0)
+      if (recalled) {
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'fold_quality:recalled' })
       }
       this.lastRecallAtFold.set(sessionId, recallFl)
+      // RUNWAY SCHEDULER: close the cycle this fold just ended. Only routine
+      // cadence folds with LIVE summaries teach the tempo (forced/degraded
+      // folds have atypical shapes — same exclusions as the deviation loop);
+      // they still reset the accumulators so the next cycle starts clean.
+      const cycleCacheTotal = cycleInputs.cacheRead + cycleInputs.cacheInput + cycleInputs.cacheWrite
+      const report: FoldCycleReport = {
+        runwayTokens: Math.max(0, snapshot.surfaceTokens - (cycleInputs.lastLandedTokens ?? snapshot.surfaceTokens)),
+        cycleTimeMs: cycleInputs.lastCompressedAt === undefined ? 0 : Math.max(0, Date.now() - cycleInputs.lastCompressedAt),
+        cycleRequests: cycleInputs.cycleRequests,
+        ...(cycleCacheTotal > 0
+          ? { cycleCacheHit: cycleInputs.cacheRead / cycleCacheTotal }
+          : {}),
+        recalled,
+        hadFailure: cycleInputs.hadFailure,
+      }
+      const teaches = plan.reason !== 'forced' && !degraded
+      const cycleState = this.compressor.applyFoldCycle(
+        sessionId,
+        teaches ? report : { ...report, cycleTimeMs: 0, cycleRequests: 0 },
+        pressureBudget,
+        landed,
+      )
+      this.usage.record(USAGE_KIND.foldCheck, 1, {
+        sessionId,
+        detail: 'fold_cycle:'
+          + `runway=${Math.round(report.runwayTokens)};time=${report.cycleTimeMs};req=${report.cycleRequests};`
+          + `cache=${report.cycleCacheHit === undefined ? 'n/a' : report.cycleCacheHit.toFixed(2)};`
+          + `recall=${report.recalled ? 1 : 0};fail=${report.hadFailure ? 1 : 0};`
+          + `k=${(cycleState.runwayFactor ?? 1).toFixed(2)};`
+          + `amp=${(learnedBandScale(cycleState) ?? 1).toFixed(2)};`
+          + `teach=${teaches ? 1 : 0}`,
+      })
+      const cycleRoute = routedTargetOf(session)
+      if (teaches && cycleRoute !== undefined) {
+        this.compressor.publishFoldCyclePrior(`${cycleRoute.provider}/${cycleRoute.model}`, cycleState)
+      }
       // Savings are recorded centrally in summarize() (both lanes pass there),
       // so the ledger does not double count the fold.
       diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
@@ -3853,6 +4157,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       }
       if (usage.cacheWriteTokens !== undefined) {
         this.usage.record(USAGE_KIND.llmCacheWrite, usage.cacheWriteTokens, attribution)
+      }
+      // Runway scheduler: accumulate this cycle's cache utility (the
+      // cycle-cache-hit EMA is the "folds too frequent" signal — every fold
+      // invalidates the KV prefix and these rows are what that costs).
+      try {
+        this.compressor.noteCycleUsage(
+          sessionId,
+          usage.inputTokens ?? 0,
+          usage.cacheReadTokens ?? 0,
+          usage.cacheWriteTokens ?? 0,
+        )
+      } catch {
+        // Learning never breaks the telemetry path.
       }
     })
   }

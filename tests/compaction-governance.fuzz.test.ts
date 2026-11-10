@@ -201,3 +201,37 @@ describe('foldPressureBudget / completionReserveOf property invariants', () => {
     }
   })
 })
+
+describe('learned-tempo invariants (runway scheduler, 2026-11 redesign)', () => {
+  it('tempoLearned plans stay inside the hard envelope for a thousand hostile inputs', () => {
+    const r = rng(0xBEEF)
+    for (let i = 0; i < 1000; i += 1) {
+      const base = randomInput(r, r() < 0.3)
+      const anchor = r() < 0.15 ? Number.NaN : span(r, -0.2, 1.4) // hostile anchors included
+      const bandScale = r() < 0.15 ? Number.NaN : span(r, 0.3, 3)
+      const input: GovernanceInput = {
+        ...base,
+        baseTriggerRatio: anchor,
+        ...(r() < 0.8 ? { tempoLearned: true } : {}),
+        ...(r() < 0.8 ? { bandScale } : {}),
+      }
+      const plan = planCompaction(input)
+      const b = { ...DEFAULT_GOVERNANCE_BOUNDS }
+      expect(plan.triggerRatio).toBeGreaterThanOrEqual(GOV_TRIGGER_FLOOR - 1e-9)
+      expect(plan.triggerRatio).toBeLessThanOrEqual(GOV_TRIGGER_CEILING + 1e-9)
+      expect(plan.targetRatio).toBeGreaterThanOrEqual(GOV_TARGET_FLOOR - 1e-9)
+      // Band invariant: target never closer than minBand to the trigger…
+      const anchorClamped = Math.min(b.triggerCeiling, Math.max(b.targetFloor + b.minBand, anchor))
+      const floor = Math.min(anchorClamped, GOV_TRIGGER_FLOOR)
+      // …except the memory floor may compress the band from below (the
+      // floors can squeeze the band to nothing on tiny budgets — same
+      // behavior as the legacy path).
+      if (plan.targetRatio > plan.triggerRatio - b.minBand + 1e-9) {
+        expect(plan.targetRatio).toBeGreaterThanOrEqual(b.memoryTargetFloor - 1e-9)
+      }
+      void floor
+      expect(Number.isFinite(plan.triggerTokens)).toBe(true)
+      expect(Number.isFinite(plan.targetSurfaceTokens)).toBe(true)
+    }
+  })
+})

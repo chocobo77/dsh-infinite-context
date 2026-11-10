@@ -385,6 +385,19 @@ export interface WaterLevelInput {
   readonly compressions: number
   /** Tokens reserved for the plugin's own per-turn injection. */
   readonly injectionBudget: number
+  /**
+   * LEARNED TEMPO: when true, the growth/fill/stage downslide is bypassed —
+   * the runway scheduler's failure servo owns trigger timing from observed
+   * cycles, and a fixed "busier = earlier" heuristic would fight it. The
+   * anchor still arrives as `baseTriggerRatio` (the learned value), clamped
+   * to the same hard band as always.
+   */
+  readonly tempoLearned?: boolean
+  /**
+   * Learned amplitude scale (recall-driven, clamped [0.5, 2] upstream):
+   * multiplies the configured band. Undefined = unscaled.
+   */
+  readonly bandScale?: number
   /** Override the shipped hard bounds (legacy lanes keep their own values). */
   readonly bounds?: Partial<WaterLevelBounds>
 }
@@ -427,13 +440,20 @@ export function compactionWaterLevels(input: WaterLevelInput): WaterLevels {
   const stage = Math.min(clamp01(input.compressions / mature), stageCap)
   const hot = Number.isFinite(b.hotGrowth) && b.hotGrowth > 0 ? b.hotGrowth : GOV_HOT_GROWTH
 
+  // LEARNED TEMPO: the runway scheduler owns trigger timing — the downslide
+  // (busier = earlier) is bypassed entirely, because it is the mechanism the
+  // scheduler replaces: it fired folds EARLIER under fast growth, which is
+  // precisely the "too frequent" behavior the observed-cycle servo exists to
+  // unlearn. Anchor clamp + hard bounds below still apply unchanged.
+  const tempoLearned = input.tempoLearned === true
+
   const triggerRatio = compactionTriggerRatio({
     anchor,
     floor,
     ceiling: b.triggerCeiling,
-    fillPressure: Number.isFinite(input.fillRatio) ? fillPressureOf(input.fillRatio as number) : 0,
-    growthPressure: clamp01(growthRatio / hot),
-    stagePressure: stage,
+    fillPressure: tempoLearned || !Number.isFinite(input.fillRatio) ? 0 : fillPressureOf(input.fillRatio as number),
+    growthPressure: tempoLearned ? 0 : clamp01(growthRatio / hot),
+    stagePressure: tempoLearned ? 0 : stage,
   })
 
   const baseTarget = Math.min(
@@ -442,8 +462,21 @@ export function compactionWaterLevels(input: WaterLevelInput): WaterLevels {
   )
   const configuredBand = Math.max(b.minBand, anchor - baseTarget)
   const interval = Number.isFinite(input.compressInterval) ? Math.max(1, input.compressInterval) : 1
-  const reserve = growthRatio * interval + b.safetyMargin + b.stageBand * stage
-  const band = Math.min(b.maxBand, Math.max(b.minBand, Math.max(configuredBand, reserve)))
+  // The growth-reserve term is part of the old heuristic (band widens under
+  // fast growth to cover `interval` rounds) — under learned tempo the servo
+  // owns cycle length, so only the configured band (amplitude-scaled) counts.
+  const reserve = tempoLearned
+    ? 0
+    : growthRatio * interval + b.safetyMargin + b.stageBand * stage
+  // The recall-driven amplitude scale arrives pre-clamped [0.5, 2] from the
+  // scheduler; the min/max band bounds below stay the law either way.
+  const bandScale = tempoLearned && Number.isFinite(input.bandScale)
+    ? (input.bandScale as number)
+    : 1
+  const band = Math.min(
+    b.maxBand,
+    Math.max(b.minBand, Math.max(configuredBand * bandScale, reserve)),
+  )
   const maxTarget = Math.max(b.targetFloor, triggerRatio - b.minBand)
   const targetRatio = Math.min(maxTarget, Math.max(b.targetFloor, triggerRatio - band))
 
@@ -830,6 +863,14 @@ export interface GovernanceInput {
   readonly fillRatio?: number
   /** Tokens reserved for the plugin's own per-turn injection (fold lane). */
   readonly injectionBudget?: number
+  /**
+   * LEARNED TEMPO (see {@link WaterLevelInput.tempoLearned}): bypasses the
+   * growth/fill/stage downslide; the anchor in `baseTriggerRatio` is then
+   * the runway scheduler's learned value, not the configured ratio.
+   */
+  readonly tempoLearned?: boolean
+  /** Learned amplitude scale for the band (see {@link WaterLevelInput.bandScale}). */
+  readonly bandScale?: number
   /** Session-phase opportunity; omitted means neutral (score 0.5, mature). */
   readonly opportunity?: CompactionOpportunity
   /** Content/stage intent; when present it replaces the phase swing. */
@@ -912,6 +953,8 @@ export function planCompaction(input: GovernanceInput): CompactionPlan {
     compressInterval: input.compressInterval,
     compressions: ledger.compressions,
     injectionBudget: injection,
+    ...(input.tempoLearned === true ? { tempoLearned: true } : {}),
+    ...(input.bandScale === undefined ? {} : { bandScale: input.bandScale }),
     bounds: b,
   })
 
@@ -1138,6 +1181,12 @@ export interface FoldPlanInput {
   /** Effective model window (for fit-guard and narrowed checks). */
   readonly window: number
   readonly ledger: GovernanceLedger
+  /**
+   * Trigger anchor for the lane that owns this hook. Under LEARNED TEMPO
+   * (`tempoLearned`) this is the runway scheduler's learned anchor — one
+   * servo-scaled delivered runway above the last landing — not the
+   * configured ratio.
+   */
   readonly baseTriggerRatio: number
   readonly baseTargetRatio: number
   readonly compressInterval: number
@@ -1153,6 +1202,13 @@ export interface FoldPlanInput {
   readonly intent?: CompactionIntent
   /** Learned landing-deviation EMA, forwarded to the planner. */
   readonly deviationEmaTokens?: number
+  /**
+   * LEARNED TEMPO (see {@link GovernanceInput.tempoLearned}): set by the
+   * executor when the runway scheduler owns trigger timing for this session.
+   */
+  readonly tempoLearned?: boolean
+  /** Learned amplitude scale (see {@link GovernanceInput.bandScale}). */
+  readonly bandScale?: number
   readonly declaredWindow?: number
   readonly bounds?: Partial<GovernanceBounds>
 }
@@ -1188,6 +1244,8 @@ export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
     measuredTokens: surface,
     fillRatio: 0,
     injectionBudget: input.injectionBudget,
+    ...(input.tempoLearned === true ? { tempoLearned: true } : {}),
+    ...(input.bandScale === undefined ? {} : { bandScale: input.bandScale }),
     ...(input.opportunity === undefined ? {} : { opportunity: input.opportunity }),
     ...(input.intent === undefined ? {} : { intent: input.intent }),
     ...(input.deviationEmaTokens === undefined ? {} : { deviationEmaTokens: input.deviationEmaTokens }),

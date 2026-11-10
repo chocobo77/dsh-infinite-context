@@ -23,6 +23,23 @@ export { VectorIndex, type VectorHit } from './vector-index.ts'
 export { MemoryStore } from './memory-store.ts'
 export { TokenBudget, estimateTokens } from './token-budget.ts'
 export { ForgettingPolicy, recencyFactor, scoreMemory } from './forgetting.ts'
+export {
+  learnedAnchorRatio,
+  learnedBandScale,
+  learnedMinIntervalMs,
+  updateFoldLearning,
+  shrinkRunwayFactor,
+  serializeFoldPrior,
+  parseFoldPrior,
+  emptyFoldLearningState,
+  FOLD_CACHE_UTILITY_FLOOR,
+  FOLD_SERVO_K_MAX,
+  FOLD_SERVO_K_MIN,
+  FOLD_AMPLITUDE_MIN,
+  FOLD_AMPLITUDE_MAX,
+  type FoldCycleReport,
+  type FoldLearningState,
+} from './fold-scheduler.ts'
 export { MemoryEngine, type MemoryEngineDeps, type StoreMemoryOptions, type SummarizeFn, type MaintenanceReport } from './memory-engine.ts'
 export { oneLine } from './strings.ts'
 export { REDACTED, redactCredentials } from './redact.ts'

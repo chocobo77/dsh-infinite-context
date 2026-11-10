@@ -379,6 +379,20 @@ export interface MemoryCompactionConfig {
   /** History compression: number of rounds between compressions (0 disables). */
   compress_round_interval?: number
   /**
+   * LEARNED FOLD TEMPO (default true): the runway scheduler observes each
+   * fold cycle (delivered runway, cycle duration, cache utility, summary
+   * recall) and learns the trigger anchor, the amplitude and the pacing
+   * floor from them — instead of running on the fixed ratio band. An
+   * agent-lane overflow or a guard takeover shortens the learned runway
+   * (fold earlier); healthy cycles with low cache utility lengthen it (fold
+   * later). Hard bounds are unchanged — learning moves the operating point
+   * INSIDE them. Note: explicitly setting `compress_trigger_ratio` or
+   * `compress_target_ratio` PINS the corresponding anchor and stands the
+   * learning down (the operator's word is authoritative, mirroring
+   * `summarization_timeout_ms`).
+   */
+  fold_learning?: boolean
+  /**
    * Dynamic compaction threshold: when the routed model's REAL context window
    * (live probe or an explicit `modelWindows` override) is smaller than the
    * window DSH declares, force the durable-history compaction as soon as the
@@ -590,6 +604,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
     minScore: z.number().min(-1).max(1),
   }),
   compress_round_interval: z.number().step(1).min(0),
+  fold_learning: z.boolean(),
   compaction_dynamic_threshold: z.boolean(),
   compaction_dynamic_floor: z.number().min(0).max(1),
   thinking_guard_enabled: z.boolean(),
