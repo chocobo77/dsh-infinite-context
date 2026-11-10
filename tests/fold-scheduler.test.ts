@@ -116,3 +116,73 @@ describe('cache utility floor', () => {
     expect(FOLD_CACHE_UTILITY_FLOOR).toBeLessThan(1)
   })
 })
+
+import {
+  cacheUtilityVote,
+  FOLD_CACHE_DROP_MARGIN,
+  FOLD_SPECULATION_LEAD,
+  nextGrowthRate,
+  speculationDue,
+} from '../src/core.ts'
+
+describe('predictive speculative launch (2026-11 intelligence audit)', () => {
+  it('growth rate EMA converges to tokens/ms', () => {
+    let rate = nextGrowthRate(undefined, 1000, 1000) // 1 tok/ms
+    expect(rate).toBeCloseTo(1)
+    rate = nextGrowthRate(rate, 1000, 3000) // 0.33 tok/ms
+    expect(rate).toBeGreaterThan(0.5)
+    expect(rate).toBeLessThan(1)
+    expect(nextGrowthRate(undefined, 100, 0)).toBeUndefined() // no time delta
+    expect(nextGrowthRate(undefined, -5, 1000)).toBeUndefined() // negative delta
+  })
+
+  it('launches by PREDICTED time-to-trigger, not by a fixed distance', () => {
+    // 10k distance at 10 tok/ms = 1s to trigger; latency 2s -> launch now.
+    expect(speculationDue({
+      surfaceTokens: 90_000, triggerTokens: 100_000,
+      growthRate: 10, latencyMs: 2000, aheadRatio: 0.8,
+    })).toBe(true)
+    // Same distance, fast model (200ms): predicted 1s >> latency -> wait.
+    expect(speculationDue({
+      surfaceTokens: 90_000, triggerTokens: 100_000,
+      growthRate: 10, latencyMs: 200, aheadRatio: 0.8,
+    })).toBe(false)
+    // Idle session (rate 0): never predicts an arrival -> no launch, even
+    // past the old 0.8 distance.
+    expect(speculationDue({
+      surfaceTokens: 95_000, triggerTokens: 100_000,
+      growthRate: 0, latencyMs: 2000, aheadRatio: 0.8,
+    })).toBe(false)
+    // Cold start (no rate/latency): the distance prior still applies.
+    expect(speculationDue({
+      surfaceTokens: 90_000, triggerTokens: 100_000,
+      aheadRatio: 0.8,
+    })).toBe(true)
+    expect(speculationDue({
+      surfaceTokens: 50_000, triggerTokens: 100_000,
+      aheadRatio: 0.8,
+    })).toBe(false)
+  })
+
+  it('the lead margin is the latency multiplier', () => {
+    expect(FOLD_SPECULATION_LEAD).toBeGreaterThan(1)
+  })
+})
+
+describe('relative cache-utility vote (2026-11 intelligence audit)', () => {
+  it('judges the hit ratio against the route baseline, not an absolute floor', () => {
+    // A route living at 0.3: a 0.28 cycle is NORMAL (no vote) even though
+    // the absolute 0.7 floor would call it "too frequent".
+    expect(cacheUtilityVote(0.28, 0.3)).toBe(false)
+    // A real drop below its own baseline IS the vote.
+    expect(cacheUtilityVote(0.1, 0.3)).toBe(true)
+    // Cold start: no baseline -> the absolute fallback floor.
+    expect(cacheUtilityVote(0.5, undefined)).toBe(true)
+    expect(cacheUtilityVote(0.9, undefined)).toBe(false)
+  })
+
+  it('the drop margin is the relational threshold', () => {
+    expect(FOLD_CACHE_DROP_MARGIN).toBeGreaterThan(0)
+    expect(FOLD_CACHE_DROP_MARGIN).toBeLessThan(1)
+  })
+})

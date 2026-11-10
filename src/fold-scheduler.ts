@@ -52,6 +52,8 @@ export interface FoldLearningState {
   readonly cycleTimeEmaMs?: number
   readonly cycleRequestsEma?: number
   readonly cycleCacheHitEma?: number
+  /** SLOW EMA of the cycle cache-hit samples — the route's own baseline. */
+  readonly cacheHitBaselineEma?: number
   /** EMA of the per-cycle recall indicator (1 = folded range was read back). */
   readonly recallEma?: number
   /** The failure servo's runway factor (cold start 1.0). */
@@ -66,8 +68,23 @@ export const FOLD_SERVO_GROW_LOW_CACHE = 1.15
 export const FOLD_SERVO_RECOVER = 1.05
 export const FOLD_SERVO_K_MIN = 0.5
 export const FOLD_SERVO_K_MAX = 2.5
-/** A cycle whose cache hit ratio sits below this is a "folds too frequent" vote. */
+/**
+ * Cold-start fallback for the cache vote when no route baseline exists yet.
+ * The live vote is RELATIVE (see cacheUtilityVote): a significant drop of
+ * the fast cache-hit EMA below the route's own slow baseline.
+ */
 export const FOLD_CACHE_UTILITY_FLOOR = 0.7
+export const FOLD_CACHE_DROP_MARGIN = 0.1
+/** Slow-EMA alpha for the route's own cache-hit baseline. */
+export const FOLD_BASELINE_ALPHA = 0.05
+/**
+ * Lead margin on the predictive speculative launch: a summary started when
+ * predicted-time-to-trigger ≤ latency × this finishes with slack. The fixed
+ * distance ratio is only the cold-start fallback for sessions without
+ * growth/latency observations yet.
+ */
+export const FOLD_SPECULATION_LEAD = 1.25
+export const FOLD_GROWTH_RATE_ALPHA = 0.3
 /** amplitudeFactor = clamp(0.5, 2, AMPLITUDE_FROM_RECALL − recallEma). */
 export const FOLD_AMPLITUDE_FROM_RECALL = 1.5
 export const FOLD_AMPLITUDE_MIN = 0.5
@@ -85,8 +102,80 @@ export function emptyFoldLearningState(): FoldLearningState {
   return {}
 }
 
-function ema(prev: number | undefined, sample: number): number {
-  return prev === undefined || !Number.isFinite(prev) ? sample : prev * (1 - FOLD_SCHEDULER_ALPHA) + sample * FOLD_SCHEDULER_ALPHA
+/**
+ * The EMA of the session's surface growth RATE (tokens per ms), updated per
+ * fold check. This is the predictor behind the speculative-launch timing:
+ * "will a summary started NOW finish before the trigger crosses?"
+ */
+export function nextGrowthRate(
+  prev: number | undefined,
+  tokensDelta: number,
+  msDelta: number,
+): number | undefined {
+  if (!Number.isFinite(tokensDelta) || !Number.isFinite(msDelta) || msDelta <= 0 || tokensDelta < 0) {
+    return prev
+  }
+  const rate = tokensDelta / msDelta
+  if (prev === undefined || !Number.isFinite(prev)) return rate
+  return prev * (1 - FOLD_GROWTH_RATE_ALPHA) + rate * FOLD_GROWTH_RATE_ALPHA
+}
+
+export interface SpeculationTimingInput {
+  readonly surfaceTokens: number
+  readonly triggerTokens: number
+  /** Learned surface growth rate (tokens/ms); undefined = no observations yet. */
+  readonly growthRate?: number
+  /** Learned summarizer latency (ms); undefined = no summaries yet. */
+  readonly latencyMs?: number
+  /** Cold-start distance prior (surface ≥ trigger × this ratio). */
+  readonly aheadRatio: number
+}
+
+/**
+ * Whether the speculative summary should LAUNCH now.
+ *
+ * The intelligent rule is PREDICTIVE: launch when the predicted time for the
+ * surface to reach the trigger (distance ÷ learned growth rate) is within
+ * the summarizer's learned latency × lead — a summary started now finishes
+ * around the crossing, neither wasted-early nor too-late. Both inputs are
+ * learned; the fixed distance ratio is only the COLD-START fallback for a
+ * session that has not yet observed growth or latency.
+ */
+export function speculationDue(spec: SpeculationTimingInput): boolean {
+  const { surfaceTokens, triggerTokens, aheadRatio } = spec
+  if (!Number.isFinite(surfaceTokens) || !Number.isFinite(triggerTokens)) return false
+  const distance = triggerTokens - surfaceTokens
+  if (distance <= 0) return false
+  const rate = spec.growthRate
+  const latency = spec.latencyMs
+  if (rate !== undefined && latency !== undefined) {
+    // OBSERVED: an idle session (rate 0) or a dead latency estimate never
+    // predictively launches — the fixed distance fallback is only for
+    // sessions that have not observed growth/latency at all.
+    if (!(rate > 0) || !(latency > 0)) return false
+    const predictedMs = distance / rate
+    return predictedMs <= latency * FOLD_SPECULATION_LEAD
+  }
+  return surfaceTokens >= triggerTokens * aheadRatio
+}
+
+/**
+ * Whether this cycle's cache utility votes "folds too frequent". RELATIVE
+ * to the route's own slow baseline: a route that naturally lives at 0.3 hit
+ * ratio (small contexts, heavy rewrites) must not be judged by an absolute
+ * floor meant for clean prefix routes — only a significant DROP below its
+ * own baseline is evidence that folds are eating the cache.
+ */
+export function cacheUtilityVote(cacheHit: number, baseline: number | undefined): boolean {
+  if (!Number.isFinite(cacheHit)) return false
+  if (baseline !== undefined && Number.isFinite(baseline)) {
+    return cacheHit < baseline - FOLD_CACHE_DROP_MARGIN
+  }
+  return cacheHit < FOLD_CACHE_UTILITY_FLOOR
+}
+
+function ema(prev: number | undefined, sample: number, alpha = FOLD_SCHEDULER_ALPHA): number {
+  return prev === undefined || !Number.isFinite(prev) ? sample : prev * (1 - alpha) + sample * alpha
 }
 
 /**
@@ -117,18 +206,22 @@ export function updateFoldLearning(
   const kAfterFailure = report.hadFailure
     ? Math.max(FOLD_SERVO_K_MIN, k * FOLD_SERVO_SHRINK)
     : k
-  // Utility servo: healthy + low cache utility = folds were too frequent —
-  // lengthen the runway. Healthy + comfortable cache = gentle recovery
-  // toward neutral (a one-off transient server failure must not depress k
-  // forever). Unhealthy cycles already shrank above.
+  // Utility servo: healthy + a significant cache-utility DROP below the
+  // route's own slow baseline = folds were too frequent — lengthen the
+  // runway. Healthy + comfortable (at/above the baseline) = gentle recovery
+  // toward neutral. Unhealthy cycles already shrank above. The vote is
+  // RELATIVE (cacheUtilityVote): an absolute floor would misjudge routes
+  // that naturally live at a low hit ratio.
+  const cacheBaseline = state.cacheHitBaselineEma
   const kNext = report.hadFailure
     ? kAfterFailure
-    : cacheHit !== undefined && cacheHit < FOLD_CACHE_UTILITY_FLOOR
+    : cacheHit !== undefined && cacheUtilityVote(cacheHit, cacheBaseline)
       ? Math.min(FOLD_SERVO_K_MAX, kAfterFailure * FOLD_SERVO_GROW_LOW_CACHE)
       : Math.min(FOLD_SERVO_K_MAX, kAfterFailure * FOLD_SERVO_RECOVER)
   return {
     ...(runwayRatio === undefined ? {} : { runwayRatioEma: ema(state.runwayRatioEma, runwayRatio) }),
     ...(cycleTime === undefined ? {} : { cycleTimeEmaMs: ema(state.cycleTimeEmaMs, cycleTime) }),
+    ...(cacheHit === undefined ? {} : { cacheHitBaselineEma: ema(state.cacheHitBaselineEma, cacheHit, FOLD_BASELINE_ALPHA) }),
     ...(requests === undefined ? {} : { cycleRequestsEma: ema(state.cycleRequestsEma, requests) }),
     ...(cacheHit === undefined ? {} : { cycleCacheHitEma: ema(state.cycleCacheHitEma, cacheHit) }),
     recallEma: ema(state.recallEma, report.recalled ? 1 : 0),
@@ -184,7 +277,7 @@ export function learnedMinIntervalMs(state: FoldLearningState): number | undefin
   return clamp((cycle as number) * 0.5, FOLD_MIN_INTERVAL_MS, FOLD_MAX_INTERVAL_MS)
 }
 
-const PRIOR_KEYS = ['runwayRatioEma', 'cycleTimeEmaMs', 'cycleRequestsEma', 'cycleCacheHitEma', 'recallEma', 'runwayFactor'] as const
+const PRIOR_KEYS = ['runwayRatioEma', 'cycleTimeEmaMs', 'cycleRequestsEma', 'cycleCacheHitEma', 'cacheHitBaselineEma', 'recallEma', 'runwayFactor'] as const
 
 /**
  * Serialize the ROUTE-level prior (KV `fold-cycle:prior:<route>`): numbers

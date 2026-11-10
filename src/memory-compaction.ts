@@ -95,8 +95,10 @@ import {
   learnedAnchorRatio,
   learnedBandScale,
   learnedMinIntervalMs,
+  nextGrowthRate,
   parseFoldPrior,
   serializeFoldPrior,
+  speculationDue,
   updateFoldLearning,
   type FoldCycleReport,
   type FoldLearningState,
@@ -467,12 +469,18 @@ interface SessionCounter {
   cycleRequestsEma?: number
   /** EMA of the cycle's cache hit ratio ([0, 1]). */
   cycleCacheHitEma?: number
+  /** SLOW EMA of cycle cache hits — the route's own utility baseline. */
+  cacheHitBaselineEma?: number
   /** EMA of the per-cycle recall indicator (1 = folded range read back). */
   recallEma?: number
   /** The failure servo's runway factor (cold start 1.0). */
   runwayFactor?: number
   /** Surface tokens this session last LANDED at (runway's reference point). */
   lastLandedTokens?: number
+  /** Learned surface growth rate (tokens/ms) — predictive launch predictor. */
+  growthRateEma?: number
+  /** Epoch ms of the last fold check (growth-rate delta reference). */
+  lastCheckAtMs?: number
   // --- in-cycle accumulators (in-memory; persisted with the cycle report) ---
   /** Cache-read tokens seen since the last fold (usage telemetry). */
   cycleCacheRead?: number
@@ -770,6 +778,8 @@ export class HistoryCompressor {
               ...(typeof parsed.recallEma === 'number' ? { recallEma: parsed.recallEma } : {}),
               ...(typeof parsed.runwayFactor === 'number' ? { runwayFactor: parsed.runwayFactor } : {}),
               ...(typeof parsed.lastLandedTokens === 'number' ? { lastLandedTokens: parsed.lastLandedTokens } : {}),
+              ...(typeof parsed.growthRateEma === 'number' ? { growthRateEma: parsed.growthRateEma } : {}),
+              ...(typeof parsed.cacheHitBaselineEma === 'number' ? { cacheHitBaselineEma: parsed.cacheHitBaselineEma } : {}),
               failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
             }
             return restored
@@ -827,8 +837,20 @@ export class HistoryCompressor {
     // Count the cooldown down on every fold check so a transient failure
     // cannot disable the lane for the rest of the session.
     if (entry.failureCooldown > 0) entry.failureCooldown -= 1
+    const now = Date.now()
     const delta = entry.lastSizeTokens === undefined ? 0 : surfaceTokens - entry.lastSizeTokens
     entry.growthEma = nextGrowthEma(entry.growthEma, delta)
+    // Surface growth RATE (tokens/ms) — the predictive speculative-launch
+    // predictor. Needs a previous check to measure a delta over.
+    if (entry.lastCheckAtMs !== undefined && entry.lastSizeTokens !== undefined) {
+      const rate = nextGrowthRate(
+        entry.growthRateEma,
+        Math.max(0, surfaceTokens - entry.lastSizeTokens),
+        now - entry.lastCheckAtMs,
+      )
+      if (rate !== undefined) entry.growthRateEma = rate
+    }
+    entry.lastCheckAtMs = now
     entry.lastSizeTokens = surfaceTokens
     this.persistCounter(sessionId)
     return {
@@ -839,6 +861,11 @@ export class HistoryCompressor {
       compressions: entry.compressions ?? 0,
       growthTokens: entry.growthEma ?? 0,
     }
+  }
+
+  /** The learned surface growth rate (tokens/ms) for predictive timing. */
+  growthRateOf(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.growthRateEma
   }
 
   /**
@@ -1006,6 +1033,7 @@ export class HistoryCompressor {
       ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
       ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
       ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
       ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
       ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
     }
@@ -1086,6 +1114,7 @@ export class HistoryCompressor {
       ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
       ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
       ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
       ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
       ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
     }
@@ -1115,6 +1144,7 @@ export class HistoryCompressor {
       ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
       ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
       ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
       ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
       ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
     }
@@ -3027,7 +3057,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }): Promise<void> {
     if (!resolveSpeculativeFold(this.config)) return
     if (input.plan.surfaceTriggerTokens <= 0) return
-    if (input.snapshot.surfaceTokens < input.plan.surfaceTriggerTokens * SPECULATIVE_AHEAD_RATIO) return
+    // PREDICTIVE launch timing (learned): a summary started NOW should
+    // finish around the trigger crossing — predicted time-to-trigger
+    // (distance ÷ learned growth rate) within the summarizer's learned
+    // latency × lead. Cold start (no growth/latency observations yet)
+    // falls back to the fixed distance ratio. The old fixed 0.8 distance
+    // launched too late on slow local summarizers (summary finished after
+    // the trigger — wasted) and too early on fast cloud models (the
+    // checkpoint sat stale through refresh cycles).
+    const growthRate = this.compressor.growthRateOf(input.sessionId)
+    const latencyMs = this.routeLatency(input.session)
+    if (!speculationDue({
+      surfaceTokens: input.snapshot.surfaceTokens,
+      triggerTokens: input.plan.surfaceTriggerTokens,
+      ...(growthRate === undefined ? {} : { growthRate }),
+      ...(latencyMs === undefined ? {} : { latencyMs }),
+      aheadRatio: SPECULATIVE_AHEAD_RATIO,
+    })) return
     if (this.speculativeInFlight.has(input.sessionId)) return
     // Concurrency headroom: the background call streams to the same server
     // WHILE the step's main request streams. The call input must fit in the
