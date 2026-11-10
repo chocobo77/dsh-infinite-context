@@ -1705,27 +1705,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (this.thinkingGuardEnabled) {
       this.registerThinkingGuard(ctx)
     }
-    // Overflow observability + learning on the AGENT lane: the base engine's
-    // `agent/request-error` recovery (its own listener) compacts reactively
-    // after a provider rejects the request for context — but that path is
-    // invisible to the plugin's ledger and, unlike the summarizer lane, never
-    // taught the window tracker anything (production 2026-11-10 session
-    // b1941b5c: a durable compaction fired with zero ledger rows explaining
-    // it). This listener records the strike AND feeds the same 2-strike /
-    // server-number evidence discipline the summarizer lane uses, so the
-    // fold lane plans against the real window on the next pass instead of
-    // waiting for the next 400.
+    // Overflow observability + learning on the AGENT lane. TWO entry points,
+    // deliberately non-overlapping:
+    // 1. `agent/request-error` (this listener) — but the BASE engine's own
+    //    recovery listener sits OUTER in the waterfall and returns
+    //    `{kind:'retry'}` WITHOUT next() on a successful recovery, so this
+    //    listener only sees the residual cases (retries exhausted, recovery
+    //    failed, non-overflow errors). Its unique coverage: a 400 that never
+    //    led to a compaction.
+    // 2. the `context-overflow` trigger inside compactIfNeeded (dynamic
+    //    dispatch reaches the plugin override) — fires for EVERY recovery
+    //    compaction, i.e. the routine case. That is where learning happens.
+    // Both feed the same evidence discipline as the summarizer lane: a
+    // plausible server number (>=1024) adopts immediately, a garbage answer
+    // needs 2 strikes then adopts estimate+4096, a healthy summarizer call
+    // clears the strikes. (Production 2026-11-10 session b1941b5c: a durable
+    // compaction fired with zero ledger rows explaining it.)
     ctx.on('agent/request-error', async ({ agent, provider, failure, signal }, next) => {
       try {
         if (failure.code !== 'CONTEXT_WINDOW_EXCEEDED' || signal.aborted) return next()
-        const sessionId = String(agent.session.id)
-        const record = (detail: string): void => {
-          try {
-            this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
-          } catch {
-            // Telemetry never breaks the error path.
-          }
-        }
         const reason = failure.message ?? ''
         const windowReported = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
         const inputReported = reason.match(/\((\d+) tokens\) exceeds/i)
@@ -1733,35 +1731,69 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           const value = Number.parseInt(match?.[1] ?? '', 10)
           return Number.isFinite(value) && value >= 1024 ? value : undefined
         }
-        const serverBound = parsed(windowReported) ?? parsed(inputReported)
-        const route = `${provider}/${routedTargetOf(agent.session)?.model ?? 'unknown'}`
-        const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
-        const strike = { count: strikes.count + 1, lastAt: Date.now() }
-        this.overflowStrikes.set(route, strike)
-        const target = routedTargetOf(agent.session)
-        const inputTokens = this.ctx.tokenMeter.measure(agent.session).totalTokens
-        const adopted = serverBound
-          ?? (strike.count >= 2 && inputTokens > 0 ? inputTokens + 4096 : undefined)
-        if (target !== undefined && adopted !== undefined) {
-          this.ctx.memoryContext.updateModelContext({
-            provider: target.provider,
-            model: target.model,
-            contextWindow: adopted,
-            source: 'overflow',
-          })
-          record(`overflow:request-error:${adopted} (server number ${serverBound === undefined ? 'absent/garbage' : 'plausible'}, strike ${strike.count})`)
-          this.ctx.logger.warn(
-            `[ContextGovernor] agent request overflow 400: adopting real window <= ${adopted} `
-              + `for ${route} (strike ${strike.count})`,
-          )
-        } else {
-          record(`overflow:request-error-strike:${strike.count}${serverBound === undefined ? ';no-plausible-server-number' : ''}`)
-        }
+        const serverNumber = parsed(windowReported) ?? parsed(inputReported)
+        this.noteAgentOverflow(agent, provider, {
+          ...(serverNumber === undefined ? {} : { serverBound: serverNumber }),
+          inputTokens: this.ctx.tokenMeter.measure(agent.session).totalTokens,
+          ledger: `request-error:${(failure.message ?? '').slice(0, 80)}`,
+          allowEstimateAdoption: true,
+        })
       } catch {
         // Learning is best-effort; the base recovery proceeds regardless.
       }
       return next()
     })
+  }
+
+  /**
+   * Record one agent-lane context overflow (see the listener comment in
+   * {@link initRegister}): strike accounting per route, window adoption under
+   * the 2-strike / server-number discipline, and a fold_check ledger row —
+   * the durable door's firings become attributable.
+   */
+  private noteAgentOverflow(
+    agent: Agent,
+    provider: string,
+    evidence: { serverBound?: number; inputTokens: number; ledger: string; allowEstimateAdoption?: boolean },
+  ): void {
+    const sessionId = String(agent.session.id)
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks the error path.
+      }
+    }
+    const target = routedTargetOf(agent.session)
+    const route = `${provider}/${target?.model ?? 'unknown'}`
+    const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
+    const strike = { count: strikes.count + 1, lastAt: Date.now() }
+    this.overflowStrikes.set(route, strike)
+    // Estimate adoption ONLY where the failure message was seen (the
+    // listener): the recovery-compaction path carries no message, and its
+    // caller set includes the thinking-guard's SYNTHETIC takeover — adopting
+    // estimate+4096 there would shrink the window to today's envelope (a
+    // correctly-firing guard misread as an overflow). Server numbers are
+    // always trusted.
+    const adopted = evidence.serverBound
+      ?? (evidence.allowEstimateAdoption === true && strike.count >= 2 && evidence.inputTokens > 0
+        ? evidence.inputTokens + 4096
+        : undefined)
+    if (target !== undefined && adopted !== undefined) {
+      this.ctx.memoryContext.updateModelContext({
+        provider: target.provider,
+        model: target.model,
+        contextWindow: adopted,
+        source: 'overflow',
+      })
+      record(`overflow:${evidence.ledger} → adopt ${adopted} (server ${evidence.serverBound === undefined ? 'absent/garbage' : 'plausible'}, strike ${strike.count})`)
+      this.ctx.logger.warn(
+        `[ContextGovernor] agent request overflow: adopting real window <= ${adopted} `
+          + `for ${route} (strike ${strike.count})`,
+      )
+    } else {
+      record(`overflow:${evidence.ledger} → strike ${strike.count}${evidence.serverBound === undefined ? ';no-plausible-server-number' : ''}`)
+    }
   }
 
   /**
@@ -1805,9 +1837,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             contextWindow: declared,
           })
         }
-        return ctx.memoryContext.windowForModel(model)
+        // Poisoned-record defense (mirror of the force doors' check): an
+        // 'overflow' estimate far below the declared window is a heuristic —
+        // budgeting the takeover off it re-creates the checkpoint storm. Use
+        // the declaration for THIS decision and let a probe settle the truth.
+        const tracked = ctx.memoryContext.windowForModel(model)
+        let window = tracked
           ?? declared
           ?? ctx.memoryContext.windowForModelOrDeclared(model)
+        if (tracked !== undefined && declared !== undefined && tracked < declared / 4) {
+          const poisoned = ctx.memoryContext.perModelWindows()
+            .find(entry => entry.model === model)
+          if (poisoned?.source === 'overflow') {
+            window = declared
+            void ctx.memoryContext.probeModel(model)
+          }
+        }
+        return window
       },
       log: (message) => ctx.logger.info(message),
     })
@@ -1874,7 +1920,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     // 'context-overflow' (provider overflow recovery, thinking-guard takeover,
     // fit-guard force calls) delegates to the base machinery unchanged — that
-    // is the plugin-supervised emergency door, not the routine lane.
+    // is the plugin-supervised emergency door, not the routine lane. But the
+    // RECOVERY case (the base's agent/request-error listener re-entering via
+    // dynamic dispatch) is the ONLY place the routine provider-400 lane is
+    // observable: its own waterfall listener short-circuits on success, so
+    // record the strike here where the failure evidence (the compacted
+    // envelope) is still at hand. See noteAgentOverflow for the discipline.
+    if (trigger === 'context-overflow') {
+      try {
+        const provider = routedTargetOf(agent.session)?.provider ?? ''
+        this.noteAgentOverflow(agent, provider, {
+          inputTokens: this.ctx.tokenMeter.measure(agent.session).totalTokens,
+          ledger: 'recovery-compaction',
+        })
+      } catch {
+        // Learning never breaks the emergency door.
+      }
+    }
     return await super.compactIfNeeded(agent, trigger, signal)
   }
 
