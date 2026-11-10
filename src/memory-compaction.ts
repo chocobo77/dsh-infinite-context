@@ -1725,8 +1725,32 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         if (session === undefined) return undefined
         // Route-aware to the end: the global "last observed" slot may belong to
         // a different model, and budgeting the guard off it would fire the
-        // takeover at another session's window.
-        return ctx.memoryContext.windowForModelOrDeclared(session.requestContext()?.model)
+        // takeover at another session's window. The routed model is resolved
+        // even when requestContext.model is absent (dynamic routing picks the
+        // model at request time), and the session's DECLARED window beats the
+        // config default: with an empty tracker the orDeclared fallback lands
+        // on resolved.contextWindow (94000) while the fold lane budgets the
+        // declared window — the guard then fires at a THIRD of the real
+        // context (production 2026-11-10, session b1941b5c: two guard
+        // takeovers at ~46k surf on a 256k-window route whose fold trigger
+        // sat at 151k).
+        const target = routedTargetOf(session)
+        const model = target?.model ?? session.requestContext()?.model
+        const declared = session.requestContext()?.contextWindow
+        if (model !== undefined && declared !== undefined
+          && ctx.memoryContext.windowForModel(model) === undefined) {
+          // Adopt the declared window under the routed model: without a
+          // record every tracker-based door (guard, probe ceiling, force
+          // doors) falls to the config default.
+          ctx.memoryContext.observeRequestContext({
+            ...(target?.provider === undefined ? {} : { provider: target.provider }),
+            model,
+            contextWindow: declared,
+          })
+        }
+        return ctx.memoryContext.windowForModel(model)
+          ?? declared
+          ?? ctx.memoryContext.windowForModelOrDeclared(model)
       },
       log: (message) => ctx.logger.info(message),
     })
@@ -1950,9 +1974,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // Diagnostics must never break governance.
       }
     }
-    const window = this.ctx.memoryContext.windowForModel(requestContext?.model ?? '')
+    // Same route resolution as the thinking guard: the routed model may exist
+    // when requestContext.model is absent (dynamic routing) — missing it
+    // here would budget the fold lane off a different window source than
+    // the guard and re-create the divergence class of bugs.
+    const routedForWindow = routedTargetOf(session)
+    const routedModel = routedForWindow?.model ?? requestContext?.model
+    const window = this.ctx.memoryContext.windowForModel(routedModel)
       ?? requestContext?.contextWindow
-      ?? this.ctx.memoryContext.windowForModelOrDeclared(requestContext?.model)
+      ?? this.ctx.memoryContext.windowForModelOrDeclared(routedModel)
     if (!(Number.isFinite(window) && window > 0)) { diag('no-window'); return null }
     // Use the SAME pressure budget as the durable lane: the window minus the
     // reserved completion tokens (the provider charges them to the same
@@ -3407,22 +3437,31 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // model waits — instead of a hard-coded window. Falls back to the
         // configured window when DSH has not resolved one yet. The per-model
         // registry (probe / modelWindows overrides) narrows this to the REAL
-        // runtime window for the routed model when one is known.
+        // runtime window for the routed model when one is known. The routed
+        // model is preferred over requestContext.model: dynamic routing may
+        // leave the declared model absent while the route table resolved one
+        // (production 2026-11-10: the un-keyed observation left the tracker
+        // empty and every tracker-based door fell to the 94000 config
+        // default against a 256k session).
         let sessionWindow: number | undefined
         const requestContext = session.requestContext()
-        if (requestContext !== undefined) {
+        const routed = routedTargetOf(session)
+        const routedModel = routed?.model ?? requestContext?.model
+        if (requestContext !== undefined || routed !== undefined) {
           ctx.memoryContext.observeRequestContext({
-            ...requestContext.provider === undefined ? {} : { provider: requestContext.provider },
-            ...requestContext.model === undefined ? {} : { model: requestContext.model },
-            ...requestContext.contextWindow === undefined ? {} : { contextWindow: requestContext.contextWindow },
+            ...(routed?.provider === undefined
+              ? requestContext?.provider === undefined ? {} : { provider: requestContext.provider }
+              : { provider: routed.provider }),
+            ...(routedModel === undefined ? {} : { model: routedModel }),
+            ...requestContext?.contextWindow === undefined ? {} : { contextWindow: requestContext.contextWindow },
           })
-          sessionWindow = ctx.memoryContext.windowForModel(requestContext.model)
-            ?? requestContext.contextWindow
+          sessionWindow = ctx.memoryContext.windowForModel(routedModel)
+            ?? requestContext?.contextWindow
         }
         // Route-aware to the end: never budget this session off another
         // model's globally last-observed window.
         const effectiveWindow = sessionWindow
-          ?? ctx.memoryContext.windowForModelOrDeclared(requestContext?.model)
+          ?? ctx.memoryContext.windowForModelOrDeclared(routedModel)
         // Deep copy here to avoid side effects.
         // Type is Message[] (not UserMessage[]) because compression injects a
         // user-role summary and fallbackTruncate can reshape the array; the
