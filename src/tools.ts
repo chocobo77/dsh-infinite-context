@@ -259,9 +259,15 @@ export function apply(ctx: Context) {
     presentCall: () => ({ card: 'generic', title: 'Memory maintain', kind: 'other' }),
   }))
 
+  // Consecutive zero-drop memory_forget calls (production 2026-11-11,
+  // session a24b23b6: a model fired the tool 82 times in a row — every
+  // result read "Forgot 0 memories; 500 remain." and nothing in that text
+  // told the model to STOP, so it read "500 remain" as unfinished work).
+  // The result text below is self-defusing, and escalates to a hard stop.
+  let consecutiveZeroForgetDrops = 0
   ctx.tools.register(defineTool({
     name: 'memory_forget',
-    description: 'Run a forgetting sweep: drop low-value memories per the configured policy.',
+    description: 'Run a forgetting sweep: drop low-value memories per the configured policy. Idempotent — when the store is within policy bounds it drops nothing, and calling it again cannot change that.',
     parameters: {},
     output: {
       schema: { type: 'string' },
@@ -269,7 +275,24 @@ export function apply(ctx: Context) {
     },
     async execute() {
       const result = await ctx.memoryContext.forget()
-      return `Forgot ${result.dropped.length} memories; ${result.retained} remain.`
+      if (result.dropped.length === 0) {
+        consecutiveZeroForgetDrops++
+        if (consecutiveZeroForgetDrops >= 2) {
+          return `STOP — do not call memory_forget again. It has now returned 0 drops `
+            + `${consecutiveZeroForgetDrops} times in a row: the result is deterministic, `
+            + `${result.retained} memories are within the forgetting policy's bounds, and no `
+            + `further call can change that. The sweep also runs automatically after every `
+            + `fold. Continue with the actual task.`
+        }
+        return `Forgot 0 memories; ${result.retained} remain. The store is within the `
+          + `forgetting policy's bounds — nothing more can be dropped right now (memories `
+          + `age out under per-type half-lives, and the sweep reruns automatically after `
+          + `every fold). Calling this tool again will return the same result.`
+      }
+      consecutiveZeroForgetDrops = 0
+      return `Forgot ${result.dropped.length} memories; ${result.retained} remain `
+        + `(policy cap enforced). The sweep reruns automatically after every fold — `
+        + `manual calls are only needed for immediate cleanup.`
     },
     presentCall: () => ({ card: 'generic', title: 'Memory forget', kind: 'other' }),
   }))
