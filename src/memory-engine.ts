@@ -447,7 +447,13 @@ export class MemoryEngine {
   async consolidate(target?: SummarizationTarget): Promise<PyramidResult | null> {
     const pyramid = this.config.pyramid
     if (pyramid.mergeThreshold <= 0) return null
-    const mids = this.store.list('mid').reverse() // oldest first
+    // Superseded memories (invalidation chains) must NOT be consolidated:
+    // merging them into a long memory resurrects retired content into the
+    // PROTECTED tier — the most durable form of exactly the garbage the
+    // supersede chain exists to retire. The pool is live memories only.
+    const mids = this.store.list('mid')
+      .filter(doc => doc.supersededBy === undefined)
+      .reverse() // oldest first
     if (mids.length < pyramid.mergeThreshold) return null
     const batch = this.selectConsolidationBatch(mids, Math.max(1, pyramid.mergeBatch))
     if (this.summarize === undefined) {

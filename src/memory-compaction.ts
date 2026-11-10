@@ -3338,13 +3338,23 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // rewrite invalidates it and the next fold-lane check drops it there.
       let stillValid = false
       try {
-        const ownProjection = shadowedMessages(
-          this.buildRegionInput(agent.session, speculation.start, speculation.end),
-        )
-        // Same two tiers as the consume: a region that only drifted in tool
-        // text keeps the checkpoint valid for its own lane.
-        stillValid = regionMessagesFingerprint(ownProjection) === speculation.regionFingerprint
-          || regionStableFingerprint(ownProjection) === speculation.stableFingerprint
+        // REBASE first (same rule as the layer-1 check): a stub replace
+        // retires the anchor seq while its callId lives on — without the
+        // rebase the projection loses a message, both fingerprints fail, and
+        // a provably-valid checkpoint is misjudged dead (inconsistent with
+        // the layer-1 path, which follows the replacement).
+        const rebasedOwn = this.rebaseSpeculation(sessionIdStr, agent.session, speculation)
+        if (rebasedOwn === null) {
+          stillValid = false
+        } else {
+          const ownProjection = shadowedMessages(
+            this.buildRegionInput(agent.session, rebasedOwn.start, rebasedOwn.end),
+          )
+          // Same two tiers as the consume: a region that only drifted in tool
+          // text keeps the checkpoint valid for its own lane.
+          stillValid = regionMessagesFingerprint(ownProjection) === rebasedOwn.regionFingerprint
+            || regionStableFingerprint(ownProjection) === rebasedOwn.stableFingerprint
+        }
       } catch {
         stillValid = false
       }
