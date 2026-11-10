@@ -1705,6 +1705,63 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (this.thinkingGuardEnabled) {
       this.registerThinkingGuard(ctx)
     }
+    // Overflow observability + learning on the AGENT lane: the base engine's
+    // `agent/request-error` recovery (its own listener) compacts reactively
+    // after a provider rejects the request for context — but that path is
+    // invisible to the plugin's ledger and, unlike the summarizer lane, never
+    // taught the window tracker anything (production 2026-11-10 session
+    // b1941b5c: a durable compaction fired with zero ledger rows explaining
+    // it). This listener records the strike AND feeds the same 2-strike /
+    // server-number evidence discipline the summarizer lane uses, so the
+    // fold lane plans against the real window on the next pass instead of
+    // waiting for the next 400.
+    ctx.on('agent/request-error', async ({ agent, provider, failure, signal }, next) => {
+      try {
+        if (failure.code !== 'CONTEXT_WINDOW_EXCEEDED' || signal.aborted) return next()
+        const sessionId = String(agent.session.id)
+        const record = (detail: string): void => {
+          try {
+            this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+          } catch {
+            // Telemetry never breaks the error path.
+          }
+        }
+        const reason = failure.message ?? ''
+        const windowReported = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
+        const inputReported = reason.match(/\((\d+) tokens\) exceeds/i)
+        const parsed = (match: RegExpMatchArray | null): number | undefined => {
+          const value = Number.parseInt(match?.[1] ?? '', 10)
+          return Number.isFinite(value) && value >= 1024 ? value : undefined
+        }
+        const serverBound = parsed(windowReported) ?? parsed(inputReported)
+        const route = `${provider}/${routedTargetOf(agent.session)?.model ?? 'unknown'}`
+        const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
+        const strike = { count: strikes.count + 1, lastAt: Date.now() }
+        this.overflowStrikes.set(route, strike)
+        const target = routedTargetOf(agent.session)
+        const inputTokens = this.ctx.tokenMeter.measure(agent.session).totalTokens
+        const adopted = serverBound
+          ?? (strike.count >= 2 && inputTokens > 0 ? inputTokens + 4096 : undefined)
+        if (target !== undefined && adopted !== undefined) {
+          this.ctx.memoryContext.updateModelContext({
+            provider: target.provider,
+            model: target.model,
+            contextWindow: adopted,
+            source: 'overflow',
+          })
+          record(`overflow:request-error:${adopted} (server number ${serverBound === undefined ? 'absent/garbage' : 'plausible'}, strike ${strike.count})`)
+          this.ctx.logger.warn(
+            `[ContextGovernor] agent request overflow 400: adopting real window <= ${adopted} `
+              + `for ${route} (strike ${strike.count})`,
+          )
+        } else {
+          record(`overflow:request-error-strike:${strike.count}${serverBound === undefined ? ';no-plausible-server-number' : ''}`)
+        }
+      } catch {
+        // Learning is best-effort; the base recovery proceeds regardless.
+      }
+      return next()
+    })
   }
 
   /**
