@@ -29,6 +29,8 @@ DeepSeek Harness 的上下文管家插件。它让 AI 助手在超长对话中�
 
 - 看阶段：模型正在连续调用工具时推迟，一段话说完的间隙才动手；
 - 看内容：大量工具输出适合折深一些，重要指令则尽量保留原文；
+- 分段消化：区域太长时拆成小段分别摘要，再按章节机械合并——小模型摘要小段落更可靠，合并绝不发明内容；
+- 折叠后核对：被折区域里的文件路径、存档编号、报错原文，凡摘要漏掉的会原样补回，摘要保真不依赖模型自觉；
 - 会自我修正：每次折叠记录"实际结果与计划的偏差"，下次自动补偿；
 - 有安全底线：模型正在思考或回答时**绝不**动手，两次折叠之间有最小间隔，避免反复折腾。
 
@@ -37,6 +39,8 @@ DeepSeek Harness 的上下文管家插件。它让 AI 助手在超长对话中�
 折叠前，原文完整存档，摘要开头给出一个取回编号（如 `fl_ab12cd34ef56`）。模型或你随时可以用 `memory_expand` 工具读回原文，支持分页和关键词定位；读不完会明确告知总长度和下一次怎么取。
 
 超长的工具输出（一次大文件读取、一份长日志）同样先存档，再用一个带编号的短摘要占位——需要细节时一键展开。
+
+工具结果也有保质期：折叠时，已经离开工作焦点的旧输出会收缩成要点占位（错误行、计数、路径），全文仍然存档、随时取回。
 
 **3. 记忆金字塔**
 
@@ -135,6 +139,8 @@ When and how deep to fold is not a fixed rule:
 
 - It watches the phase: deferred while tools run in a loop, applied at turn boundaries;
 - It watches the content: tool-heavy bulk folds deep, important instructions stay verbatim;
+- It digests in pieces: a region too large for one comfortable pass is split into small segments, each summarized on its own and merged section by section — small models summarize small spans well, and the merge invents nothing;
+- It checks its own work: after a summary lands, the file paths, archive references, and error lines from the folded region are audited against it and anything missing is re-attached verbatim — fidelity does not depend on the model's diligence;
 - It self-corrects: each fold records how far the result landed from the plan and compensates next time;
 - It has hard safety rails: the model is **never** interrupted mid-generation, and a minimum interval prevents fold churn.
 
@@ -143,6 +149,8 @@ When and how deep to fold is not a fixed rule:
 Before folding, the original text is archived and the summary carries a reference (e.g. `fl_ab12cd34ef56`). The model — or you — can read the exact original back via the `memory_expand` tool, with paging and keyword search; truncated reads state the full length and the exact next call.
 
 Oversized tool outputs (a big file read, a long log) are archived the same way and replaced by a short stub that carries the reference.
+
+Tool results also age out: when a fold runs, results that have left the working set shrink to a signal stub (errors, counts, paths) while the full text stays archived and retrievable.
 
 **3. The memory pyramid**
 
