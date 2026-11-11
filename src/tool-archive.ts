@@ -73,12 +73,32 @@ export const DEFAULT_TOOL_ARCHIVE_OPTIONS: ToolArchiveOptions = {
   thresholdChars: 6000,
   headChars: 2048,
   tailChars: 1024,
-  maxEntries: 500,
+  // 2000, not 500: the expiry pass archives small results too, so entry
+  // counts grow roughly with tool calls per session; trimming to 500 would
+  // silently dangle the read-back refs of aged stubs.
+  maxEntries: 2_000,
   retentionDays: 30,
 }
 
 /** Ref prefix; the remainder is a sha256 prefix of the archived text. */
 export const ARCHIVE_REF_PREFIX = 'tr_'
+
+/**
+ * Tool-result EXPIRY (the fold-time aging pass). The size-gated passes above
+ * keep payloads a model might still read verbatim in the working set; the
+ * expiry pass ages results OUT of the working set into stubs regardless of
+ * size, because a stale tool payload has no information the model still
+ * needs in-context — the digest lines carry the signal, the full text stays
+ * one `memory_expand` away. Bounds here are working-set SAFETY edges, not
+ * tuning points: how many of the newest results stay verbatim, and below
+ * what size a stub would cost about as much as the payload itself.
+ */
+export const TOOL_EXPIRY_KEEP_RECENT_RESULTS = 10
+export const TOOL_EXPIRY_MIN_CHARS = 400
+/** Head kept in an expiry stub when the payload has no signal lines at all. */
+export const TOOL_EXPIRY_HEAD_KEEP_CHARS = 240
+/** A surface node already carrying an archive stub (skip, never re-stub). */
+const ALREADY_STUBBED_RE = /\[\.\.\. \d+ chars (?:archived|absorbed)/
 
 /** Unicode-code-point length (surrogate-pair safe), matching the DSH measure. */
 export function measureChars(text: string): number {
@@ -314,6 +334,8 @@ export class ToolResultArchive {
    * @param callId - the tool call id, when known.
    * @param sessionId - the owning session id, when known.
    * @param text - the exact result text.
+   * @param force - archive even under the size threshold (the expiry pass:
+   *   the payload leaves the surface, so it must be stored wherever it lands).
    * @returns the archive ref, or `null` when nothing was archived.
    */
   capture(
@@ -321,6 +343,7 @@ export class ToolResultArchive {
     callId: string | undefined,
     sessionId: string | undefined,
     text: string,
+    force = false,
   ): ArchiveCaptureResult | null {
     if (!this.options.enabled) return null
     const chars = measureChars(text)
@@ -331,7 +354,7 @@ export class ToolResultArchive {
     // The digest becomes the surface stub AND a memory — redact it; the
     // archived full text stays verbatim (the reversibility contract).
     const redactedDigest = digest === null ? null : redactCredentials(digest)
-    if (chars <= this.options.thresholdChars) {
+    if (chars <= this.options.thresholdChars && !force) {
       return redactedDigest === null ? null : { chars, inserted: false, digest: redactedDigest }
     }
     const ref = archiveRef(text)
@@ -453,6 +476,82 @@ export class ToolResultArchive {
     const result = this.rewrite(session, () => true)
     this.passBarrier.set(session, highestSeq(session))
     return result
+  }
+
+  /**
+   * The expiry pass, run when a fold is committed (the request prefix is
+   * being rewritten anyway, so the pass adds no extra cache cost): every
+   * tool result OUTSIDE the working-set tail becomes a digest stub at any
+   * size, its full text archived under a `tr_` ref. This is the Anthropic
+   * "clear stale tool results" move — the single biggest safe cut in an
+   * agent transcript — and it shrinks the fold's summarizer input, which
+   * lowers the landing and the landing's systematic overshoot.
+   * @param session - the session whose aged results are stubbed.
+   * @returns the landed replacements.
+   */
+  expireOldResults(session: Session): ArchiveRewriteResult {
+    if (!this.options.enabled) return EMPTY_RESULT
+    const candidates: { seq: SessionSeq; event: SessionEvent<'tool/result'> }[] = []
+    for (const seq of [...session.surface.nodes]) {
+      // oxlint-disable-next-line typescript/no-deprecated -- Existing session history read; migration deferred.
+      const event = session.eventAt(seq)
+      if (event?.type === 'tool/result') candidates.push({ seq, event })
+    }
+    // The newest results stay verbatim: they are the working set the model
+    // may still be reasoning over. Everything older has served its turn.
+    const eligible = candidates.slice(0, Math.max(0, candidates.length - TOOL_EXPIRY_KEEP_RECENT_RESULTS))
+    let replaced = 0
+    let charsRemoved = 0
+    const refs: string[] = []
+    for (const { seq, event } of eligible) {
+      const original = session.deriveEventMessage(event) as ToolResultMessage
+      const text = textOfBlocks(original.content)
+      const charsBefore = measureChars(text)
+      if (charsBefore <= TOOL_EXPIRY_MIN_CHARS) continue
+      if (ALREADY_STUBBED_RE.test(text)) continue
+      const callId = original.source?.callId
+      const known = callId === undefined ? undefined : this.safeFindByCallId(callId)
+      const tool = known?.tool ?? 'unknown'
+      const captured = known === undefined
+        ? this.capture(tool, callId, String(session.id), text, true)
+        : undefined
+      const ref = known?.ref ?? captured?.ref
+      if (ref === undefined) {
+        this.logger.warn(
+          'tool expiry: could not archive a ' + charsBefore + '-char result; leaving it on the surface',
+        )
+        continue
+      }
+      const digest = known?.digest ?? captured?.digest ?? buildDigest(tool, text, this.absorbOptions)
+      // Signal lines when they exist; otherwise the head plus the ref marker
+      // (a blind slice still keeps the ref readable back).
+      const stub = digest !== null && digest !== undefined
+        ? digestStub(ref, digest, charsBefore)
+        : Array.from(text).slice(0, TOOL_EXPIRY_HEAD_KEEP_CHARS).join('') + '\n…'
+          + archiveMarker(ref, charsBefore)
+      const content = replaceTextWithStub(original.content, stub)
+      if (content === null) continue
+      const charsAfter = measureContent(content)
+      const message = freezeMessage<ToolResultMessage>({ ...original, content })
+      // Same shadow-price protocol as the size-gated rewrite pass.
+      session.append('compaction/prune', {
+        shadowedRange: { start: seq, end: seq },
+        shadowedSeqs: [seq],
+        shadowedTokenCount: this.estimateMessage(original),
+      })
+      session.append('tool/result', { ...event.data, message }, {
+        surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
+        sourceEventSeqs: [seq],
+      })
+      replaced++
+      charsRemoved += charsBefore - charsAfter
+      refs.push(ref)
+    }
+    if (replaced > 0) {
+      this.logger.info('tool expiry: aged ' + replaced + ' out-of-working-set result(s) into stubs, '
+        + charsRemoved + ' chars off the surface; refs ' + refs.join(', '))
+    }
+    return { replaced, charsRemoved, refs }
   }
 
   /** Drop archived results past retention, then past the entry cap. */

@@ -119,6 +119,14 @@
         # plugin's own per-step history compression also fires earlier — again
         # keeping short-context local models out of the slow long-context zone.
         compress_trigger_ratio: 0.75
+        # Chunked fold summarization (segment → per-segment note → mechanical
+        # merge). Split prior is cold-start only; the split itself follows the
+        # region's observed size. Default on.
+        fold_chunking: true
+        fold_chunk_tokens: 6000
+        # Fold evidence audit: the summary's lost anchors (paths, archive refs,
+        # error lines) are re-attached verbatim after each fold. Zero LLM cost.
+        fold_evidence_check: true
         compress_target_ratio: 0.6
         # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN
         # and the target DEEPER as the session heats up (growth EMA) or matures
@@ -188,8 +196,11 @@
         tool_archive_threshold_chars: 6000
         tool_archive_head_chars: 2048
         tool_archive_tail_chars: 1024
-        tool_archive_max_entries: 500
+        tool_archive_max_entries: 2000
         tool_archive_retention_days: 30
+        # Fold-time expiry: aged-out tool results become stubs at any size when
+        # a fold commits (prefix rebuild is owed anyway). Default on.
+        tool_expiry_on_fold: true
         # Immediate distillation: an oversized result is reduced to signal lines
         # (errors/counts/diff stats/paths + head/tail) and that digest IS the stub.
         # min_chars sits below the archive threshold on purpose: a result can be too

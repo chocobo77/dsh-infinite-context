@@ -393,6 +393,29 @@ export interface MemoryCompactionConfig {
    */
   fold_learning?: boolean
   /**
+   * Chunked fold summarization: a region far over one call's comfortable size
+   * is split into ≤`fold_chunk_tokens` segments, each summarized under its own
+   * deadline/extractive-fallback, then the section structures are merged
+   * mechanically (extract-then-merge: Mem0, recursive-summary). Small models
+   * summarize small spans well; the merge invents nothing. Default true.
+   */
+  fold_chunking?: boolean
+  /**
+   * Chunking cold-start prior (tokens per segment); a region only splits when
+   * it is at least 2× this. The live behavior is driven by region size — this
+   * is only where the first split starts. Default 6000.
+   */
+  fold_chunk_tokens?: number
+  /**
+   * Fold evidence audit: after a fold summary lands, the region's load-
+   * bearing anchors (file paths, archive refs, error/signal lines) are
+   * checked against the summary mechanically, and the few MISSING lines are
+   * re-attached verbatim under a `## Folded Evidence` heading. Zero LLM cost,
+   * append-only — a fidelity floor under the summarizer, auditable in the
+   * ledger (`evidence:missing=n`). Default true.
+   */
+  fold_evidence_check?: boolean
+  /**
    * Dynamic compaction threshold: when the routed model's REAL context window
    * (live probe or an explicit `modelWindows` override) is smaller than the
    * window DSH declares, force the durable-history compaction as soon as the
@@ -546,10 +569,19 @@ export interface MemoryCompactionConfig {
   tool_archive_head_chars?: number
   /** Tool-result archiving: code points kept from the tail of the stub. Default 1024. */
   tool_archive_tail_chars?: number
-  /** Tool-result archiving: archived entries retained (newest win). Default 500. */
+  /** Tool-result archiving: archived entries retained (newest win). Default 2000. */
   tool_archive_max_entries?: number
   /** Tool-result archiving: days to retain an archived entry (0 disables). Default 30. */
   tool_archive_retention_days?: number
+  /**
+   * Tool-result expiry: when a fold commits, tool results that have aged out
+   * of the working-set tail become archive stubs REGARDLESS of size (full
+   * text stays one `memory_expand` away). The fold rewrites the request
+   * prefix anyway, so the pass adds no extra cache cost, and it shrinks the
+   * fold's summarizer input — lower landings, less systematic overshoot.
+   * Default true.
+   */
+  tool_expiry_on_fold?: boolean
   /**
    * Absorb-style distillation of oversized tool results (see absorb.ts): the
    * recoverable stub keeps the error lines, counts, and paths instead of a
@@ -605,6 +637,9 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   }),
   compress_round_interval: z.number().step(1).min(0),
   fold_learning: z.boolean(),
+  fold_chunking: z.boolean(),
+  fold_chunk_tokens: z.number().step(1).min(1000),
+  fold_evidence_check: z.boolean(),
   compaction_dynamic_threshold: z.boolean(),
   compaction_dynamic_floor: z.number().min(0).max(1),
   thinking_guard_enabled: z.boolean(),
@@ -636,6 +671,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   tool_archive_tail_chars: z.number().step(1).min(0),
   tool_archive_max_entries: z.number().step(1).min(1),
   tool_archive_retention_days: z.number().min(0),
+  tool_expiry_on_fold: z.boolean(),
   tool_absorb: z.boolean(),
   tool_absorb_min_chars: z.number().step(1).min(100),
   tool_absorb_max_digest_chars: z.number().step(1).min(100),
@@ -707,6 +743,15 @@ export function resolveRetrievalOptions(raw: MemoryCompactionConfig): ResolvedRe
  * safe upper bound used to keep `head + marker + tail` under the threshold.
  */
 const ARCHIVE_MARKER_RESERVE_CHARS = 220
+
+/**
+ * Whether the fold-time tool-result expiry pass runs (default true).
+ * @param raw - the config from cordis.yml.
+ * @returns the effective flag.
+ */
+export function resolveToolExpiryOnFold(raw: MemoryCompactionConfig): boolean {
+  return raw.tool_expiry_on_fold ?? true
+}
 
 /**
  * Resolve the tool-result archive policy.

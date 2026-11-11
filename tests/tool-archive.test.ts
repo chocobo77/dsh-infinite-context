@@ -451,3 +451,79 @@ describe('tool-archive absorb CJK signals', () => {
     expect(captured?.digest).not.toContain('f6')
   })
 })
+
+describe('tool-archive expiry (fold-time aging)', () => {
+  // A threshold ABOVE the expiry floor (400): the band 400..threshold is
+  // exactly what the size-gated passes leave on the surface and expiry must
+  // age out — the whole point of the pass.
+  const EXPIRY_OPTIONS: ToolArchiveOptions = {
+    enabled: true,
+    thresholdChars: 5000,
+    headChars: 100,
+    tailChars: 50,
+    maxEntries: 100,
+    retentionDays: 30,
+  }
+  /** Medium result: over the expiry floor, under the size-gate threshold. */
+  const mediumText = (): string => 'abcdefghij'.repeat(80) // 800 code points
+
+  it('ages results under the archive threshold once they leave the working set', () => {
+    const { rows, store } = makeStore()
+    const { archive } = makeArchive(store, EXPIRY_OPTIONS)
+    const { session, nodes, events, addToolResult } = makeSession()
+    const seqs: number[] = []
+    for (let i = 0; i < 13; i += 1) seqs.push(addToolResult('c' + i, mediumText()))
+    // The size-gated pass leaves ALL of these (800 < 5000).
+    expect(archive.rewriteAllResults(session as unknown as Session).replaced).toBe(0)
+    const result = archive.expireOldResults(session as unknown as Session)
+    // 13 results, the newest 10 stay: exactly 3 age out (the oldest).
+    expect(result.replaced).toBe(3)
+    expect(result.refs.length).toBe(3)
+    // Reversibility: force-archived under the size threshold, still readable.
+    const stored = archive.read(result.refs[0] ?? '')
+    expect(stored?.text).toBe(mediumText())
+    // The stub carries the ref.
+    const event = events.get(nodes[0]) as unknown as FakeEvent | undefined
+    expect(textOfBlocks(event?.data.message.content ?? [])).toContain('tr_')
+    // Content-addressed refs: three aged results of identical text share ONE
+    // stored row; the working-set tail (never captured, under the size gate)
+    // contributes nothing.
+    expect(rows.size).toBe(1)
+    expect(new Set(result.refs).size).toBe(1)
+    void seqs
+  })
+
+  it('is idempotent and leaves tiny results and existing stubs alone', () => {
+    const { store } = makeStore()
+    const { archive } = makeArchive(store, EXPIRY_OPTIONS)
+    const { session, addToolResult } = makeSession()
+    for (let i = 0; i < 12; i += 1) addToolResult('c' + i, mediumText())
+    addToolResult('tiny', 'x'.repeat(120)) // below the expiry floor
+    const first = archive.expireOldResults(session as unknown as Session)
+    expect(first.replaced).toBe(3) // 13 - 10 kept
+    const second = archive.expireOldResults(session as unknown as Session)
+    expect(second.replaced).toBe(0) // already-stubbed nodes never re-stub
+    const tiny = archive.capture('x', 'tiny', 's1', 'x'.repeat(120), true)
+    expect(tiny?.ref).toBeDefined() // capture(force) archives below the threshold
+  })
+
+  it('capture(force) archives below the size gate; without force a digest-less small result stores nothing', () => {
+    const { rows, store } = makeStore()
+    const { archive } = makeArchive(store, EXPIRY_OPTIONS)
+    // No signal lines and under the size gate → nothing (old behavior kept).
+    expect(archive.capture('x', 'c1', 's1', mediumText())).toBeNull()
+    expect(rows.size).toBe(0)
+    // force: the expiry pass needs a ref for every aged payload.
+    const forced = archive.capture('x', 'c1', 's1', mediumText(), true)
+    expect(forced?.ref).toBeDefined()
+    expect(rows.get(forced?.ref ?? '')?.text).toBe(mediumText())
+  })
+
+  it('disabled policy expires nothing', () => {
+    const { store } = makeStore()
+    const { archive } = makeArchive(store, { ...EXPIRY_OPTIONS, enabled: false })
+    const { session, addToolResult } = makeSession()
+    for (let i = 0; i < 12; i += 1) addToolResult('c' + i, mediumText())
+    expect(archive.expireOldResults(session as unknown as Session).replaced).toBe(0)
+  })
+})

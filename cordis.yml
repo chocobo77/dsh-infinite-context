@@ -128,6 +128,22 @@
     # a local server (27B-class models need minutes, not seconds), 90s for
     # cloud. 0 disables the wrapper; explicit values clamp to [15000, 300000].
     summarization_timeout_ms: 90000
+    # Chunked fold summarization: a region at least 2x fold_chunk_tokens wide
+    # is split at tool-pair-safe seams; each segment gets its own summary call
+    # (own deadline, own extractive fallback) and the section structures are
+    # merged mechanically under a budget. Small models summarize small spans
+    # well — this is what stops a 40k one-shot summary from restating bulk
+    # and landing over target. Default true; fold_chunk_tokens is only the
+    # cold-start split prior (live behavior follows the region's own size).
+    fold_chunking: true
+    fold_chunk_tokens: 6000
+    # Fold evidence audit: after the summary lands, the region's load-bearing
+    # anchors (file paths, archive refs, error/signal lines) are checked
+    # mechanically against everything the fold lands, and the few MISSING
+    # ones are re-attached verbatim under `## Folded Evidence`. Zero LLM cost,
+    # append-only, capped at 25% of the summary budget. Ledger:
+    # evidence:missing=n. Default true.
+    fold_evidence_check: true
     # Per-turn TASK-STATE working-memory block: a small carried snapshot of the
     # primary request / pending jobs / next step / critical context, rebuilt
     # from every fold's structured checkpoint and injected BEFORE the RAG
@@ -196,8 +212,13 @@
     tool_archive_threshold_chars: 6000   # below the built-in pruner's 8192
     tool_archive_head_chars: 2048
     tool_archive_tail_chars: 1024
-    tool_archive_max_entries: 500
+    tool_archive_max_entries: 2000       # expiry ages small results too; a lower cap would dangle their refs
     tool_archive_retention_days: 30
+    # When a fold commits, tool results that have aged out of the working-set
+    # tail become stubs at ANY size (full text still memory_expand-able). The
+    # fold rebuilds the request prefix anyway, so the pass is free; it shrinks
+    # the fold's summarizer input, which lowers the landing and its overshoot.
+    tool_expiry_on_fold: true
     # --- immediate distillation (absorb), complementary to the archive ---
     # The oversized result is reduced to its signal lines (errors, exit codes, test
     # counts, diff stats, paths + head/tail) and that digest becomes the stub body;

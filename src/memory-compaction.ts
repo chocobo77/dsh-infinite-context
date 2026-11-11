@@ -86,11 +86,21 @@ import {
   deadlineFrom,
   scaleSummarizationTimeoutMs,
   resolveToolArchiveOptions,
+  resolveToolExpiryOnFold,
   resolveUsageOptions,
   type MemoryCompactionConfig,
   type ResolvedRetrievalOptions,
 } from './config.ts'
 import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
+import { applySectionBudget, mergeSegmentNotes, splitRegionIntoSegments } from './fold-chunking.ts'
+import {
+  anchorsPoolCapped,
+  auditEvidence,
+  evidenceSectionCeiling,
+  extractAnchors,
+  fitEvidenceOptions,
+  renderEvidenceSection,
+} from './fold-evidence.ts'
 import {
   learnedAnchorRatio,
   learnedBandScale,
@@ -1689,6 +1699,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly dynamicThreshold: boolean
   /** Whether the runway scheduler (fold_learning) owns trigger timing/amplitude. */
   private readonly foldLearningEnabled: boolean
+  /** Chunked fold summarization (segment → per-segment note → mechanical merge). */
+  private readonly foldChunking: boolean
+  /** Chunking cold-start prior: tokens per segment. */
+  private readonly foldChunkTokens: number
+  /** Fold evidence audit: re-attach anchors the summary lost (zero-LLM floor). */
+  private readonly foldEvidenceCheck: boolean
   /** Whether the operator pinned a trigger/target ratio (learning stands down). */
   private readonly foldTempoPinned: boolean
   /** Lower bound of the dynamic trigger ratio as the real window fills. */
@@ -1733,6 +1749,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       compress_trigger_ratio,
       compress_target_ratio,
       fold_learning,
+      fold_chunking,
+      fold_chunk_tokens,
+      fold_evidence_check,
       compaction_governance,
       compaction_dynamic_threshold,
       compaction_dynamic_floor,
@@ -1811,6 +1830,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // stands the learning down (mirrors `isSummarizationTimeoutExplicit`).
     this.foldTempoPinned = compress_trigger_ratio !== undefined || compress_target_ratio !== undefined
     this.foldLearningEnabled = (fold_learning ?? true) && !this.foldTempoPinned
+    this.foldChunking = fold_chunking ?? true
+    this.foldChunkTokens = fold_chunk_tokens ?? 6000
+    this.foldEvidenceCheck = fold_evidence_check ?? true
     this.compressor = new HistoryCompressor(
       ctx,
       this.config,
@@ -2393,7 +2415,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // constant; the clamp below still keeps the minimum prompt share.
     const reservedCompletion = completionReserveOf(declaredMaxTokens, window)
     const pressureBudget = foldPressureBudget({ window, reservedCompletion, headroom })
-    const meter = this.ctx.tokenMeter.measure(session)
+    // `let`: a committed-fold expiry pass rewrites the surface mid-flight, and
+    // every consumer below prices against the post-expiry view.
+    let meter = this.ctx.tokenMeter.measure(session)
     if (meter.totalTokens <= 0) { diag('no-meter'); return null }
     const snapshot = toSurfaceSnapshot({
       totalTokens: meter.totalTokens,
@@ -2520,6 +2544,34 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         diag(`min-interval:${Math.round((Date.now() - last) / 1000)}/${Math.round(minIntervalMs / 1000)}s;`
           + `surf=${snapshot.surfaceTokens}`)
         return null
+      }
+    }
+    // --- TOOL-RESULT EXPIRY (the fold-time aging pass) ---
+    // A fold is about to run, so the request prefix is rebuilt anyway: this
+    // is the zero-regret moment to age STALE tool results into archive stubs
+    // regardless of size (Anthropic's "clear stale tool results" — the biggest
+    // safe cut in an agent transcript, and NVIDIA's compaction study says the
+    // accuracy cost is negligible). Everything outside the newest
+    // TOOL_EXPIRY_KEEP_RECENT_RESULTS results becomes a digest stub with the
+    // full text archived under a tr_ ref (memory_expand-recoverable, two hops
+    // deep at most: checkpoint → fl_ archive → tr_ payload). Everything
+    // downstream prices the POST-expiry surface — boundary keep, speculation
+    // (the stable fingerprint tier is built for stub churn), range selection,
+    // the size gates. If the sweep alone lands the surface under target, the
+    // selection returns null and the fold defers itself: expiry did the work,
+    // zero LLM calls, one prefix rebuild the fold owed anyway. Cadence is
+    // fold-gated (this sits behind the frequency gate), never per-step.
+    if (this.toolArchive.enabled && resolveToolExpiryOnFold(this.config)) {
+      try {
+        const expired = this.toolArchive.expireOldResults(session)
+        if (expired.replaced > 0) {
+          this.usage.record(USAGE_KIND.archiveChars, expired.charsRemoved, { sessionId })
+          diag(`expiry:n=${expired.replaced};chars=${expired.charsRemoved};surf=${this.ctx.tokenMeter.measure(session).surfaceTokens}`)
+          // Consumers below must price the rewritten surface.
+          meter = this.ctx.tokenMeter.measure(session)
+        }
+      } catch (error) {
+        diag('expiry-error:' + (error instanceof Error ? error.message : String(error)).slice(0, 120))
       }
     }
     // Goal-conditioned importance: the carried task-state block is the goal
@@ -3512,6 +3564,60 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (timeoutMs <= 0) return super.summarize(input, agent, signal)
     const shadowed = shadowedMessages(input)
     const startedAt = Date.now()
+    // --- CHUNKED RECURSIVE SUMMARIZATION (extract → mechanical merge) ---
+    // A 40k-token one-shot summary is outside a small local model's
+    // competence: production showed those summaries restating bulk and
+    // landing 7-13k over target. Split the region at tool-pair-safe seams,
+    // give every segment its OWN call (own deadline, own extractive fallback
+    // — one dead segment costs its own note, not the region), then merge the
+    // section structures mechanically: nothing is invented, order is kept.
+    // This is Mem0's extract-then-merge plus the recursive-summary lineage,
+    // and the segment calls are the shape the learned route latency prices,
+    // so the deadline stays a measurement. Regions under 2× the chunk prior
+    // keep the single call (the cache-reuse replay shape the base engine was
+    // designed around); speculation stays single-call — its fingerprint
+    // contract cannot be re-cut here, and live folds are where the quality
+    // loss was measured.
+    if (this.foldChunking) {
+      const chunkTokens = Math.min(16_000, Math.max(2_000, this.foldChunkTokens))
+      if (inputTokens >= chunkTokens * 2) {
+        const segments = splitRegionIntoSegments(
+          shadowed as Message[],
+          chunkTokens,
+          message => estimateTokens(messageText(message)),
+        )
+        if (segments.length > 1) {
+          const chunked = await this.summarizeChunked(input, segments, agent, signal)
+          // Latency learning per SEGMENT call (the shape the deadline
+          // controls); a degraded run teaches nothing, matching the single
+          // path's discipline.
+          if (!chunked.degraded && route !== undefined && signal?.aborted !== true) {
+            this.recordSummarizerLatency(
+              route,
+              Math.round((Date.now() - startedAt) / Math.max(1, chunked.attempts)),
+            )
+            this.overflowStrikes.delete(route)
+          }
+          this.lastSummarizeDegraded.set(agent, chunked.degraded)
+          try {
+            this.usage.record(USAGE_KIND.foldCheck, 1, {
+              sessionId: String(agent.session.id),
+              detail: `chunked:n=${segments.length};attempts=${chunked.attempts};`
+                + `degraded=${chunked.degraded ? 1 : 0};seg~${chunkTokens}`,
+            })
+            if (chunked.degraded) {
+              this.usage.record(USAGE_KIND.foldCheck, 1, {
+                sessionId: String(agent.session.id),
+                detail: 'degraded:chunked',
+              })
+            }
+          } catch {
+            // Diagnostics must never break the fold.
+          }
+          return redactedSummary(chunked.result)
+        }
+      }
+    }
     const outcome = await summarizeWithResilience(
       combined => super.summarize(input, agent, combined),
       error => {
@@ -3643,6 +3749,102 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * The chunked live-fold summarization: one resilient summarize call per
+   * segment (the system head is replayed with each — the cache win only
+   * survives for the first segment, the QUALITY win is why chunking exists),
+   * then a mechanical merge of the section structures under a budget derived
+   * from the region's own output share. A segment whose model dies keeps its
+   * own extractive note instead of taking the whole region down with it.
+   * @param input - the original region input (supplies the system head and
+   *   the tool schemas every segment replays).
+   * @param segments - the region pre-split at tool-pair-safe seams.
+   * @param agent - the fold owner (routing, effort).
+   * @param signal - the fold's cancellation signal, honoured per segment.
+   * @returns the merged checkpoint plus the degraded/attempts accounting the
+   *   caller feeds into the route's latency EMA.
+   */
+  private async summarizeChunked(
+    input: SummarizationInput,
+    segments: Message[][],
+    agent: Agent,
+    signal: AbortSignal | undefined,
+  ): Promise<{ result: SummaryResult; degraded: boolean; attempts: number }> {
+    const system = input.messages[0]?.role === 'system' ? input.messages[0] : undefined
+    const notes: string[] = []
+    let degraded = false
+    let attempts = 0
+    for (const segment of segments) {
+      if (signal?.aborted === true) throw new Error('summarization aborted before a fold segment')
+      const segInput: SummarizationInput = {
+        // Carry the envelope EVERY segment replays: the conversation's own
+        // system prompt and tool schemas ride as separate SummarizationInput
+        // fields (the base prepends them for prefix-cache alignment — they
+        // are NOT messages[0]). Dropping them would silently cost both.
+        ...(input.system === undefined ? {} : { system: input.system }),
+        ...(input.tools === undefined ? {} : { tools: input.tools }),
+        messages: system === undefined ? segment : [system, ...segment],
+      }
+      const segTokens = estimateTokens(segment.map(message => messageText(message)).join('\n'))
+      const { timeoutMs, retryMs } = this.summarizerDeadline(agent, segTokens)
+      const outcome = await summarizeWithResilience(
+        combined => super.summarize(segInput, agent, combined),
+        error => {
+          const reason = error instanceof Error ? error.message : String(error ?? 'unknown')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160)
+          return {
+            summary: [{
+              type: 'text',
+              text: extractiveSummary(
+                segment
+                  .filter(message => message.role !== 'user' || isUserAuthored(message))
+                  .map(message => ({ role: message.role, text: messageText(message) })),
+                { reason: 'segment: ' + reason },
+              ),
+            }],
+            provider: 'extractive',
+            model: 'extractive',
+          } satisfies SummaryResult
+        },
+        {
+          // timeoutMs<=0 can only mean an operator-disabled wrapper; the
+          // chunk branch never starts under it (checked in summarizeResilient).
+          timeoutMs,
+          retryMs,
+          retries: 1,
+          ...(signal === undefined ? {} : { outerSignal: signal }),
+        },
+      )
+      if (outcome.degraded) degraded = true
+      attempts += outcome.attempts
+      notes.push(outcome.value.summary
+        .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+        .map(block => block.text)
+        .join('\n'))
+    }
+    // The budget basis MUST match the downstream global cap in summarize()
+    // (shadowedTokens × SUMMARY_OUTPUT_SHARE), or the section-budget reflow
+    // would reflow against one number and get blind-clipped to another.
+    const region = input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
+    const regionTokens = this.compressor.estimateMessageTokens(region)
+    const totalMaxChars = summaryCharBudget(regionTokens, SUMMARY_OUTPUT_SHARE)
+    const merged = applySectionBudget(mergeSegmentNotes(notes), {
+      // Both budgets DERIVE from the region's observed size: the total is
+      // the same share the single-call path caps at, and one section may
+      // never eat more than a sixth of it (a blown Critical Context section
+      // is how the local routes landed +13k on target).
+      perSectionMaxChars: Math.max(500, Math.floor(totalMaxChars / 6)),
+      totalMaxChars,
+    })
+    return {
+      result: { summary: [{ type: 'text', text: merged }], provider: 'chunked', model: 'chunked' },
+      degraded,
+      attempts,
+    }
+  }
+
+  /**
    * Summarize a compacted region and then persist it as a mid-term memory,
    * rebalance the memory pyramid, and run the forgetting sweep.
    */
@@ -3746,7 +3948,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         remaining = 0
         return { ...block, text: clipped }
       })
-      const modelText = result.summary
+      let modelText = result.summary
         .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
         .map(block => block.text)
         .join('\n')
@@ -3778,10 +3980,76 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       const digest = userInstructions.length === 0
         ? ''
         : `## 折叠区用户指令 / User instructions in the folded range\n${userInstructions.join('\n')}`
+      // Fold evidence audit (deterministic fidelity floor): the deviation EMA
+      // measures a summary's SIZE, never its FIDELITY — a checkpoint can land
+      // exactly on budget and still have dropped the one line the resume
+      // needed (an exact path, an archive ref, an error string; KEEP-Bench).
+      // Extract the region's load-bearing anchors mechanically, subtract what
+      // the checkpoint already carries, re-attach the few MISSING ones
+      // verbatim. The section never rewrites the model's text — it floors it —
+      // and its share is capped at 25% of the summary budget, so evidence can
+      // never cannibalize the checkpoint it audits.
+      let evidenceSection = ''
+      if (this.foldEvidenceCheck && modelText.length > 0) {
+        try {
+          // Audit against EVERYTHING the fold lands, digest included: an
+          // anchor the user-instructions digest carries is kept and must not
+          // be re-attached a second time.
+          const auditDomain = digest.length > 0 ? `${modelText}\n\n${digest}` : modelText
+          const evidenceOptions = fitEvidenceOptions({}, Math.floor(maxChars * 0.25))
+          const anchors = extractAnchors(shadowed.map(message => ({
+            role: message.role,
+            source: (message as { source?: { kind?: string } }).source ?? null,
+            text: messageText(message),
+          })), evidenceOptions)
+          const poolCapped = anchorsPoolCapped(anchors, evidenceOptions)
+          let audit = auditEvidence(anchors, auditDomain, evidenceOptions, poolCapped)
+          let candidate = renderEvidenceSection(audit)
+          if (candidate.length > 0 && modelText.length + candidate.length + 2 > maxChars) {
+            // The re-attached block must fit the SAME budget: tighten the
+            // model's share (same cumulative text-block clip), then re-audit
+            // against the tightened text — lines that counted as kept before
+            // may have been clipped away, and those come back as evidence.
+            const room = Math.max(0, maxChars - evidenceSectionCeiling(evidenceOptions) - 2)
+            let spare = room
+            result.summary = result.summary.map(block => {
+              if (block.type !== 'text') return block
+              if (spare <= 0) return { ...block, text: '' }
+              if (block.text.length <= spare) {
+                spare -= block.text.length
+                return block
+              }
+              const clipped = block.text.slice(0, Math.max(0, spare - 14)) + '\n…[truncated]'
+              spare = 0
+              return { ...block, text: clipped }
+            })
+            modelText = result.summary
+              .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+              .map(block => block.text)
+              .join('\n')
+              .trim()
+            const tightened = digest.length > 0 ? `${modelText}\n\n${digest}` : modelText
+            audit = auditEvidence(anchors, tightened, evidenceOptions, poolCapped)
+            candidate = renderEvidenceSection(audit)
+          }
+          if (candidate.length > 0) {
+            evidenceSection = candidate
+            this.usage.record(USAGE_KIND.foldCheck, 1, {
+              sessionId: String(agent.session.id),
+              detail: `evidence:missing=${audit.missing.length}${audit.truncated ? ';trunc=1' : ''}`,
+            })
+          }
+        } catch (error) {
+          // The audit must never break a fold commit.
+          this.ctx.logger.warn(
+            `fold evidence audit failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
       // The degradation header stays on the SURFACE copy (result.summary)
       // only: the durable copies must not persist a transient provider error
       // into the folded_ranges summary and the mid-tier memory.
-      const text = [digest, stripExtractiveHeader(modelText)].filter(Boolean).join('\n\n')
+      const text = [digest, stripExtractiveHeader(modelText), evidenceSection].filter(Boolean).join('\n\n')
       if (text.length > 0) {
         // One place records compaction savings for BOTH lanes (durable and
         // fold), using the plugin's CJK-aware surface estimate.
@@ -3806,6 +4074,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             return { ...block, text: `${prefix}\n\n${block.text}` }
           })
           if (!inserted) result.summary = [{ type: 'text', text: prefix }, ...result.summary]
+        }
+        // The surface copy gets the evidence block too — the durable
+        // `text` above already carries it into the folded_ranges archive
+        // and the mid-tier checkpoint. It lands as its own block, never
+        // woven into the model's text.
+        if (evidenceSection.length > 0) {
+          result.summary = [...result.summary, { type: 'text', text: evidenceSection }]
         }
         // Mid-tier checkpoint digests file under their OWN kind: the
         // supersede chain (below) retires every prior same-session digest the
