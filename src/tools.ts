@@ -259,11 +259,13 @@ export function apply(ctx: Context) {
     presentCall: () => ({ card: 'generic', title: 'Memory maintain', kind: 'other' }),
   }))
 
-  // Consecutive zero-drop memory_forget calls (production 2026-11-11,
-  // session a24b23b6: a model fired the tool 82 times in a row — every
-  // result read "Forgot 0 memories; 500 remain." and nothing in that text
-  // told the model to STOP, so it read "500 remain" as unfinished work).
-  // The result text below is self-defusing, and escalates to a hard stop.
+  // Consecutive zero-drop memory_forget calls. THREE escalation layers,
+  // because prose provably fails: production 2026-11-11 session a24b23b6
+  // ran the tool 122 times — the model (glm-5.3-flash) degenerated into
+  // BARE tool-call responses (zero reasoning, ~7 output tokens each), so
+  // neither the explanation nor the STOP instruction was ever read. Layer 3
+  // is execution-level: the breaker THROWS, and an error-shaped tool result
+  // is the only signal a degenerate loop responds to.
   let consecutiveZeroForgetDrops = 0
   ctx.tools.register(defineTool({
     name: 'memory_forget',
@@ -274,6 +276,13 @@ export function apply(ctx: Context) {
       render: (_args, value: string) => [{ type: 'text', text: value }],
     },
     async execute() {
+      if (consecutiveZeroForgetDrops >= 2) {
+        throw new Error(
+          `memory_forget circuit breaker: ${consecutiveZeroForgetDrops} consecutive zero-drop sweeps. `
+          + `The store is within the forgetting policy's bounds; the sweep also reruns automatically `
+          + `after every fold. Do not call this tool again this turn.`,
+        )
+      }
       const result = await ctx.memoryContext.forget()
       if (result.dropped.length === 0) {
         consecutiveZeroForgetDrops++
