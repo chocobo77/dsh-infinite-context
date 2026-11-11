@@ -50,12 +50,12 @@ DeepSeek Harness 的上下文管家插件。它让 AI 助手在超长对话中�
 
 **5. 提前准备，而不是让你等**
 
-快到折叠点时，插件会在后台提前把摘要写好；真正需要折叠时直接取用，现场零等待。如果后台准备会和你的对话抢同一个模型服务器的位置（本地小窗口部署时可能发生），它会自动让路——对话永远优先。
+插件按会话的增长速度和摘要耗时做预测，在合适的时机提前于后台把摘要写好；真正需要折叠时直接取用，现场零等待。增长停滞时不会空跑；后台准备与对话抢同一台模型服务器时（本地小窗口部署可能发生）会自动让路——对话永远优先。
 
 **6. 会自己学习的参数**
 
 - 每个模型路线"摘要实际需要多久"，由插件持续测量并自动调整等待时间——本地部署的大模型慢但健康，等待会自动放宽；云端卡死的流不会浪费第二次机会。
-- 每次折叠"实际落点与计划的偏差"持续记录，下一次自动补偿。
+- 折叠的触发点和幅度来自对实际使用周期的观察：两次折叠之间留出的工作余量、缓存命中率的起伏、摘要被回读的频率，都会影响下一次的判断。增长快的会话自动拉开折叠间隔，摘要常被回读就折得浅一些。
 - 提供商报"装不下"时，记下服务器的真实容量，之后按真实容量规划，而不是按声明值硬撑。
 - 你在配置里手工指定的值优先级最高，学习只在未指定时生效。
 
@@ -156,12 +156,12 @@ This fixes a real gap: memory retrieval works by similarity, and a fifty-turn-ol
 
 **5. Prepared in advance, instead of making you wait**
 
-As the surface approaches the fold trigger, the summary is precomputed in the BACKGROUND; the actual fold consumes it with zero waiting. If the background call would contend with your conversation for the same local server (possible on small local deployments), it stands down — the conversation always wins.
+The plugin predicts a good launch moment from the session's growth speed and summary duration, and precomputes the summary in the BACKGROUND; the actual fold consumes it with zero waiting. An idle session does not speculate, and a background call that would contend with your conversation for the same local server (possible on small local deployments) stands down — the conversation always wins.
 
 **6. Parameters that learn**
 
 - How long a summary takes per model route is measured continuously and the wait adjusts itself — a big locally-deployed model is slow but alive, so waits widen; a dead cloud stream does not get a second patient chance.
-- How far each fold actually landed from its plan is tracked and compensated.
+- The fold trigger and its depth come from observing actual usage cycles: the working room left between folds, how the cache hit ratio moves, and whether folded summaries ever get read back all shape the next decision. Fast-growing sessions space their folds out; heavily-read summaries fold shallower.
 - When a provider rejects a request for size, the server's real capacity is recorded and future folds plan against reality, not the declared number.
 - Values you set explicitly always win; learning only applies where you did not.
 
