@@ -196,6 +196,13 @@ type SummaryResult = {
   readonly maxTokens?: number
   readonly usage?: TokenUsage
 }
+/**
+ * A spread copy of a SummaryResult (readonly modifiers stripped), which the
+ * commit lifecycle rewrites in place: budget clip, fl_ prefix insertion,
+ * evidence block append. Callers pass `{ ...result }` — the mutation stays
+ * visible to the caller that returns the copy.
+ */
+type MutableSummaryResult = Omit<SummaryResult, 'summary'> & { summary: ContentBlock[] }
 
 /** The plugin label stamped on synthesized messages for provenance. */
 const PLUGIN = 'dsh-infinite-context'
@@ -2780,7 +2787,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.usage.record(USAGE_KIND.foldCheck, 1, {
         sessionId,
         detail: 'fold_cycle:'
-          + `runway=${Math.round(report.runwayTokens)};time=${report.cycleTimeMs};req=${report.cycleRequests};`
+          // 'na' = the session's first fold (no landing reference): readable
+          // in the ledger, unlike Math.round(NaN) → 'NaN'.
+          + `runway=${Number.isFinite(report.runwayTokens) ? Math.round(report.runwayTokens) : 'na'};`
+          + `time=${report.cycleTimeMs};req=${report.cycleRequests};`
           + `cache=${report.cycleCacheHit === undefined ? 'n/a' : report.cycleCacheHit.toFixed(2)};`
           + `recall=${report.recalled ? 1 : 0};fail=${report.hadFailure ? 1 : 0};`
           + `k=${(cycleState.runwayFactor ?? 1).toFixed(2)};`
@@ -3886,7 +3896,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // fold path publishes the route prior (the flag would otherwise hold a
         // STALE value from an earlier call and wrongly suppress publishing).
         this.lastSummarizeDegraded.set(agent, false)
-        return redactedSummary({ summary: speculation.summary, provider: 'precomputed', model: 'speculative' })
+        // The precomputed summary joins the SAME commit lifecycle as a live
+        // one: clip, task-state rebuild, digest, evidence audit, folded-range
+        // archive, checkpoint memory. Production 2026-11-11 (session
+        // e8d3bbf8): an early return here skipped ALL of it — the hit fold
+        // landed with no fl_ archive, no checkpoint, no savings record, and
+        // a stale task state. Reversibility must not depend on where the
+        // summary came from.
+        const consumed = {
+          ...redactedSummary({
+            summary: speculation.summary,
+            provider: 'precomputed',
+            model: 'speculative',
+          }),
+        }
+        await this.postSummarize(consumed, input, agent)
+        return consumed
       }
       // Mismatch: the caller may be ANOTHER LANE. summarize() serves the
       // durable/base compaction too, and that lane shadows a DIFFERENT range
@@ -3928,6 +3953,27 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // Spread once: the resilience wrapper's declared type keeps the summary
     // read-only, while the clipping below rewrites it in place.
     const result = { ...(await this.summarizeResilient(input, agent, signal)) }
+    await this.postSummarize(result, input, agent)
+    return result
+  }
+
+  /**
+   * The commit lifecycle every produced summary goes through: budget clip,
+   * task-state rebuild, user-instructions digest, evidence audit, folded-
+   * range archive + checkpoint memory, pyramid/forgetting sweep. SHARED by
+   * the live summarizer and the speculative-hit path — the reversibility
+   * contract (fl_ archive, read-back, supersede chain) applies to a fold no
+   * matter how its summary was produced.
+   * @param result - the summary, mutated in place (clipped, prefixed, floored
+   *   by the evidence section; the caller returns it after this call).
+   * @param input - the summarization input whose shadowed region is folded.
+   * @param agent - the fold owner (routing for the rebalance summarizer).
+   */
+  private async postSummarize(
+    result: MutableSummaryResult,
+    input: SummarizationInput,
+    agent: Agent,
+  ): Promise<void> {
     try {
       // The summarizer is asked for ~30% of its input, but local models often
       // over-produce; a summary that is not smaller than the folded content is
@@ -4125,7 +4171,6 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         `memory persistence/rebalance failed: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
-    return result
   }
 
   /**
