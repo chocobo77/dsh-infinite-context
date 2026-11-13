@@ -77,6 +77,7 @@ import {
   MemoryCompactionConfigSchema,
   MIN_SUMMARIZATION_TIMEOUT_MS,
   resolveAbsorbOptions,
+  resolveDegenerateRetry,
   resolveFoldOptions,
   resolveImplicitRecall,
   resolveRetrievalOptions,
@@ -120,6 +121,7 @@ import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import type { FoldAttachmentInsert } from './memory-store.ts'
+import { DEGENERATE_RETRY_MAX_STREAK, degenerateRetryNudge, isDegenerateAssistantContent } from './degenerate-turn.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
@@ -687,6 +689,11 @@ const GOV_SLEEP_CONSOLIDATE_MIN = 3
 const GOV_SLEEP_CONSOLIDATE_INPUTS = 8
 /** Minimum ms between two consolidations of the SAME session (cold-start prior). */
 const GOV_SLEEP_RERUN_MS = 6 * 3600_000
+
+// --- Degenerate-turn invisible retry (upstream billion-context #821, engine-layer equivalent) ---
+// The streak cap itself lives in degenerate-turn.ts (DEGENERATE_RETRY_MAX_STREAK):
+// a single degenerate turn is a fluke the nudge fixes; a streak means the model
+// is wedged and a fourth retry would burn tokens on the same collapse.
 
 export class HistoryCompressor {
   // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
@@ -1745,6 +1752,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly sleepTimers = new Map<string, NodeJS.Timeout>()
   /** Last idle-consolidation run per session (rate limit). */
   private readonly sleepLastRun = new Map<string, number>()
+  /** Consecutive degenerate turns per session (zero visible output; reset on any real output). */
+  private readonly degenerateStreaks = new Map<string, number>()
   /**
    * Evict idle sessions from the engine's per-session RAM maps, matching the
    * compressor's counter eviction (same idle clock, returned by
@@ -2068,6 +2077,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
     this.registerSleepWatch(ctx)
+    this.registerDegenerateRetry(ctx)
     this.registerUsage(ctx)
     this.registerCompactionEffort(ctx)
 
@@ -4361,6 +4371,58 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * Degenerate-turn invisible retry (upstream billion-context #821, engine-
+   * layer equivalent): when a turn is about to close normally, inspect its
+   * last assistant message; zero visible output (reasoning only, or empty)
+   * means the turn produced nothing — splice ONE corrective step into the
+   * inbox so the turn continues instead of ending on lost work. The streak
+   * cap bounds a wedged model; any real output (observed in registerUsage)
+   * resets it.
+   * @param ctx - the plugin context (agent-scoped serial dispatch).
+   */
+  private registerDegenerateRetry(ctx: Context): void {
+    ctx.on('agent/turn-stopping', ({ agent, turn, signal }: { agent: Agent; turn: number; signal: AbortSignal }) => {
+      if (!resolveDegenerateRetry(this.config)) return
+      if (signal.aborted) return
+      const sessionId = String(agent.session.id)
+      const streak = this.degenerateStreaks.get(sessionId) ?? 0
+      if (streak >= DEGENERATE_RETRY_MAX_STREAK) return
+      // The turn's OWN assistant message: scan the surface tail for the newest
+      // assistant/message belonging to this turn (a completed turn with no
+      // assistant message at all is the empty-turn path — nothing to retry).
+      let content: readonly { type: string; text?: string }[] | undefined
+      try {
+        for (let i = agent.session.surface.nodes.length - 1; i >= 0; i--) {
+          const seq = agent.session.surface.nodes[i]
+          if (seq === undefined) continue
+          const event = agent.session.eventAt(seq)
+          if (event?.type !== 'assistant/message') continue
+          if (event.data.turn !== turn) break
+          content = event.data.message?.content
+          break
+        }
+      } catch {
+        return // history read failure is not worth a retry decision
+      }
+      if (content === undefined || !isDegenerateAssistantContent(content as never)) return
+      this.degenerateStreaks.set(sessionId, streak + 1)
+      try {
+        agent.inbox.append('next-step', degenerateRetryNudge())
+      } catch (error) {
+        this.degenerateStreaks.set(sessionId, streak) // append failed: do not count the attempt
+        this.ctx.logger.warn(
+          `[ContextGovernor] degenerate-turn retry failed to inject: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return
+      }
+      this.usage.record(USAGE_KIND.degenerateRetry, 1, { sessionId, detail: `turn=${turn};streak=${streak + 1}` })
+      this.ctx.logger.info(
+        `[ContextGovernor] Degenerate turn ${turn} (no visible output) — one invisible retry injected (streak ${streak + 1})`,
+      )
+    })
+  }
+
+  /**
    * Arm one deferred idle pass unless one is already pending for the session.
    * @param sessionId - the idle session.
    * @param session - its session handle (routing + persistence).
@@ -4754,6 +4816,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private registerUsage(ctx: Context): void {
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'assistant/message') return
+      // Degenerate-turn streak bookkeeping runs BEFORE the usage gate: any
+      // assistant message with real output resets the session's streak, and
+      // this is the only choke point that sees every message (degenerate
+      // ones increment in registerDegenerateRetry at turn close).
+      const retryContent = event.data.message?.content
+      if (Array.isArray(retryContent) && !isDegenerateAssistantContent(retryContent as never)) {
+        this.degenerateStreaks.delete(String(session.id))
+      }
       const usage = event.data.usage
       if (usage === undefined) return
       const sessionId = String(session.id)

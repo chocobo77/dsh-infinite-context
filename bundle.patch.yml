@@ -130,6 +130,7 @@
         fold_implicit_recall: true
         sleep_consolidate: true
         sleep_idle_ms: 900000
+        degenerate_retry: true
         compress_target_ratio: 0.6
         # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN
         # and the target DEEPER as the session heats up (growth EMA) or matures

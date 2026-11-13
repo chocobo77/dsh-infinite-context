@@ -68,6 +68,12 @@ export const USAGE_KIND = {
   absorbChars: 'absorb_digest_chars',
   /** One scheduled (nudged) compression. */
   nudge: 'nudge_forced',
+  /**
+   * One degenerate-turn invisible retry (upstream billion-context #821): the
+   * turn ended normally with zero visible output and the driver spliced one
+   * corrective step instead of closing (detail = `turn=<n>`).
+   */
+  degenerateRetry: 'degenerate_retry',
   /** One fold-lane diagnostic sample (detail carries the outcome + numbers). */
   foldCheck: 'fold_check',
   /**

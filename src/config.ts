@@ -433,6 +433,13 @@ export interface MemoryCompactionConfig {
   /** Idle delay before the deferred pass fires (default 15min, min 60s). */
   sleep_idle_ms?: number
   /**
+   * Degenerate-turn invisible retry (upstream billion-context #821): a turn
+   * that ends normally with zero visible output gets ONE corrective step
+   * spliced into the inbox instead of closing on lost work. Streak-capped
+   * (3 consecutive) — a wedged model stops getting free retries. Default true.
+   */
+  degenerate_retry?: boolean
+  /**
    * Dynamic compaction threshold: when the routed model's REAL context window
    * (live probe or an explicit `modelWindows` override) is smaller than the
    * window DSH declares, force the durable-history compaction as soon as the
@@ -660,6 +667,7 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   fold_implicit_recall: z.boolean(),
   sleep_consolidate: z.boolean(),
   sleep_idle_ms: z.number().step(1).min(60_000),
+  degenerate_retry: z.boolean(),
   compaction_dynamic_threshold: z.boolean(),
   compaction_dynamic_floor: z.number().min(0).max(1),
   thinking_guard_enabled: z.boolean(),
@@ -1007,6 +1015,11 @@ export function resolveSleepConsolidate(raw: MemoryCompactionConfig): SleepConso
       ? (raw.sleep_idle_ms as number)
       : DEFAULT_SLEEP_IDLE_MS,
   }
+}
+
+/** Whether the degenerate-turn invisible retry participates (default true). */
+export function resolveDegenerateRetry(raw: MemoryCompactionConfig): boolean {
+  return raw.degenerate_retry ?? true
 }
 
 export function resolveUsageOptions(raw: MemoryCompactionConfig): UsageOptions {

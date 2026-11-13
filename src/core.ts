@@ -172,6 +172,11 @@ export {
   type TaskStateInput,
 } from './task-state.ts'
 export {
+  DEGENERATE_RETRY_MAX_STREAK,
+  degenerateRetryNudge,
+  isDegenerateAssistantContent,
+} from './degenerate-turn.ts'
+export {
   analyzeContext,
   type CompactionIntent,
   type ContextProfile,

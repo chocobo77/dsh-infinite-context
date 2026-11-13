@@ -147,6 +147,7 @@
     fold_implicit_recall: true
     sleep_consolidate: true
     sleep_idle_ms: 900000
+    degenerate_retry: true
     # Per-turn TASK-STATE working-memory block: a small carried snapshot of the
     # primary request / pending jobs / next step / critical context, rebuilt
     # from every fold's structured checkpoint and injected BEFORE the RAG
