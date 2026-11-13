@@ -1,6 +1,6 @@
 name: ci
 
-# The three gates (typecheck / test / build). They need the plugin's HOST
+# The two gates (typecheck / build). They need the plugin's HOST
 # packages (`@deepseek-ai/*`), which live in a DSH source snapshot that has
 # no public repository — a plain runner cannot provision them.
 #
@@ -42,12 +42,12 @@ jobs:
 
       - name: Point the host-package candidates at the checked-out snapshot
         run: |
-          sed -i "s|D:/Program files/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.typecheck.json
-          sed -i "s|/home/[^/]*/.local/share/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.typecheck.json
-          grep -c "$DSH_CHECKOUT" tsconfig.typecheck.json
+          sed -i "s|D:/Program files/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.base.json
+          sed -i "s|/home/[^/]*/.local/share/deepseek-harness|$DSH_CHECKOUT|g" tsconfig.base.json
+          grep -c "$DSH_CHECKOUT" tsconfig.base.json
 
       - name: Install
         run: npm ci
 
-      - name: Verify (typecheck + test + build)
+      - name: Verify (typecheck + build)
         run: npm run verify

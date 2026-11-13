@@ -58,10 +58,8 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "npm run build",
     "prepack": "npm run verify",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
-    "verify": "npm run typecheck && vitest run && npm run build"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify": "npm run typecheck && npm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",
@@ -76,8 +74,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "^6.0.3",
-    "vitest": "^3.0.0"
+    "typescript": "^6.0.3"
   },
   "engines": {
     "node": ">=22.19.0"

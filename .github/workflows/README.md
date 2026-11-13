@@ -1,6 +1,6 @@
-# CI — the three gates (typecheck / test / build)
+# CI — the two gates (typecheck / build)
 
-The plugin's test suite imports its HOST packages (`@deepseek-ai/*`) from a
+The plugin's sources import their HOST packages (`@deepseek-ai/*`) from a
 DSH checkout, and that checkout is a **local source snapshot without a public
 repository** — a plain GitHub runner cannot provision it. The gates therefore
 run where a checkout exists (the two dev machines, via the `pre-push` hook and
@@ -16,16 +16,23 @@ see one:
    `DSH_CHECKOUT_REF`, default `master`), plus `DSH_CHECKOUT_TOKEN` if the
    snapshot repo is private.
 3. Re-run this workflow. The job clones the snapshot to `${{ github.workspace }}/dsh`,
-   exports `DSH_CHECKOUT` (which `vitest.config.ts` honors), and rewrites
-   `tsconfig.typecheck.json`'s absolute candidates to the snapshot path.
+   exports `DSH_CHECKOUT` (which `tsconfig.base.json` candidates honor), and rewrites
+   the absolute candidates to the snapshot path.
 
-Without `DSH_CHECKOUT` the job fails fast with a notice instead of faking a
-green run: the suite cannot execute against host packages that are not there.
+Without provisioning the job fails fast with a notice instead of faking a
+green run: the sources cannot be checked against host packages that are not
+there.
 
-## Why the typecheck config is committed with absolute path candidates
+## Why the base config is committed with absolute path candidates
 
-`tsconfig.typecheck.json` resolves the host packages through a candidates
-list tried in order: `DSH_CHECKOUT` env-aware relative paths, then the two
-operators' own checkout locations (Windows `D:/…`, Ubuntu `~/.local/…`). CI
-exports `DSH_CHECKOUT`; a dev machine hits its own candidate. Extra machines
-append their candidate rather than editing the existing ones.
+`tsconfig.base.json` resolves the host packages through a candidates list
+tried in order: the two operators' own checkout locations (Windows `D:/…`,
+Ubuntu `~/.local/…`). CI rewrites them with `sed`; extra machines append
+their candidate rather than editing the existing ones.
+
+## Test suite
+
+The vitest suite was removed from the repository on 2026-11-14 (operator
+decision; the regression asset lives in git history up to and including
+tag `v0.9.8` — `git checkout v0.9.8 -- tests/ vitest.config.ts` restores it
+along with the vitest devDependency). `verify` is typecheck + build.

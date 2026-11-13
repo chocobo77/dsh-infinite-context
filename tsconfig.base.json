@@ -117,13 +117,5 @@
         "/home/qinpeng/.local/share/deepseek-harness/packages/experimental/*/lib/types/index.d.ts"
       ]
     }
-  },
-  "include": [
-    "src/**/*.ts",
-    "bench/**/*.ts"
-  ],
-  "exclude": [
-    "node_modules",
-    "tests"
-  ]
+  }
 }

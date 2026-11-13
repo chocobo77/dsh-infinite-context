@@ -61,12 +61,10 @@ scripts/install-dsh-plugin.cfg
 docs/
 scripts/
 ARCHITECTURE.md
-# tests/, vitest.config.ts and tsconfig.typecheck.json are TRACKED since
-# 0.8.9: the suite is the project's regression asset and must sync across
-# the two dev machines through git (they were local-only 2026-10-31..11-04,
-# which is how the two sides drifted). tsconfig.typecheck.json carries
-# per-machine absolute path candidates (D:/… first, /home/… second) — both
-# are the operators' own checkouts.
+# The vitest suite left the repository on 2026-11-14 (operator decision):
+# tests/, vitest.config.ts and tsconfig.typecheck.json are gone; the suite
+# remains recoverable from git history (tag v0.9.8 and earlier). verify is
+# typecheck + build only.
 
 release/
 

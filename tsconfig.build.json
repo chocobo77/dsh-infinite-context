@@ -1,5 +1,5 @@
 {
-  "extends": "./tsconfig.typecheck.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "noEmit": false,
     "outDir": "dist",
@@ -9,5 +9,5 @@
     "sourceMap": false
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "tests"]
+  "exclude": ["node_modules"]
 }
