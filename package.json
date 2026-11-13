@@ -1,6 +1,6 @@
 {
   "name": "dsh-infinite-context",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "description": "DSH 上下文治理插件：可逆压缩、分层记忆，折叠的时机与幅度随实际使用学习，每份摘要分段提炼并经原文核对。/ Context governance for DeepSeek Harness: reversible compaction, layered memory, a fold rhythm learned from use, and every summary built in segments and checked against the original.",
   "type": "module",
   "license": "MIT",
