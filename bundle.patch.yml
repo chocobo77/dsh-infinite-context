@@ -127,6 +127,9 @@
         # Fold evidence audit: the summary's lost anchors (paths, archive refs,
         # error lines) are re-attached verbatim after each fold. Zero LLM cost.
         fold_evidence_check: true
+        fold_implicit_recall: true
+        sleep_consolidate: true
+        sleep_idle_ms: 900000
         compress_target_ratio: 0.6
         # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN
         # and the target DEEPER as the session heats up (growth EMA) or matures

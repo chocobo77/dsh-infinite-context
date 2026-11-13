@@ -416,6 +416,23 @@ export interface MemoryCompactionConfig {
    */
   fold_evidence_check?: boolean
   /**
+   * Implicit fold recall: embed each fold summary and semantically match the
+   * step's user-authored input against recent folds, counting significant
+   * overlaps into the same recall loop an explicit `memory_expand` read
+   * feeds. Threshold is a fixed cold-start prior — nothing here learns.
+   * Default true.
+   */
+  fold_implicit_recall?: boolean
+  /**
+   * Sleep-time consolidation: when an agent goes idle, run one deferred
+   * pass that re-summarizes the session's superseded checkpoint history
+   * into one long-tier memory. LLM spend is bounded (min superseded count,
+   * one call per idle window, per-session rerun gap). Default true.
+   */
+  sleep_consolidate?: boolean
+  /** Idle delay before the deferred pass fires (default 15min, min 60s). */
+  sleep_idle_ms?: number
+  /**
    * Dynamic compaction threshold: when the routed model's REAL context window
    * (live probe or an explicit `modelWindows` override) is smaller than the
    * window DSH declares, force the durable-history compaction as soon as the
@@ -640,6 +657,9 @@ export const MemoryCompactionConfigSchema: z<MemoryCompactionConfig> = z.object(
   fold_chunking: z.boolean(),
   fold_chunk_tokens: z.number().step(1).min(1000),
   fold_evidence_check: z.boolean(),
+  fold_implicit_recall: z.boolean(),
+  sleep_consolidate: z.boolean(),
+  sleep_idle_ms: z.number().step(1).min(60_000),
   compaction_dynamic_threshold: z.boolean(),
   compaction_dynamic_floor: z.number().min(0).max(1),
   thinking_guard_enabled: z.boolean(),
@@ -964,6 +984,28 @@ export function resolveFoldOptions(raw: MemoryCompactionConfig): FoldOptions {
     enabled: raw.fold_ranges ?? DEFAULT_FOLD_OPTIONS.enabled,
     retentionDays: raw.fold_range_retention_days ?? DEFAULT_FOLD_OPTIONS.retentionDays,
     maxEntries: raw.fold_range_max_entries ?? DEFAULT_FOLD_OPTIONS.maxEntries,
+  }
+}
+
+/** Whether the implicit fold-recall scan participates (default true). */
+export function resolveImplicitRecall(raw: MemoryCompactionConfig): boolean {
+  return raw.fold_implicit_recall ?? true
+}
+
+export interface SleepConsolidateOptions {
+  readonly enabled: boolean
+  readonly idleMs: number
+}
+
+const DEFAULT_SLEEP_IDLE_MS = 900_000
+
+/** Resolve the idle-consolidation gate and delay (defaults: on, 15min). */
+export function resolveSleepConsolidate(raw: MemoryCompactionConfig): SleepConsolidateOptions {
+  return {
+    enabled: raw.sleep_consolidate ?? true,
+    idleMs: Number.isFinite(raw.sleep_idle_ms) && (raw.sleep_idle_ms as number) >= 60_000
+      ? (raw.sleep_idle_ms as number)
+      : DEFAULT_SLEEP_IDLE_MS,
   }
 }
 

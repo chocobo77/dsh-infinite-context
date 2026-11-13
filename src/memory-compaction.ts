@@ -78,7 +78,9 @@ import {
   MIN_SUMMARIZATION_TIMEOUT_MS,
   resolveAbsorbOptions,
   resolveFoldOptions,
+  resolveImplicitRecall,
   resolveRetrievalOptions,
+  resolveSleepConsolidate,
   resolveSummarizationTimeoutMs,
   resolveSpeculativeFold,
   resolveTaskStateEnabled,
@@ -663,6 +665,28 @@ const SESSION_COUNTER_IDLE_MS = 3600_000
 const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
 /** Persisted-retention sweep is throttled to this cadence. */
 const SESSION_KV_PRUNE_INTERVAL_MS = 3600_000
+
+// --- Implicit fold recall (semantic scan, feeds the EXISTING recall loop) ---
+
+/** Semantic-overlap threshold for an implicit recall (cold-start prior; the loop tunes nothing here — the signal feeds recallEma downstream). */
+const GOV_IMPLICIT_RECALL_COS = 0.82
+/** Recent folds the scan matches the step's user-authored delta against. */
+const IMPLICIT_RECALL_SCAN_RECENT = 8
+/** Turns a matched ref stays counted — one signal per ref per window. */
+const IMPLICIT_RECALL_COOLDOWN_TURNS = 50
+/** Safety bound on the cooldown map (cleared wholesale when exceeded). */
+const IMPLICIT_RECALL_COOLDOWN_MAX = 512
+/** Characters of fold text embedded at archive time (hashing embedder is cheap; clip anyway). */
+const IMPLICIT_RECALL_EMBED_CHARS = 8_000
+
+// --- Sleep-time consolidation (Letta's idle-compute pattern) ---
+
+/** Minimum superseded checkpoints before idle consolidation is worth an LLM call (cold-start prior). */
+const GOV_SLEEP_CONSOLIDATE_MIN = 3
+/** How many newest superseded checkpoint texts feed one consolidation. */
+const GOV_SLEEP_CONSOLIDATE_INPUTS = 8
+/** Minimum ms between two consolidations of the SAME session (cold-start prior). */
+const GOV_SLEEP_RERUN_MS = 6 * 3600_000
 
 export class HistoryCompressor {
   // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
@@ -1339,6 +1363,7 @@ export class HistoryCompressor {
     sessionId: string,
     messages: readonly Message[],
     summaryText: string,
+    embedding?: readonly number[] | undefined,
   ): string {
     const options = resolveFoldOptions(this.config)
     if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
@@ -1354,6 +1379,7 @@ export class HistoryCompressor {
         original,
         sessionId,
         ...(attachments.length > 0 ? { attachments } : {}),
+        ...(embedding === undefined ? {} : { embedding }),
       })
       this.enforceFoldRetention(options)
       return foldedRangeHeader(messages.length, chars, ref)
@@ -1713,6 +1739,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
   /** fl_ recall count observed at each session's last fold (quality delta). */
   private readonly lastRecallAtFold = new Map<string, number>()
+  /** Per `sessionId:ref` turn stamp of the last implicit-recall count. */
+  private readonly implicitRecallCooldown = new Map<string, number>()
+  /** Pending idle-maintenance timers per session (cancelled on wake). */
+  private readonly sleepTimers = new Map<string, NodeJS.Timeout>()
+  /** Last idle-consolidation run per session (rate limit). */
+  private readonly sleepLastRun = new Map<string, number>()
   /**
    * Evict idle sessions from the engine's per-session RAM maps, matching the
    * compressor's counter eviction (same idle clock, returned by
@@ -2035,6 +2067,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // (Strategy 1) and model-context adoption (G8) — both must keep working
     // when RAG retrieval is disabled. The RAG section gates itself inside.
     this.registerRetrieval(ctx)
+    this.registerSleepWatch(ctx)
     this.registerUsage(ctx)
     this.registerCompactionEffort(ctx)
 
@@ -4172,6 +4205,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           String(agent.session.id),
           shadowed,
           text,
+          // Summary embedding for the implicit-recall scan: the fold's own
+          // durable text is the matching side. Best-effort — undefined just
+          // means this fold is invisible to the scan.
+          resolveImplicitRecall(this.config) && text.length > 0
+            ? await this.ctx.memoryContext.embedText(
+              text.length > IMPLICIT_RECALL_EMBED_CHARS ? text.slice(0, IMPLICIT_RECALL_EMBED_CHARS) : text,
+            )
+            : undefined,
         )
         const prefix = [header.includes('fl_') ? header : '', digest]
           .filter(Boolean)
@@ -4260,6 +4301,131 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
   }
 
+  /**
+   * Implicit fold recall: match the step's user-authored input against the
+   * session's recent fold summaries. A significant semantic overlap means
+   * the conversation is circling back to material a fold removed — the
+   * signal the amplitude loop was blind to when the model never calls
+   * memory_expand (20 production cycles at recall=0 pushed amp to its
+   * ceiling with zero information). Feeds the SAME flRecalls counter an
+   * explicit read bumps, so recallEma learns from it with no new loop.
+   * Fire-and-forget; failure costs one scan, never a step.
+   * @param sessionId - the folding session.
+   * @param turn - the current turn (cooldown key).
+   * @param texts - user-authored texts of this step's inbox delta.
+   */
+  private async scanImplicitRecall(sessionId: string, turn: number, texts: readonly string[]): Promise<void> {
+    if (!resolveImplicitRecall(this.config)) return
+    const joined = texts.map(text => text.trim()).filter(text => text.length > 0).join('\n')
+    if (joined.length < 40) return
+    const query = await this.ctx.memoryContext.embedText(
+      joined.length > IMPLICIT_RECALL_EMBED_CHARS ? joined.slice(0, IMPLICIT_RECALL_EMBED_CHARS) : joined,
+    )
+    if (query === undefined) return
+    const recent = this.ctx.memoryContext.recentFoldEmbeddings(sessionId, IMPLICIT_RECALL_SCAN_RECENT)
+    for (const { ref, embedding } of recent) {
+      const cooldownKey = sessionId + ':' + ref
+      if ((this.implicitRecallCooldown.get(cooldownKey) ?? Number.NEGATIVE_INFINITY) + IMPLICIT_RECALL_COOLDOWN_TURNS > turn) continue
+      const score = cosineSimilarity(query, embedding)
+      if (score < GOV_IMPLICIT_RECALL_COS) continue
+      if (this.implicitRecallCooldown.size > IMPLICIT_RECALL_COOLDOWN_MAX) this.implicitRecallCooldown.clear()
+      this.implicitRecallCooldown.set(cooldownKey, turn)
+      this.ctx.memoryContext.noteFlRecall(sessionId)
+      this.usage.record(USAGE_KIND.foldCheck, 1, {
+        sessionId,
+        detail: `implicit-recall:ref=${ref};score=${score.toFixed(2)}`,
+      })
+    }
+  }
+
+  /**
+   * Sleep-time maintenance: when an agent goes idle, schedule one deferred
+   * consolidation pass; any non-idle status (or the next pre-step) cancels
+   * the pending pass. Letta's idle-compute pattern — the fold commit does
+   * the urgent work, idle time does the catch-up work (sweep the stale
+   * counters, re-summarize the superseded checkpoint history into the long
+   * tier). LLM spend is bounded: one call per session per idle window,
+   * min-GOV_SLEEP_CONSOLIDATE_MIN superseded checkpoints to arm, and a
+   * per-session rerun gap.
+   * @param ctx - the plugin context (agent/status dispatch).
+   */
+  private registerSleepWatch(ctx: Context): void {
+    ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
+      const sessionId = String(agent.session.id)
+      if (status === 'idle') {
+        this.scheduleIdleMaintenance(sessionId, agent.session)
+      } else {
+        this.cancelIdleMaintenance(sessionId)
+      }
+    })
+  }
+
+  /**
+   * Arm one deferred idle pass unless one is already pending for the session.
+   * @param sessionId - the idle session.
+   * @param session - its session handle (routing + persistence).
+   */
+  private scheduleIdleMaintenance(sessionId: string, session: Session): void {
+    if (!resolveSleepConsolidate(this.config).enabled) return
+    if (this.sleepTimers.has(sessionId)) return
+    const idleMs = resolveSleepConsolidate(this.config).idleMs
+    const timer = setTimeout(() => {
+      this.sleepTimers.delete(sessionId)
+      void this.runSleepMaintenance(sessionId, session).catch(() => { /* best-effort sweep */ })
+    }, idleMs)
+    timer.unref?.()
+    this.sleepTimers.set(sessionId, timer)
+  }
+
+  /** Cancel one session's pending idle pass (the agent woke up). */
+  private cancelIdleMaintenance(sessionId: string): void {
+    const timer = this.sleepTimers.get(sessionId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    this.sleepTimers.delete(sessionId)
+  }
+
+  /**
+   * One idle pass: stale-counter sweep + superseded-checkpoint consolidation.
+   * @param sessionId - the idle session.
+   * @param session - its session handle.
+   * @param summarize - the LLM merge call (injectable for tests).
+   */
+  private async runSleepMaintenance(
+    sessionId: string,
+    session: Session,
+    summarize: (texts: readonly string[]) => Promise<string> = async texts =>
+      summarizeMemoriesWithLlm(this.ctx, this.config, texts, 'sleep consolidation'),
+  ): Promise<void> {
+    // The execution point re-checks the gate: the schedule side arms only
+    // enabled sessions, but this method must stand on its own (defense in
+    // depth — a stray direct call must not spend tokens against a disabled
+    // config).
+    if (!resolveSleepConsolidate(this.config).enabled) return
+    const lastRun = this.sleepLastRun.get(sessionId) ?? Number.NEGATIVE_INFINITY
+    if (Date.now() - lastRun < GOV_SLEEP_RERUN_MS) return
+    const superseded = this.ctx.memoryContext.supersededCheckpointTexts(sessionId, GOV_SLEEP_CONSOLIDATE_INPUTS)
+    if (superseded.count < GOV_SLEEP_CONSOLIDATE_MIN) return
+    const merged = await summarize(superseded.texts)
+    if (merged.trim().length === 0) return
+    // kind 'project': the fold's supersedePrior('checkpoint') must NOT retire
+    // the consolidation — it is the session's long-term conclusion, not the
+    // next digest's predecessor.
+    await this.ctx.memoryContext.storeMemory(merged, 'long', {
+      sourceSessionId: session.id,
+      importance: 0.7,
+      kind: 'project',
+    })
+    this.sleepLastRun.set(sessionId, Date.now())
+    this.usage.record(USAGE_KIND.foldCheck, 1, {
+      sessionId,
+      detail: `sleep:consolidated=${superseded.texts.length}`,
+    })
+    this.ctx.logger.info(
+      `[ContextGovernor] Idle consolidation: ${superseded.texts.length} superseded checkpoints → one long memory (session …${sessionId.slice(-8)})`,
+    )
+  }
+
   /** Register the per-turn governance hook: CTX adoption + compression + RAG injection. */
   private registerRetrieval(ctx: Context): void {
     ctx.on('agent/pre-step', async (
@@ -4268,6 +4434,20 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     ): Promise<PreStepDecision> => {
       // Periodic cleanup of stale session counters + stale forced-pressure marks
       this.evictIdleSessions(this.compressor.cleanupStale())
+      // The agent woke up: any pending idle pass is obsolete.
+      this.cancelIdleMaintenance(String(payload.agent.session.id))
+
+      // --- Implicit fold recall scan ---
+      // Fire-and-forget BEFORE the pipeline: the scan is read-only (one
+      // embed + one store query), and its signal must survive even if a
+      // later injection step throws.
+      try {
+        void this.scanImplicitRecall(
+          String(payload.agent.session.id),
+          payload.turn,
+          payload.messages.filter(message => isUserAuthored(message)).map(message => messageText(message)),
+        ).catch(() => { /* the scan costs one signal at most, never a step */ })
+      } catch { /* construction-time failures are the caller's problem, not the step's */ }
 
       // --- Tool-result archive (exact-text CCR) ---
       // Stub oversized tool results that appeared since the last pass BEFORE the

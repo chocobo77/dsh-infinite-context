@@ -64,6 +64,7 @@ function buildEngine() {
   engine.ctx = {
     logger: { info: () => {}, warn: () => {}, debug: () => {} },
     memoryContext: {
+      embedText: async () => undefined,
       storeMemory: async (text: string, tier: string, meta: { kind?: string }) => {
         stored.push({ text, tier, ...(meta.kind === undefined ? {} : { kind: meta.kind }) })
         return { id: 'mem-1' }

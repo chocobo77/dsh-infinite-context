@@ -472,6 +472,14 @@ export class MemoryStore {
         PRIMARY KEY (ref, msg_idx, block_idx)
       )
     `)
+    // Folded-range summary embedding (implicit-recall matching). Same guarded
+    // ALTER pattern as tool_results.digest: older stores gain the column.
+    {
+      const columns = this.db.prepare('PRAGMA table_info(folded_ranges)').all() as unknown as { name: string }[]
+      if (!columns.some(column => column.name === 'embedding')) {
+        this.db.exec('ALTER TABLE folded_ranges ADD COLUMN embedding BLOB')
+      }
+    }
     this.backfillDedupKeys()
   }
 
@@ -823,11 +831,12 @@ export class MemoryStore {
     readonly ref?: string | undefined
     readonly createdAt?: number | undefined
     readonly attachments?: readonly FoldAttachmentInsert[] | undefined
+    readonly embedding?: readonly number[] | undefined
   }): string {
     this.assertOpen()
     const ref = input.ref ?? newFoldedRef()
     this.db.prepare(
-      'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
+      'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
     ).run(
       ref,
       input.createdAt ?? Date.now(),
@@ -837,6 +846,7 @@ export class MemoryStore {
       input.tokens,
       input.summary,
       input.original,
+      input.embedding === undefined ? null : vectorToBlob(input.embedding),
     )
     if (input.attachments !== undefined && input.attachments.length > 0) {
       const insert = this.db.prepare(
@@ -866,6 +876,43 @@ export class MemoryStore {
       kind: row.kind as FoldAttachmentRecord['kind'],
       payload: row.payload,
     }))
+  }
+
+  /**
+   * The newest folded ranges of one session that carry a summary embedding —
+   * the matching side of the implicit-recall scan.
+   * @param sessionId - owning session.
+   * @param limit - how many recent folds to consider.
+   * @returns ref + embedding pairs, newest first.
+   */
+  recentFoldEmbeddings(sessionId: string, limit: number): { ref: string; embedding: number[] }[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, embedding FROM folded_ranges WHERE session_id = ? AND embedding IS NOT NULL ORDER BY ts DESC LIMIT ?',
+    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { ref: string; embedding: Buffer }[]
+    return rows.flatMap(row => {
+      const embedding = blobToVector(row.embedding)
+      return embedding === undefined ? [] : [{ ref: row.ref, embedding }]
+    })
+  }
+
+  /**
+   * Count and list the SUPERSEDED checkpoint texts of one session — the raw
+   * material of idle-time consolidation (each fold replaced the previous
+   * session digest; the replaced ones hold the session's own history).
+   * @param sessionId - owning session.
+   * @param limit - how many newest superseded texts to return.
+   * @returns `{ count, texts }` — count is unbounded, texts capped at limit.
+   */
+  supersededCheckpointTexts(sessionId: string, limit = 8): { count: number; texts: string[] } {
+    this.assertOpen()
+    const count = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND source_session_id = ?',
+    ).get(sessionId) as unknown as { n: number }
+    const rows = this.db.prepare(
+      'SELECT text FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND source_session_id = ? ORDER BY created_at DESC LIMIT ?',
+    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { text: string }[]
+    return { count: Number(count.n), texts: rows.map(row => row.text) }
   }
 
   /** Delete the attachment rows of the given folded-range refs. */

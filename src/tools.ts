@@ -15,6 +15,11 @@ import { oneLine } from './strings.ts'
 export const name = 'memory-tools'
 export const inject = ['tools', 'memoryContext', 'sessions']
 
+/** Longest memory_write payload (a fact, not a transcript). */
+const MEMORY_WRITE_MAX_CHARS = 2000
+/** memory_write cap per session — retrieval attention is the scarce resource. */
+const MEMORY_WRITE_SESSION_MAX = 20
+
 /** Render retrieval hits as a compact text block for the tool output. */
 function renderHits(hits: { doc: { tier: string; text: string }; score: number }[]): string {
   if (hits.length === 0) {
@@ -172,6 +177,8 @@ export function apply(ctx: Context) {
       const status = ctx.memoryContext.status()
       return JSON.stringify({
         ...status,
+        // Agent-curated writes this process (memory_write cap accounting).
+        memoryWrites: [...memoryWriteCounts.values()].reduce((sum, count) => sum + count, 0),
         // Reverse compaction: what is archived and therefore still recoverable.
         foldedRanges: {
           ...ctx.memoryContext.foldedRangeStats(),
@@ -268,6 +275,61 @@ export function apply(ctx: Context) {
   // is execution-level: the breaker THROWS, and an error-shaped tool result
   // is the only signal a degenerate loop responds to.
   let consecutiveZeroForgetDrops = 0
+  // Per-session memory_write counters (module-process lifetime): the cap and
+  // the status readout share one map, mirroring the forget breaker's shape.
+  const memoryWriteCounts = new Map<string, number>()
+
+  ctx.tools.register(defineTool({
+    name: 'memory_write',
+    description: 'Persist one durable fact or decision into mid-tier memory for future sessions (e.g. a user preference, a project constraint, a reference). Stores verbatim; deduplicated. NOT for session summaries — folds checkpoint automatically.',
+    parameters: {
+      text: { type: 'string', required: true, description: 'The fact to remember, one self-contained sentence or short paragraph (max 2000 chars).' },
+      kind: { type: 'string', description: 'Memory kind: "user" (preference), "feedback" (correction), "project" (constraint/decision), or "reference" (pointer). Default "project".' },
+      importance: { type: 'number', description: '0-1 importance (forgetting weight). Default 0.6.' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value: string) => [{ type: 'text', text: value }],
+    },
+    async execute(args: { text: string; kind?: string; importance?: number }, exec: ToolRunContext) {
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const capKey = sessionId ?? '(global)'
+      const written = memoryWriteCounts.get(capKey) ?? 0
+      if (written >= MEMORY_WRITE_SESSION_MAX) {
+        return `STOP — do not call memory_write again this session. ${written} writes is the cap `
+          + `(MEMORY_WRITE_SESSION_MAX); each write costs retrieval attention for the REST of this `
+          + `project. Keep only what a future session genuinely needs. Continue with the actual task.`
+      }
+      const text = args.text.trim()
+      if (text.length === 0) return 'Nothing to remember: the text was empty.'
+      const clipped = text.length > MEMORY_WRITE_MAX_CHARS
+        ? text.slice(0, MEMORY_WRITE_MAX_CHARS) + '…'
+        : text
+      if (ctx.memoryContext.hasTextNormalized(clipped)) {
+        return 'Already remembered — an equivalent memory exists; no second copy stored.'
+      }
+      const allowedKind = ['user', 'feedback', 'project', 'reference'] as const
+      const requestedKind = args.kind ?? 'project'
+      if (!(allowedKind as readonly string[]).includes(requestedKind)) {
+        return `Rejected: kind "${requestedKind}" is not one of ${allowedKind.join(', ')}. `
+          + `"checkpoint" is reserved for the automatic fold system and cannot be written manually.`
+      }
+      const kind = requestedKind as 'user' | 'feedback' | 'project' | 'reference'
+      const importanceRaw = args.importance ?? 0.6
+      const importance = Number.isFinite(importanceRaw) ? Math.min(1, Math.max(0, importanceRaw)) : 0.6
+      const doc = await ctx.memoryContext.storeMemory(clipped, 'mid', {
+        importance,
+        kind,
+        ...(sessionId === undefined ? {} : { sourceSessionId: sessionId }),
+      })
+      memoryWriteCounts.set(capKey, written + 1)
+      return `Remembered (${requestedKind}, importance ${importance.toFixed(2)}, id ${doc.id}`
+        + `${clipped.length < text.length ? `, clipped from ${text.length}` : ''}). `
+        + `${written + 1}/${MEMORY_WRITE_SESSION_MAX} writes used this session.`
+    },
+    presentCall: args => ({ card: 'generic', title: 'Memory write', kind: 'other', rawInput: args }),
+  }))
+
   ctx.tools.register(defineTool({
     name: 'memory_forget',
     description: 'Run a forgetting sweep: drop low-value memories per the configured policy. Idempotent — when the store is within policy bounds it drops nothing, and calling it again cannot change that.',

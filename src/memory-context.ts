@@ -565,6 +565,7 @@ export class MemoryContext extends Service {
     readonly original: string
     readonly sessionId?: string | undefined
     readonly attachments?: readonly FoldAttachmentInsert[] | undefined
+    readonly embedding?: readonly number[] | undefined
   }): string | null {
     this.requireEngine()
     return this.store?.archiveFoldedRange(input) ?? null
@@ -578,6 +579,39 @@ export class MemoryContext extends Service {
   getFoldAttachments(ref: string): FoldAttachmentRecord[] {
     this.requireEngine()
     return this.store?.getFoldAttachments(ref) ?? []
+  }
+
+  /**
+   * The newest folded ranges of one session carrying a summary embedding —
+   * the matching side of the implicit-recall scan.
+   * @param sessionId - owning session.
+   * @param limit - how many recent folds to consider.
+   */
+  recentFoldEmbeddings(sessionId: string, limit: number): { ref: string; embedding: number[] }[] {
+    this.requireEngine()
+    return this.store?.recentFoldEmbeddings(sessionId, limit) ?? []
+  }
+
+  /**
+   * The superseded checkpoint texts of one session — idle-time
+   * consolidation's raw material.
+   * @param sessionId - owning session.
+   * @param limit - how many newest superseded texts to return.
+   */
+  supersededCheckpointTexts(sessionId: string, limit?: number): { count: number; texts: string[] } {
+    this.requireEngine()
+    return this.store?.supersededCheckpointTexts(sessionId, limit) ?? { count: 0, texts: [] }
+  }
+
+  /**
+   * Count one IMPLICIT folded-range recall (the engine's semantic scan
+   * matched the conversation against a fold summary) into the same
+   * per-session counter an explicit `memory_expand` read bumps — both feed
+   * one recall loop. The durable evidence stays in the engine's ledger row.
+   * @param sessionId - the session whose fold was recalled.
+   */
+  noteFlRecall(sessionId: string): void {
+    this.flRecalls.set(sessionId, (this.flRecalls.get(sessionId) ?? 0) + 1)
   }
 
   /**

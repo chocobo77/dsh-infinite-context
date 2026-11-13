@@ -276,3 +276,65 @@ describe('memory_expand (registered tool)', () => {
     expect(events).toEqual([])
   })
 })
+
+describe('memory_write', () => {
+  function makeWriteTool() {
+    const defs: ToolDefinition[] = []
+    const stored: { text: string; tier: string; meta: { importance?: number; kind?: string; sourceSessionId?: string } }[] = []
+    const dedup = new Set<string>()
+    const agent = { session: { id: 'sess-w' } }
+    const ctx = {
+      tools: { register: (tool: ToolDefinition) => { defs.push(tool) } },
+      memoryContext: {
+        hasTextNormalized: (text: string) => dedup.has(text),
+        storeMemory: async (text: string, tier: string, meta: typeof stored[number]['meta']) => {
+          stored.push({ text, tier, meta })
+          dedup.add(text)
+          return { id: `mem-${stored.length}` }
+        },
+      },
+    } as unknown as Context
+    apply(ctx)
+    const tool = defs.find(candidate => candidate.name === 'memory_write')
+    expect(tool).toBeDefined()
+    const run = (args: Record<string, unknown>): Promise<string> =>
+      (tool!.execute as (args: Record<string, unknown>, exec: Partial<ToolRunContext>) => Promise<string>)(
+        args, { agent } as unknown as ToolRunContext,
+      )
+    return { run, stored }
+  }
+
+  it('stores a clipped fact mid-tier with kind, importance and session attribution', async () => {
+    const { run, stored } = makeWriteTool()
+    const out = await run({ text: 'User prefers pnpm over npm for this monorepo.', kind: 'feedback', importance: 0.8 })
+    expect(out).toContain('Remembered (feedback, importance 0.80')
+    expect(out).toContain('1/20 writes used')
+    expect(stored).toEqual([{
+      text: 'User prefers pnpm over npm for this monorepo.',
+      tier: 'mid',
+      meta: { importance: 0.8, kind: 'feedback', sourceSessionId: 'sess-w' },
+    }])
+  })
+
+  it('rejects checkpoint, deduplicates, and clips oversized text', async () => {
+    const { run, stored } = makeWriteTool()
+    expect(await run({ text: 'x', kind: 'checkpoint' })).toContain('cannot be written manually')
+    expect(await run({ text: 'same fact twice', kind: 'project' })).toContain('Remembered')
+    expect(await run({ text: 'same fact twice', kind: 'project' })).toContain('Already remembered')
+    const long = 'a'.repeat(2500)
+    const out = await run({ text: long })
+    expect(out).toContain(`clipped from ${long.length}`)
+    expect(stored.at(-1)!.text.length).toBeLessThan(long.length)
+    // checkpoint rejected + duplicate skipped: only two real stores
+    expect(stored).toHaveLength(2)
+  })
+
+  it('caps writes per session with a stand-down message', async () => {
+    const { run, stored } = makeWriteTool()
+    for (let i = 0; i < 20; i++) await run({ text: `fact number ${i}` })
+    expect(stored).toHaveLength(20)
+    const refused = await run({ text: 'one more fact' })
+    expect(refused).toContain('STOP')
+    expect(stored).toHaveLength(20)
+  })
+})
