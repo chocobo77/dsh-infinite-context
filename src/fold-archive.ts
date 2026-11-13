@@ -54,3 +54,52 @@ export function foldedRangeHeader(messages: number, chars: number, ref: string |
     + `A serialized text record of them (${size} chars, long messages truncated) is archived: `
     + `read it back with memory_expand ref=${ref}]`
 }
+
+/**
+ * Render the archived non-text blocks (images, files) of one folded range as
+ * deterministic text lines. The text-only `original` record drops these
+ * blocks' pixels, but their DURABLE attachment references survive in
+ * `fold_attachments`; naming the ref and its metadata keeps the fold
+ * information-reversible — the host attachment service owns the bytes and
+ * resolves a ref on demand. Corrupt payloads degrade to a count line rather
+ * than throwing (the audit rule: archiving must never break a read-back).
+ * @param records - the stored attachment records, message order.
+ * @returns the rendered block appended to a read-back, or '' when none.
+ */
+export function renderFoldAttachmentLines(
+  records: readonly { kind: string; payload: string }[],
+): string {
+  if (records.length === 0) return ''
+  const lines = records.map((record, i) => {
+    try {
+      const parsed = JSON.parse(record.payload) as {
+        attachmentId?: unknown
+        name?: unknown
+        mediaType?: unknown
+        bytes?: unknown
+        width?: unknown
+        height?: unknown
+      }
+      const id = typeof parsed.attachmentId === 'string' ? parsed.attachmentId : ''
+      const digest = id.startsWith('sha256:')
+        ? id.slice('sha256:'.length, 'sha256:'.length + 8)
+        : id.slice(0, 12)
+      const dims = typeof parsed.width === 'number' && typeof parsed.height === 'number'
+        ? `, ${parsed.width}x${parsed.height}px`
+        : ''
+      const meta = [
+        typeof parsed.mediaType === 'string' ? parsed.mediaType : undefined,
+        typeof parsed.bytes === 'number' ? `${parsed.bytes}B` : undefined,
+      ].filter(Boolean).join(' ')
+      const label = typeof parsed.name === 'string' && parsed.name.length > 0
+        ? `${record.kind} "${parsed.name}"`
+        : record.kind
+      return `- [attachment ${i + 1}/${records.length}] ${label} (${meta}${dims})`
+        + (digest.length > 0 ? ` — attachment sha256:${digest}` : '')
+    } catch {
+      return `- [attachment ${i + 1}/${records.length}] ${record.kind} (record unreadable)`
+    }
+  })
+  return '\n\n[Archived attachments — durable refs survive the fold; '
+    + `re-attach or view via the client to see them again]\n${lines.join('\n')}`
+}

@@ -8,6 +8,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { renderFoldAttachmentLines } from './fold-archive.ts'
 import { sanitizeToolResult } from './OutputSanitizer.ts'
 import { oneLine } from './strings.ts'
 
@@ -526,10 +527,15 @@ export function apply(ctx: Context) {
       const truncated = readTo < points.length
       const notice = expandTruncationNotice({ ref, totalPoints: points.length, offset, returnedPoints: slice.length })
       reportRestore(slice.length, truncated)
+      // Archived non-text blocks ride the FIRST page only: their durable
+      // refs must reach the model once, not on every paged call.
+      const attachments = folded !== undefined && offset === 0
+        ? renderFoldAttachmentLines(ctx.memoryContext.getFoldAttachments(folded.ref))
+        : ''
       const tail = truncated
         ? '\n\n[read up to code point ' + readTo + ' of ' + points.length + '; call again with offset ' + readTo + ']'
         : '\n\n[end of archived text]'
-      return (notice === null ? '' : notice + '\n') + header + '\n\n' + slice.join('') + tail
+      return (notice === null ? '' : notice + '\n') + header + '\n\n' + slice.join('') + attachments + tail
     },
     presentCall: args => ({ card: 'generic', title: 'Tool result expand', kind: 'other', rawInput: args }),
   }))

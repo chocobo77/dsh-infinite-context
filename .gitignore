@@ -69,3 +69,6 @@ ARCHITECTURE.md
 # are the operators' own checkouts.
 
 release/
+
+# bench replay outputs (generated reports)
+bench-results/

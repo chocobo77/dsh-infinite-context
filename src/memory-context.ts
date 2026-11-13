@@ -27,6 +27,8 @@ import { VectorIndex } from './vector-index.ts'
 import {
   FOLDED_REF_PREFIX,
   MemoryStore,
+  type FoldAttachmentInsert,
+  type FoldAttachmentRecord,
   type FoldedRangeMeta,
   type FoldedRangeRecord,
   type ToolResultMeta,
@@ -562,9 +564,20 @@ export class MemoryContext extends Service {
     readonly summary: string
     readonly original: string
     readonly sessionId?: string | undefined
+    readonly attachments?: readonly FoldAttachmentInsert[] | undefined
   }): string | null {
     this.requireEngine()
     return this.store?.archiveFoldedRange(input) ?? null
+  }
+
+  /**
+   * Read the non-text blocks (images, files) stored for one folded range.
+   * @param ref - the archive ref.
+   * @returns the attachment records in message order, empty when none.
+   */
+  getFoldAttachments(ref: string): FoldAttachmentRecord[] {
+    this.requireEngine()
+    return this.store?.getFoldAttachments(ref) ?? []
   }
 
   /**

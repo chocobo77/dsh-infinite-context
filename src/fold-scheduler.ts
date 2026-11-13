@@ -39,6 +39,13 @@ export interface FoldCycleReport {
    * in [0, 1]; `undefined` when the cycle carried no usage rows.
    */
   readonly cycleCacheHit?: number
+  /**
+   * KV-cache dip on the FIRST request after the cycle's opening fold:
+   * 1 − cacheRead/(cacheRead+input+write), in [0, 1]. Ledger-only
+   * measurement (the fold_cycle row's `dip=`) — the utility judgment stays
+   * with cacheUtilityVote, which reads cycle ratios, not this.
+   */
+  readonly cacheDip?: number
   /** Whether the folded range was read back (fl_ recall) during the cycle. */
   readonly recalled: boolean
   /** Whether an agent-lane overflow / guard takeover happened in the cycle. */

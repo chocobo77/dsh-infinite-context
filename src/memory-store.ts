@@ -120,6 +120,20 @@ export interface FoldedRangeMeta {
   readonly restoredCount: number
 }
 
+/** One insert of a non-text block folded into a range (attachment JSON). */
+export interface FoldAttachmentInsert {
+  readonly msgIdx: number
+  readonly blockIdx: number
+  readonly kind: 'image' | 'file'
+  /** The serializable host attachment reference, JSON-encoded. */
+  readonly payload: string
+}
+
+/** One stored non-text block of a folded range, ref included. */
+export interface FoldAttachmentRecord extends FoldAttachmentInsert {
+  readonly ref: string
+}
+
 /** Row shape of `folded_ranges` as stored. */
 interface FoldedRangeRow {
   ref: string
@@ -443,6 +457,21 @@ export class MemoryStore {
     `)
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_ts ON folded_ranges (ts)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_session ON folded_ranges (session_id, ts)')
+    // Non-text blocks (images, files) of folded ranges: the `original` column
+    // is a text-only rendering, so without this side table the durable
+    // attachment references would be dropped at fold time and the pixels'
+    // only remaining identity lost. Rows hold the SERIALIZABLE attachment
+    // refs (host attachment service owns the bytes), not the bytes.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS fold_attachments (
+        ref       TEXT NOT NULL,
+        msg_idx   INTEGER NOT NULL,
+        block_idx INTEGER NOT NULL,
+        kind      TEXT NOT NULL,
+        payload   TEXT NOT NULL,
+        PRIMARY KEY (ref, msg_idx, block_idx)
+      )
+    `)
     this.backfillDedupKeys()
   }
 
@@ -793,6 +822,7 @@ export class MemoryStore {
     readonly sessionId?: string | undefined
     readonly ref?: string | undefined
     readonly createdAt?: number | undefined
+    readonly attachments?: readonly FoldAttachmentInsert[] | undefined
   }): string {
     this.assertOpen()
     const ref = input.ref ?? newFoldedRef()
@@ -808,7 +838,41 @@ export class MemoryStore {
       input.summary,
       input.original,
     )
+    if (input.attachments !== undefined && input.attachments.length > 0) {
+      const insert = this.db.prepare(
+        'INSERT INTO fold_attachments (ref, msg_idx, block_idx, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(ref, msg_idx, block_idx) DO NOTHING',
+      )
+      for (const attachment of input.attachments) {
+        insert.run(ref, attachment.msgIdx, attachment.blockIdx, attachment.kind, attachment.payload)
+      }
+    }
     return ref
+  }
+
+  /**
+   * Read the non-text blocks stored for one folded range.
+   * @param ref - the archive ref.
+   * @returns the records in message order, empty when the range had none.
+   */
+  getFoldAttachments(ref: string): FoldAttachmentRecord[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, msg_idx, block_idx, kind, payload FROM fold_attachments WHERE ref = ? ORDER BY msg_idx, block_idx',
+    ).all(ref) as unknown as { ref: string; msg_idx: number; block_idx: number; kind: string; payload: string }[]
+    return rows.map(row => ({
+      ref: row.ref,
+      msgIdx: Number(row.msg_idx),
+      blockIdx: Number(row.block_idx),
+      kind: row.kind as FoldAttachmentRecord['kind'],
+      payload: row.payload,
+    }))
+  }
+
+  /** Delete the attachment rows of the given folded-range refs. */
+  private deleteFoldAttachmentsForRefs(refs: readonly string[]): void {
+    if (refs.length === 0) return
+    const del = this.db.prepare('DELETE FROM fold_attachments WHERE ref = ?')
+    for (const ref of refs) del.run(ref)
   }
 
   /**
@@ -879,7 +943,10 @@ export class MemoryStore {
    */
   pruneFoldedRanges(beforeTs: number): number {
     this.assertOpen()
+    const doomed = this.db.prepare('SELECT ref FROM folded_ranges WHERE ts < ?').all(beforeTs) as unknown as { ref: string }[]
+    if (doomed.length === 0) return 0
     const info = this.db.prepare('DELETE FROM folded_ranges WHERE ts < ?').run(beforeTs)
+    this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
     return Number(info.changes)
   }
 
@@ -890,9 +957,14 @@ export class MemoryStore {
    */
   trimFoldedRanges(maxEntries: number): number {
     this.assertOpen()
+    const doomed = this.db.prepare(
+      'SELECT ref FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
+    ).all(Math.max(0, maxEntries)) as unknown as { ref: string }[]
+    if (doomed.length === 0) return 0
     const info = this.db.prepare(
       'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
     ).run(Math.max(0, maxEntries))
+    this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
     return Number(info.changes)
   }
 

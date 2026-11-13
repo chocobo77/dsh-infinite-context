@@ -117,6 +117,7 @@ import { cosineSimilarity, fnv1a } from './embedder.ts'
 import { buildTaskStateBlock } from './task-state.ts'
 import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
 import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
+import type { FoldAttachmentInsert } from './memory-store.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
@@ -334,6 +335,31 @@ function finishError(finish: FinishReason): Error | undefined {
   }
 }
 
+/**
+ * Collect the non-text blocks of a folded range: their durable host
+ * attachment references are serializable JSON, and the text-only `original`
+ * rendering would otherwise drop them — the fold's irreversible loss. The
+ * attachment service owns the bytes; the archive stores only the refs.
+ */
+export function extractFoldAttachments(messages: readonly Message[]): FoldAttachmentInsert[] {
+  const out: FoldAttachmentInsert[] = []
+  for (const [msgIdx, message] of messages.entries()) {
+    if (!Array.isArray(message.content)) continue
+    for (const [blockIdx, block] of message.content.entries()) {
+      if (block.type !== 'image' && block.type !== 'file') continue
+      const attachment = (block as { readonly attachment?: unknown }).attachment
+      if (attachment === undefined || attachment === null) continue
+      out.push({
+        msgIdx,
+        blockIdx,
+        kind: block.type,
+        payload: JSON.stringify(attachment),
+      })
+    }
+  }
+  return out
+}
+
 /** Serialize messages to readable text for the summarization prompt. */
 function serializeMessagesForSummary(messages: readonly { role: string; content: unknown }[]): string {
   const MAX_CHARS_PER_MESSAGE = 16_000
@@ -509,6 +535,14 @@ interface SessionCounter {
   cycleRequestsCount?: number
   /** An agent-lane overflow / guard takeover happened this cycle. */
   cycleHadFailure?: boolean
+  /**
+   * KV-cache dip on the FIRST request after the cycle's opening fold:
+   * 1 − cacheRead/(cacheRead+input+write), in [0, 1]. The fold invalidates
+   * the cached prefix; this measures what the break actually cost. Measured
+   * once per cycle, reported in the fold_cycle ledger row (dip=), never
+   * learned from — the utility judgment stays with cacheUtilityVote.
+   */
+  cycleCacheDip?: number | undefined
 }
 
 /** Persistent KV interface (backed by the SQLite plugin_kv table). */
@@ -1069,6 +1103,16 @@ export class HistoryCompressor {
   noteCycleUsage(sessionId: string, inputTokens: number, cacheRead: number, cacheWrite: number): void {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) return
+    // The FIRST request of a fresh cycle is the one that pays for the
+    // opening fold's cache invalidation: capture its dip once, before the
+    // request counter increments. Sessions that never folded have no break
+    // to measure (lastCompressedAt undefined).
+    if ((entry.cycleRequestsCount ?? 0) === 0 && entry.lastCompressedAt !== undefined
+      && Number.isFinite(cacheRead)) {
+      const total = cacheRead + (Number.isFinite(inputTokens) ? inputTokens : 0)
+        + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
+      if (total > 0) entry.cycleCacheDip = Math.min(1, Math.max(0, 1 - cacheRead / total))
+    }
     entry.cycleCacheRead = (entry.cycleCacheRead ?? 0) + (Number.isFinite(cacheRead) ? cacheRead : 0)
     entry.cycleCacheInput = (entry.cycleCacheInput ?? 0) + (Number.isFinite(inputTokens) ? inputTokens : 0)
     entry.cycleCacheWrite = (entry.cycleCacheWrite ?? 0) + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
@@ -1094,6 +1138,7 @@ export class HistoryCompressor {
     cacheInput: number
     cacheWrite: number
     hadFailure: boolean
+    cacheDip?: number
   } {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) {
@@ -1107,6 +1152,7 @@ export class HistoryCompressor {
       cacheInput: entry.cycleCacheInput ?? 0,
       cacheWrite: entry.cycleCacheWrite ?? 0,
       hadFailure: entry.cycleHadFailure === true,
+      ...(entry.cycleCacheDip === undefined ? {} : { cacheDip: entry.cycleCacheDip }),
     }
   }
 
@@ -1147,6 +1193,11 @@ export class HistoryCompressor {
     if (next.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = next.cycleTimeEmaMs
     if (next.cycleRequestsEma !== undefined) entry.cycleRequestsEma = next.cycleRequestsEma
     if (next.cycleCacheHitEma !== undefined) entry.cycleCacheHitEma = next.cycleCacheHitEma
+    // The slow route baseline MUST round-trip like the fast EMA: updateFoldLearning
+    // produces it every cycle, and skipping this write-back (the 2026-11-13 bug)
+    // froze the baseline at its seed so cacheUtilityVote permanently fell through
+    // to the absolute floor — the relative-to-baseline judgment never engaged.
+    if (next.cacheHitBaselineEma !== undefined) entry.cacheHitBaselineEma = next.cacheHitBaselineEma
     if (next.recallEma !== undefined) entry.recallEma = next.recallEma
     if (next.runwayFactor !== undefined) entry.runwayFactor = next.runwayFactor
     if (Number.isFinite(landedTokens)) entry.lastLandedTokens = landedTokens
@@ -1155,6 +1206,7 @@ export class HistoryCompressor {
     entry.cycleCacheWrite = 0
     entry.cycleRequestsCount = 0
     entry.cycleHadFailure = false
+    entry.cycleCacheDip = undefined
     this.persistCounter(sessionId)
     return {
       ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
@@ -1191,10 +1243,16 @@ export class HistoryCompressor {
     if (entry === undefined || entry.cycleRunwayRatioEma !== undefined) return
     try {
       const prior = parseFoldPrior(this.kv.get(HistoryCompressor.foldCyclePriorKey(route)))
+      // Every prior key seeds: a partial seed (the pre-0.9.7 shape seeded only
+      // four) leaves the freshly-warmed session with unlearned fields whose
+      // consumers silently fall back — e.g. cacheUtilityVote to the absolute floor.
       if (prior.runwayRatioEma !== undefined) entry.cycleRunwayRatioEma = prior.runwayRatioEma
       if (prior.runwayFactor !== undefined) entry.runwayFactor = prior.runwayFactor
       if (prior.recallEma !== undefined) entry.recallEma = prior.recallEma
       if (prior.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = prior.cycleTimeEmaMs
+      if (prior.cycleRequestsEma !== undefined) entry.cycleRequestsEma = prior.cycleRequestsEma
+      if (prior.cycleCacheHitEma !== undefined) entry.cycleCacheHitEma = prior.cycleCacheHitEma
+      if (prior.cacheHitBaselineEma !== undefined) entry.cacheHitBaselineEma = prior.cacheHitBaselineEma
       this.persistCounter(sessionId)
     } catch {
       // Prior seeding is best-effort.
@@ -1287,6 +1345,7 @@ export class HistoryCompressor {
     try {
       const original = serializeMessagesForSummary(messages)
       const chars = original.length
+      const attachments = extractFoldAttachments(messages)
       const ref = this.ctx.memoryContext.archiveFoldedRange({
         messages: messages.length,
         chars,
@@ -1294,6 +1353,7 @@ export class HistoryCompressor {
         summary: summaryText,
         original,
         sessionId,
+        ...(attachments.length > 0 ? { attachments } : {}),
       })
       this.enforceFoldRetention(options)
       return foldedRangeHeader(messages.length, chars, ref)
@@ -2773,6 +2833,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         ...(cycleCacheTotal > 0
           ? { cycleCacheHit: cycleInputs.cacheRead / cycleCacheTotal }
           : {}),
+        ...(cycleInputs.cacheDip === undefined ? {} : { cacheDip: cycleInputs.cacheDip }),
         recalled,
         hadFailure: cycleInputs.hadFailure,
       }
@@ -2792,6 +2853,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           + `runway=${Number.isFinite(report.runwayTokens) ? Math.round(report.runwayTokens) : 'na'};`
           + `time=${report.cycleTimeMs};req=${report.cycleRequests};`
           + `cache=${report.cycleCacheHit === undefined ? 'n/a' : report.cycleCacheHit.toFixed(2)};`
+          // dip = KV-cache rebuilt by the cycle's first post-fold request; 'na'
+          // when the cycle opened before any fold (or carried no usage rows).
+          + `dip=${report.cacheDip === undefined ? 'na' : report.cacheDip.toFixed(2)};`
           + `recall=${report.recalled ? 1 : 0};fail=${report.hadFailure ? 1 : 0};`
           + `k=${(cycleState.runwayFactor ?? 1).toFixed(2)};`
           + `amp=${(learnedBandScale(cycleState) ?? 1).toFixed(2)};`

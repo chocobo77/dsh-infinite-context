@@ -137,6 +137,7 @@ function makeExpandTool() {
       searchToolResults: () => [],
       listFoldedRanges: () => [],
       searchFoldedRanges: () => [],
+      getFoldAttachments: () => [],
     },
   } as unknown as Context
   apply(ctx)
