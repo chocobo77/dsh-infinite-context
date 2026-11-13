@@ -98,6 +98,14 @@ DeepSeek Harness 的上下文管家插件。它让 AI 助手在超长对话中�
 
 需要 Node.js ≥ 22.19.0 和 DSH 0.2.x。
 
+一条命令，直接装最新发布版：
+
+```sh
+dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-context/releases/latest/download/dsh-infinite-context.tgz
+```
+
+从源码打包安装（本地开发）：
+
 ```sh
 npm pack
 dsh plugin --profile <profile> add ./dsh-infinite-context-<version>.tgz
@@ -207,6 +215,14 @@ The full list with per-key explanations is in the comments of `cordis.yml`.
 ### Install
 
 Requires Node.js ≥ 22.19.0 and DSH 0.2.x.
+
+One command, straight from the latest release:
+
+```sh
+dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-context/releases/latest/download/dsh-infinite-context.tgz
+```
+
+Or pack from source (local development):
 
 ```sh
 npm pack
