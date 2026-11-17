@@ -80,6 +80,9 @@ async function main(): Promise<void> {
   const sessionId = args.session!
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   const sessionFile = resolveSessionFile(home, sessionId)
+  // The importer drops regions under minTokens (15000) — a smaller --target
+  // would silently produce an all-zero report (the 0.9.8 review F17).
+  if (args.target < 15_000) throw new Error('--target must be >= 15000 (the importer drops smaller regions)')
   const regions = importSessionRegions(sessionFile, { targetTokens: args.target })
   const selected = regions.slice(0, args.regions)
   console.log(`session: ${sessionFile}`)
@@ -116,7 +119,9 @@ async function main(): Promise<void> {
       })
     }
 
-    variants.push({ variant: 'extractive', text: baselines.extractive })
+    // Production extractive folds land through postSummarize too (digest +
+    // evidence re-attachment) — score the baseline the way it really lands.
+    variants.push({ variant: 'extractive', text: commitSummaryLayer(region, baselines.extractive).text })
     variants.push({ variant: 'raw-truncation', text: baselines.rawTruncation })
     for (const { variant, text } of variants) {
       const score = scoreVariant(region, variant, text)

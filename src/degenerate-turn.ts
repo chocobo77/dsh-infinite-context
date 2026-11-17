@@ -23,14 +23,15 @@ export const DEGENERATE_RETRY_MAX_STREAK = 3
 
 /**
  * Whether the final assistant content of a completed turn is degenerate:
- * no tool call AND no non-empty text — the turn visibly did nothing.
- * Reasoning-only counts (thinking without an answer); a single character of
- * text does not (that is output, however weak — judging quality is not this
- * module's job).
+ * no tool call AND no non-empty text AND no attachment — the turn visibly
+ * did nothing. Reasoning-only counts (thinking without an answer); a single
+ * character of text does not (that is output, however weak — judging quality
+ * is not this module's job), and an image or file block is visible output.
  */
 export function isDegenerateAssistantContent(content: readonly ContentBlock[]): boolean {
   for (const block of content) {
     if (block.type === 'tool-call') return false
+    if (block.type === 'image' || block.type === 'file') return false
     if (block.type === 'text' && block.text.trim().length > 0) return false
   }
   return true

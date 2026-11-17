@@ -87,13 +87,17 @@ export function renderFoldAttachmentLines(
       const dims = typeof parsed.width === 'number' && typeof parsed.height === 'number'
         ? `, ${parsed.width}x${parsed.height}px`
         : ''
+      // name/mediaType come from the stored payload — user-controlled. Cap and
+      // flatten them: a newline would forge an extra attachment line, and an
+      // unbounded name would blow the one-line contract the section promises.
+      const name = typeof parsed.name === 'string' && parsed.name.length > 0
+        ? parsed.name.replace(/\s+/g, ' ').trim().slice(0, 120)
+        : ''
       const meta = [
-        typeof parsed.mediaType === 'string' ? parsed.mediaType : undefined,
+        typeof parsed.mediaType === 'string' ? parsed.mediaType.replace(/\s+/g, ' ').trim().slice(0, 80) : undefined,
         typeof parsed.bytes === 'number' ? `${parsed.bytes}B` : undefined,
       ].filter(Boolean).join(' ')
-      const label = typeof parsed.name === 'string' && parsed.name.length > 0
-        ? `${record.kind} "${parsed.name}"`
-        : record.kind
+      const label = name.length > 0 ? `${record.kind} "${name}"` : record.kind
       return `- [attachment ${i + 1}/${records.length}] ${label} (${meta}${dims})`
         + (digest.length > 0 ? ` — attachment sha256:${digest}` : '')
     } catch {

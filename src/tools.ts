@@ -118,10 +118,17 @@ export function expandTruncationNotice(input: {
   readonly totalPoints: number
   readonly offset: number
   readonly returnedPoints: number
+  /**
+   * Non-text payload riding the same response (attachment lines). Counts
+   * toward "the body exceeds one page" but NEVER toward the read position —
+   * mixing it into returnedPoints would advance readTo past text the model
+   * never received and misreport "last page".
+   */
+  readonly extraPoints?: number
 }): string | null {
   const readTo = input.offset + input.returnedPoints
   const truncated = readTo < input.totalPoints
-  if (!truncated && input.returnedPoints <= EXPAND_PAGE_CODE_POINTS) return null
+  if (!truncated && input.returnedPoints + (input.extraPoints ?? 0) <= EXPAND_PAGE_CODE_POINTS) return null
   if (truncated) {
     const next = JSON.stringify({ ref: input.ref, offset: readTo })
     return '[TRUNCATED READ — full text is ' + input.totalPoints + ' code points; this response returns '
@@ -275,9 +282,25 @@ export function apply(ctx: Context) {
   // is execution-level: the breaker THROWS, and an error-shaped tool result
   // is the only signal a degenerate loop responds to.
   let consecutiveZeroForgetDrops = 0
-  // Per-session memory_write counters (module-process lifetime): the cap and
-  // the status readout share one map, mirroring the forget breaker's shape.
+  // Per-session memory_write counters. The cap must survive DSH restarts — a
+  // process-memory map made the cap bypassable by restarting (the 0.9.8
+  // review's F5) — so the durable value lives in plugin_kv under
+  // `memory-write:<sessionId>`; the module map mirrors it as the in-process
+  // status readout.
   const memoryWriteCounts = new Map<string, number>()
+  const kvWriteCount = (capKey: string): number => {
+    const mirror = memoryWriteCounts.get(capKey)
+    if (mirror !== undefined) return mirror
+    const raw = ctx.memoryContext.kvGet('memory-write:' + capKey)
+    const value = raw === undefined ? 0 : Number.parseInt(raw, 10)
+    const count = Number.isFinite(value) && value > 0 ? value : 0
+    memoryWriteCounts.set(capKey, count)
+    return count
+  }
+  const bumpWriteCount = (capKey: string, count: number): void => {
+    memoryWriteCounts.set(capKey, count)
+    ctx.memoryContext.kvSet('memory-write:' + capKey, String(count))
+  }
 
   ctx.tools.register(defineTool({
     name: 'memory_write',
@@ -294,7 +317,7 @@ export function apply(ctx: Context) {
     async execute(args: { text: string; kind?: string; importance?: number }, exec: ToolRunContext) {
       const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
       const capKey = sessionId ?? '(global)'
-      const written = memoryWriteCounts.get(capKey) ?? 0
+      const written = kvWriteCount(capKey)
       if (written >= MEMORY_WRITE_SESSION_MAX) {
         return `STOP — do not call memory_write again this session. ${written} writes is the cap `
           + `(MEMORY_WRITE_SESSION_MAX); each write costs retrieval attention for the REST of this `
@@ -322,7 +345,7 @@ export function apply(ctx: Context) {
         kind,
         ...(sessionId === undefined ? {} : { sourceSessionId: sessionId }),
       })
-      memoryWriteCounts.set(capKey, written + 1)
+      bumpWriteCount(capKey, written + 1)
       return `Remembered (${requestedKind}, importance ${importance.toFixed(2)}, id ${doc.id}`
         + `${clipped.length < text.length ? `, clipped from ${text.length}` : ''}). `
         + `${written + 1}/${MEMORY_WRITE_SESSION_MAX} writes used this session.`
@@ -573,12 +596,18 @@ export function apply(ctx: Context) {
         const capped = totalMatches > windows.length
         const body = windows.join('\n\n')
         reportRestore(Array.from(body).length, capped)
+        // Attachment refs reach the model on the query path too: a caller who
+        // locates content via query would otherwise never learn the archived
+        // attachments exist (the 0.9.8 review's F11).
+        const queryAttachments = folded !== undefined
+          ? renderFoldAttachmentLines(ctx.memoryContext.getFoldAttachments(folded.ref))
+          : ''
         const notice = capped
           ? '[PARTIAL MATCHES — ' + totalMatches + ' occurrence(s) in the archive; showing the first '
             + windows.length + ' window(s). Call again with a higher limit (max ' + EXPAND_MAX_WINDOWS
             + ') or a narrower query.]'
           : ''
-        return (notice === '' ? '' : notice + '\n') + header + '\n' + windows.length + ' match window(s) for '
+        return (notice === '' ? '' : notice + '\n') + header + queryAttachments + '\n' + windows.length + ' match window(s) for '
           + label + (capped ? ' of ' + totalMatches + ' matches' : '') + ':\n\n' + body
       }
       const offset = Math.max(0, Math.floor(args.offset ?? 0))
@@ -587,17 +616,26 @@ export function apply(ctx: Context) {
       if (slice.length === 0) return header + '\nOffset ' + offset + ' is past the end of the archived text.'
       const readTo = offset + slice.length
       const truncated = readTo < points.length
-      const notice = expandTruncationNotice({ ref, totalPoints: points.length, offset, returnedPoints: slice.length })
-      reportRestore(slice.length, truncated)
-      // Archived non-text blocks ride the FIRST page only: their durable
-      // refs must reach the model once, not on every paged call.
+      // Archived non-text blocks ride the FIRST page only, directly under the
+      // header: the truncation banner exists because the harness cuts long
+      // tool results at the tail, so anything after the text slice would be
+      // exactly what gets cut (the 0.9.8 review's F6). The banner must also
+      // know the attachments consume page budget.
       const attachments = folded !== undefined && offset === 0
         ? renderFoldAttachmentLines(ctx.memoryContext.getFoldAttachments(folded.ref))
         : ''
+      const notice = expandTruncationNotice({
+        ref,
+        totalPoints: points.length,
+        offset,
+        returnedPoints: slice.length,
+        ...(attachments === '' ? {} : { extraPoints: Array.from(attachments).length }),
+      })
+      reportRestore(slice.length, truncated)
       const tail = truncated
         ? '\n\n[read up to code point ' + readTo + ' of ' + points.length + '; call again with offset ' + readTo + ']'
         : '\n\n[end of archived text]'
-      return (notice === null ? '' : notice + '\n') + header + '\n\n' + slice.join('') + attachments + tail
+      return (notice === null ? '' : notice + '\n') + header + attachments + '\n\n' + slice.join('') + tail
     },
     presentCall: args => ({ card: 'generic', title: 'Tool result expand', kind: 'other', rawInput: args }),
   }))

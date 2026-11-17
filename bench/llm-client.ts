@@ -83,9 +83,13 @@ export async function chatCompletion(options: ChatOptions): Promise<ChatResult> 
   try {
     return await postOnce(options)
   } catch (error: unknown) {
+    // Retry ONLY network/transport failures (fetch throws, no .status) and
+    // HTTP 429/5xx. A response we RECEIVED but disliked (empty content from a
+    // thinking model that spent its budget on reasoning, malformed JSON) is
+    // deterministic at the same settings — retrying doubles the latency for
+    // nothing and, on an aborting timeout, costs 2× timeoutMs per call.
     const status = (error as { status?: number }).status
-    const transient = status === undefined || isRetriable(status)
-    if (!transient) throw error
+    if (status === undefined || !isRetriable(status)) throw error
     await new Promise(resolve => setTimeout(resolve, RETRY_BACKOFF_MS))
     return postOnce(options)
   }
@@ -108,9 +112,18 @@ const JUDGE_PROMPT = [
 function parseVerdict(raw: string): JudgeVerdict {
   // Thinking models wrap reasoning in <think>…</think>; strip before the JSON scan.
   const text = raw.replace(/<think>[\s\S]*?<\/think>/g, '')
-  const match = text.match(/\{[\s\S]*\}/)
-  if (match === null) throw new Error('judge returned no JSON object')
-  const parsed = JSON.parse(match[0]) as { faithfulness?: unknown; coverage?: unknown; notes?: unknown }
+  // Scan from the LAST '{' backwards: the greedy /\{[\s\S]*\}/ span breaks as
+  // soon as any prose before the verdict contains a brace.
+  const starts: number[] = []
+  for (let i = text.length - 1; i >= 0; i--) if (text[i] === '{') starts.push(i)
+  let parsed: { faithfulness?: unknown; coverage?: unknown; notes?: unknown } | undefined
+  for (const start of starts) {
+    try {
+      parsed = JSON.parse(text.slice(start)) as typeof parsed
+      break
+    } catch { /* try an earlier opening brace */ }
+  }
+  if (parsed === undefined) throw new Error('judge returned no parseable JSON object')
   const clamp = (value: unknown): number => {
     const n = typeof value === 'number' ? value : Number.NaN
     return Number.isFinite(n) ? Math.min(5, Math.max(1, Math.round(n))) : 0

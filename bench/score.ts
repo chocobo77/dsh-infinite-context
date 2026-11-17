@@ -48,7 +48,11 @@ export function serializeRegionText(region: ImportedRegion): string {
 
 /** The completion-token ceiling for one region's summary (budget chars ≈ /4 tokens). */
 export function regionMaxTokens(region: ImportedRegion): number {
-  return Math.min(16_384, Math.max(2_048, Math.round(summaryCharBudget(region.tokens, SUMMARY_OUTPUT_SHARE) / 4)))
+  // Production cap: summarizationTargetTokens = min(floor(config.maxTokens × 0.7), share)
+  // with the shipped maxTokens: 10000 → 7000 completion tokens. Without this cap
+  // the bench grants the model up to 16k completion tokens — a budget no
+  // production fold ever gets, biasing bench summaries longer than real ones.
+  return Math.min(7_000, 16_384, Math.max(2_048, Math.round(summaryCharBudget(region.tokens, SUMMARY_OUTPUT_SHARE) / 4)))
 }
 
 const EVIDENCE_SHARE = 0.25

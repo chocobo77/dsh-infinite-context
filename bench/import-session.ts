@@ -111,7 +111,10 @@ export function importSession(zstdPath: string): ImportedMessage[] {
 /**
  * Chunk the conversation into contiguous scoring regions. A region closes at
  * `targetTokens`, or earlier when one more message would blow `maxTokens`;
- * trailing mass below `minTokens` is dropped.
+ * trailing mass below `minTokens` is dropped. A SINGLE message heavier than
+ * `maxTokens` (one huge tool result) is text-clipped to the ceiling first —
+ * otherwise it would become a region far past the ceiling, with a budget
+ * nothing like a production fold region.
  */
 export function chunkRegions(messages: readonly ImportedMessage[], options: RegionChunkOptions = {}): ImportedRegion[] {
   const o = { ...DEFAULT_CHUNK, ...options }
@@ -125,7 +128,26 @@ export function chunkRegions(messages: readonly ImportedMessage[], options: Regi
     current = []
     currentTokens = 0
   }
-  for (const message of messages) {
+  const clipToTokens = (message: ImportedMessage, maxTokens: number): ImportedMessage => {
+    // 4 chars per token, mirroring the heuristic meter's text accounting;
+    // only text blocks are clipped, non-text blocks pass through.
+    const budgetChars = maxTokens * 4
+    let spent = 0
+    const content = (message.content as { type?: string; text?: string }[]).map(block => {
+      if (block.type !== 'text' || typeof block.text !== 'string') return block
+      if (spent >= budgetChars) return { ...block, text: '' }
+      const room = budgetChars - spent
+      if (block.text.length <= room) {
+        spent += block.text.length
+        return block
+      }
+      spent += room
+      return { ...block, text: block.text.slice(0, room) + '\n…[clipped to region ceiling]' }
+    })
+    return { role: message.role, content, tokens: messageTokens(content) }
+  }
+  for (const raw of messages) {
+    const message = raw.tokens > o.maxTokens ? clipToTokens(raw, o.maxTokens) : raw
     if (currentTokens > 0 && currentTokens + message.tokens > o.maxTokens) close()
     current.push(message)
     currentTokens += message.tokens

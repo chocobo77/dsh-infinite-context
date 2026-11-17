@@ -1376,7 +1376,9 @@ export class HistoryCompressor {
     if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
     try {
       const original = serializeMessagesForSummary(messages)
-      const chars = original.length
+      // Code points, not UTF-16 units: memory_expand reports code points and
+      // the two headers must agree for astral text (the 0.9.8 review F18a).
+      const chars = Array.from(original).length
       const attachments = extractFoldAttachments(messages)
       const ref = this.ctx.memoryContext.archiveFoldedRange({
         messages: messages.length,
@@ -1770,6 +1772,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       this.lastRecallAtFold.delete(sessionId)
       this.speculative.delete(sessionId)
       this.speculativeStalls.delete(sessionId)
+      // Same per-session RAM lifecycle as the maps above — without these
+      // three, a long-lived process accumulates one stale entry per retired
+      // session (the 0.9.8 review's F13).
+      for (const key of this.implicitRecallCooldown.keys()) {
+        if (key.startsWith(sessionId + ':')) this.implicitRecallCooldown.delete(key)
+      }
+      this.sleepLastRun.delete(sessionId)
+      this.degenerateStreaks.delete(sessionId)
+      this.cancelIdleMaintenance(sessionId)
     }
     this.ctx.memoryContext.evictFlRecalls(stale)
     // Route-keyed overflow strikes age out on the counter retention clock.

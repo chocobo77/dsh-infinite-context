@@ -377,6 +377,10 @@ export class MemoryStore {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_text_norm ON memories (text_norm)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories (tier)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at)')
+    // supersededCheckpointTexts (idle consolidation) filters by
+    // source_session_id + kind; supersede chains keep every retired row, so
+    // `memories` grows unbounded and the per-idle-window scan needs this index.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_session_kind ON memories (source_session_id, kind, created_at)')
     // Generic key/value table for plugin state that must survive restarts
     // (e.g. the HistoryCompressor per-session turn counters). Kept separate
     // from the memories table so it never pollutes retrieval.
@@ -835,26 +839,37 @@ export class MemoryStore {
   }): string {
     this.assertOpen()
     const ref = input.ref ?? newFoldedRef()
-    this.db.prepare(
-      'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
-    ).run(
-      ref,
-      input.createdAt ?? Date.now(),
-      input.sessionId ?? null,
-      input.messages,
-      input.chars,
-      input.tokens,
-      input.summary,
-      input.original,
-      input.embedding === undefined ? null : vectorToBlob(input.embedding),
-    )
-    if (input.attachments !== undefined && input.attachments.length > 0) {
-      const insert = this.db.prepare(
-        'INSERT INTO fold_attachments (ref, msg_idx, block_idx, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(ref, msg_idx, block_idx) DO NOTHING',
+    // One transaction: a folded_ranges row with HALF its attachments (or
+    // none) is worse than no row — the surface header would promise a
+    // read-back the archive cannot honor, and nothing sweeps the partial
+    // state (the 0.9.8 review's F2).
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare(
+        'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
+      ).run(
+        ref,
+        input.createdAt ?? Date.now(),
+        input.sessionId ?? null,
+        input.messages,
+        input.chars,
+        input.tokens,
+        input.summary,
+        input.original,
+        input.embedding === undefined ? null : vectorToBlob(input.embedding),
       )
-      for (const attachment of input.attachments) {
-        insert.run(ref, attachment.msgIdx, attachment.blockIdx, attachment.kind, attachment.payload)
+      if (input.attachments !== undefined && input.attachments.length > 0) {
+        const insert = this.db.prepare(
+          'INSERT INTO fold_attachments (ref, msg_idx, block_idx, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(ref, msg_idx, block_idx) DO NOTHING',
+        )
+        for (const attachment of input.attachments) {
+          insert.run(ref, attachment.msgIdx, attachment.blockIdx, attachment.kind, attachment.payload)
+        }
       }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
     }
     return ref
   }
@@ -992,9 +1007,18 @@ export class MemoryStore {
     this.assertOpen()
     const doomed = this.db.prepare('SELECT ref FROM folded_ranges WHERE ts < ?').all(beforeTs) as unknown as { ref: string }[]
     if (doomed.length === 0) return 0
-    const info = this.db.prepare('DELETE FROM folded_ranges WHERE ts < ?').run(beforeTs)
-    this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
-    return Number(info.changes)
+    // One transaction: a crash between the folded delete and the attachment
+    // sweep would leave orphan attachment rows nothing ever cleans up.
+    this.db.exec('BEGIN')
+    try {
+      const info = this.db.prepare('DELETE FROM folded_ranges WHERE ts < ?').run(beforeTs)
+      this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
+      this.db.exec('COMMIT')
+      return Number(info.changes)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   /**
@@ -1004,15 +1028,25 @@ export class MemoryStore {
    */
   trimFoldedRanges(maxEntries: number): number {
     this.assertOpen()
+    // Same NaN discipline as trimToolResults: a bad LIMIT throws in node:sqlite,
+    // it does not silently delete zero rows.
+    const capped = Number.isFinite(maxEntries) ? Math.max(0, Math.round(maxEntries)) : 0
     const doomed = this.db.prepare(
       'SELECT ref FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
-    ).all(Math.max(0, maxEntries)) as unknown as { ref: string }[]
+    ).all(capped) as unknown as { ref: string }[]
     if (doomed.length === 0) return 0
-    const info = this.db.prepare(
-      'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
-    ).run(Math.max(0, maxEntries))
-    this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
-    return Number(info.changes)
+    this.db.exec('BEGIN')
+    try {
+      const info = this.db.prepare(
+        'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
+      ).run(capped)
+      this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
+      this.db.exec('COMMIT')
+      return Number(info.changes)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   private assertOpen(): void {
