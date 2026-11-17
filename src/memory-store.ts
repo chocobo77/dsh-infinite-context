@@ -355,6 +355,12 @@ export class MemoryStore {
     if (!columns.some(col => col.name === 'superseded_by')) {
       this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT')
     }
+    // Idle-consolidation consumption stamp: without it, consumed checkpoints
+    // re-qualify forever and every idle window re-emits a near-duplicate long
+    // memory (the lifecycle review's P2-6).
+    if (!columns.some(col => col.name === 'consolidated_at')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN consolidated_at INTEGER')
+    }
     // One-time migration (D): fold digests written before the 0.8.13 digest
     // fix lead with the base engine's checkpoint preamble instead of the
     // user's own instructions — they quote injected artifacts as if the user
@@ -912,22 +918,46 @@ export class MemoryStore {
   }
 
   /**
-   * Count and list the SUPERSEDED checkpoint texts of one session — the raw
-   * material of idle-time consolidation (each fold replaced the previous
-   * session digest; the replaced ones hold the session's own history).
+   * Count and list the SUPERSEDED checkpoint texts of one session that have
+   * NOT been consumed by an idle consolidation yet — the raw material of
+   * sleep-time merging (each fold replaced the previous session digest; the
+   * replaced ones hold the session's own history). Without the
+   * `consolidated_at` filter the same rows would re-qualify forever and the
+   * consolidation would emit a near-duplicate long memory every idle window
+   * (the lifecycle review's P2-6).
    * @param sessionId - owning session.
    * @param limit - how many newest superseded texts to return.
-   * @returns `{ count, texts }` — count is unbounded, texts capped at limit.
+   * @returns `{ count, ids, texts }` — count is unbounded, ids/texts capped at limit.
    */
-  supersededCheckpointTexts(sessionId: string, limit = 8): { count: number; texts: string[] } {
+  supersededCheckpointTexts(sessionId: string, limit = 8): { count: number; ids: string[]; texts: string[] } {
     this.assertOpen()
     const count = this.db.prepare(
-      'SELECT COUNT(*) AS n FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND source_session_id = ?',
+      'SELECT COUNT(*) AS n FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND consolidated_at IS NULL AND source_session_id = ?',
     ).get(sessionId) as unknown as { n: number }
     const rows = this.db.prepare(
-      'SELECT text FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND source_session_id = ? ORDER BY created_at DESC LIMIT ?',
-    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { text: string }[]
-    return { count: Number(count.n), texts: rows.map(row => row.text) }
+      'SELECT id, text FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND consolidated_at IS NULL AND source_session_id = ? ORDER BY created_at DESC LIMIT ?',
+    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { id: string; text: string }[]
+    return { count: Number(count.n), ids: rows.map(row => row.id), texts: rows.map(row => row.text) }
+  }
+
+  /** Stamp checkpoints as consumed by an idle consolidation. */
+  markCheckpointsConsolidated(ids: readonly string[]): void {
+    this.assertOpen()
+    const update = this.db.prepare('UPDATE memories SET consolidated_at = ? WHERE id = ?')
+    const now = Date.now()
+    for (const id of ids) update.run(now, id)
+  }
+
+  /**
+   * Back-fill the summary embedding of an already-archived folded range —
+   * the fold commit path stores the row first and lets the embedder run
+   * off the critical path.
+   * @param ref - the archive ref.
+   * @param embedding - the summary embedding vector.
+   */
+  patchFoldEmbedding(ref: string, embedding: readonly number[]): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE folded_ranges SET embedding = ? WHERE ref = ?').run(vectorToBlob(embedding), ref)
   }
 
   /** Delete the attachment rows of the given folded-range refs. */

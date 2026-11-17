@@ -1131,20 +1131,22 @@ export class HistoryCompressor {
    * In-memory only: the totals fold into the learning EMAs at the cycle's
    * commit (persisting per request would multiply write volume).
    */
-  noteCycleUsage(sessionId: string, inputTokens: number, cacheRead: number, cacheWrite: number): void {
+  noteCycleUsage(sessionId: string, inputTokens: number, cacheRead: number | undefined, cacheWrite: number): void {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) return
     // The FIRST request of a fresh cycle is the one that pays for the
     // opening fold's cache invalidation: capture its dip once, before the
     // request counter increments. Sessions that never folded have no break
-    // to measure (lastCompressedAt undefined).
+    // to measure (lastCompressedAt undefined), and an adapter that omits
+    // cache fields leaves the dip UNMEASURED — a fabricated 1.00 would read
+    // as a total cache miss (the lifecycle review's P2-3).
     if ((entry.cycleRequestsCount ?? 0) === 0 && entry.lastCompressedAt !== undefined
-      && Number.isFinite(cacheRead)) {
+      && cacheRead !== undefined && Number.isFinite(cacheRead)) {
       const total = cacheRead + (Number.isFinite(inputTokens) ? inputTokens : 0)
         + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
       if (total > 0) entry.cycleCacheDip = Math.min(1, Math.max(0, 1 - cacheRead / total))
     }
-    entry.cycleCacheRead = (entry.cycleCacheRead ?? 0) + (Number.isFinite(cacheRead) ? cacheRead : 0)
+    entry.cycleCacheRead = (entry.cycleCacheRead ?? 0) + (cacheRead !== undefined && Number.isFinite(cacheRead) ? cacheRead : 0)
     entry.cycleCacheInput = (entry.cycleCacheInput ?? 0) + (Number.isFinite(inputTokens) ? inputTokens : 0)
     entry.cycleCacheWrite = (entry.cycleCacheWrite ?? 0) + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
     entry.cycleRequestsCount = (entry.cycleRequestsCount ?? 0) + 1
@@ -1370,10 +1372,10 @@ export class HistoryCompressor {
     sessionId: string,
     messages: readonly Message[],
     summaryText: string,
-    embedding?: readonly number[] | undefined,
   ): string {
     const options = resolveFoldOptions(this.config)
     if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
+    let headerRef: string | null = null
     try {
       const original = serializeMessagesForSummary(messages)
       // Code points, not UTF-16 units: memory_expand reports code points and
@@ -1388,9 +1390,25 @@ export class HistoryCompressor {
         original,
         sessionId,
         ...(attachments.length > 0 ? { attachments } : {}),
-        ...(embedding === undefined ? {} : { embedding }),
       })
+      headerRef = ref
       this.enforceFoldRetention(options)
+      // The summary embedding is BACK-FILLED after the archive row exists:
+      // awaiting the embedder here sat on the fold commit path, and a
+      // TransformersEmbedder inits/downloads its ONNX model on first use —
+      // minutes of latency blocking the pending model call (the lifecycle
+      // review's P2-7). Fire-and-forget; a failed embed leaves the fold
+      // invisible to the implicit-recall scan, nothing more.
+      if (ref !== null && resolveImplicitRecall(this.config) && summaryText.length > 0) {
+        const embeddedText = summaryText.length > IMPLICIT_RECALL_EMBED_CHARS
+          ? summaryText.slice(0, IMPLICIT_RECALL_EMBED_CHARS)
+          : summaryText
+        void this.ctx.memoryContext.embedText(embeddedText)
+          .then(embedding => {
+            if (embedding !== undefined) this.ctx.memoryContext.patchFoldEmbedding(ref, embedding)
+          })
+          .catch(() => { /* the fold stays scan-invisible; nothing else is lost */ })
+      }
       return foldedRangeHeader(messages.length, chars, ref)
     } catch (err) {
       this.ctx.logger.warn(
@@ -1754,6 +1772,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private readonly sleepTimers = new Map<string, NodeJS.Timeout>()
   /** Last idle-consolidation run per session (rate limit). */
   private readonly sleepLastRun = new Map<string, number>()
+  /** Consolidations currently executing (prevents concurrent double-merge). */
+  private readonly sleepInFlight = new Set<string>()
   /** Consecutive degenerate turns per session (zero visible output; reset on any real output). */
   private readonly degenerateStreaks = new Map<string, number>()
   /**
@@ -2091,6 +2111,33 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     this.registerDegenerateRetry(ctx)
     this.registerUsage(ctx)
     this.registerCompactionEffort(ctx)
+    // Idle timers must NOT survive this engine: a raw setTimeout is invisible
+    // to cordis teardown (it only unwinds ctx.on listeners), so a reload/HMR
+    // left zombie timers firing the OLD engine 15 minutes later — racing the
+    // new instance and double-spending the consolidation (the lifecycle
+    // review's P1-1). The scope disposer is the sanctioned unwind; a disposed
+    // agent additionally cancels its own timer immediately.
+    ctx.effect(() => () => {
+      for (const timer of this.sleepTimers.values()) clearTimeout(timer)
+      this.sleepTimers.clear()
+    })
+    ctx.on('agent/disposed', ({ agent }: { agent: Agent }) => {
+      this.cancelIdleMaintenance(String(agent.session.id))
+    })
+    // A session CLEAR (or a fresh startup) restarts the turn numbering: the
+    // degenerate streak and the implicit-recall cooldown compare ABSOLUTE
+    // turn numbers, so stale-era stamps would silently block matches (and a
+    // wedged model would inherit a consumed streak). Start clean per era
+    // (the lifecycle review's P2-9).
+    ctx.on('agent/created', ({ agent, source }: { agent: Agent; source: string }) => {
+      if (source !== 'clear' && source !== 'startup') return
+      const sessionId = String(agent.session.id)
+      this.degenerateStreaks.delete(sessionId)
+      this.sleepLastRun.delete(sessionId)
+      for (const key of this.implicitRecallCooldown.keys()) {
+        if (key.startsWith(sessionId + ':')) this.implicitRecallCooldown.delete(key)
+      }
+    })
 
     // Mid-thinking context guard: wrap the agent's LLM stream and inject a
     // CONTEXT_WINDOW_EXCEEDED finish when input + output-so-far approaches the
@@ -4222,18 +4269,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             sessionId: String(agent.session.id),
           })
         }
+        // The summary embedding back-fills INSIDE archiveFoldedRange, off the
+        // commit path: awaiting the embedder here blocked the fold on a
+        // possibly-slow (Transformers ONNX) embedder — the lifecycle review's
+        // P2-7.
         const header = this.compressor.archiveFoldedRange(
           String(agent.session.id),
           shadowed,
           text,
-          // Summary embedding for the implicit-recall scan: the fold's own
-          // durable text is the matching side. Best-effort — undefined just
-          // means this fold is invisible to the scan.
-          resolveImplicitRecall(this.config) && text.length > 0
-            ? await this.ctx.memoryContext.embedText(
-              text.length > IMPLICIT_RECALL_EMBED_CHARS ? text.slice(0, IMPLICIT_RECALL_EMBED_CHARS) : text,
-            )
-            : undefined,
         )
         const prefix = [header.includes('fl_') ? header : '', digest]
           .filter(Boolean)
@@ -4349,7 +4392,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if ((this.implicitRecallCooldown.get(cooldownKey) ?? Number.NEGATIVE_INFINITY) + IMPLICIT_RECALL_COOLDOWN_TURNS > turn) continue
       const score = cosineSimilarity(query, embedding)
       if (score < GOV_IMPLICIT_RECALL_COS) continue
-      if (this.implicitRecallCooldown.size > IMPLICIT_RECALL_COOLDOWN_MAX) this.implicitRecallCooldown.clear()
+      // Watermark eviction, not a wholesale clear: Map iteration order is
+      // insertion order, and clear() would also wipe cooldowns stamped THIS
+      // turn — the same fold ref would re-match and re-count next turn (the
+      // lifecycle review's P2-4).
+      if (this.implicitRecallCooldown.size > IMPLICIT_RECALL_COOLDOWN_MAX) {
+        const evictCount = Math.floor(this.implicitRecallCooldown.size / 2)
+        let evicted = 0
+        for (const key of this.implicitRecallCooldown.keys()) {
+          this.implicitRecallCooldown.delete(key)
+          if (++evicted >= evictCount) break
+        }
+      }
       this.implicitRecallCooldown.set(cooldownKey, turn)
       this.ctx.memoryContext.noteFlRecall(sessionId)
       this.usage.record(USAGE_KIND.foldCheck, 1, {
@@ -4402,6 +4456,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // assistant/message belonging to this turn (a completed turn with no
       // assistant message at all is the empty-turn path — nothing to retry).
       let content: readonly { type: string; text?: string }[] | undefined
+      let outputTokens: number | undefined
       try {
         for (let i = agent.session.surface.nodes.length - 1; i >= 0; i--) {
           const seq = agent.session.surface.nodes[i]
@@ -4410,12 +4465,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           if (event?.type !== 'assistant/message') continue
           if (event.data.turn !== turn) break
           content = event.data.message?.content
+          outputTokens = event.data.usage?.outputTokens
           break
         }
       } catch {
         return // history read failure is not worth a retry decision
       }
       if (content === undefined || !isDegenerateAssistantContent(content as never)) return
+      // A MAX-TOKENS stop is structural, not degenerate: the model was capped
+      // mid-reasoning and a full-context re-send ends the same way — up to 3
+      // wasted requests per episode. Retry only turns the model CHOSE to end
+      // (output under the configured ceiling; no ceiling configured = no veto).
+      const tokenCeiling = agent.options.maxTokens
+      if (tokenCeiling !== undefined && outputTokens !== undefined && outputTokens >= tokenCeiling) return
       this.degenerateStreaks.set(sessionId, streak + 1)
       try {
         agent.inbox.append('next-step', degenerateRetryNudge())
@@ -4440,18 +4502,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    */
   private scheduleIdleMaintenance(sessionId: string, session: Session): void {
     if (!resolveSleepConsolidate(this.config).enabled) return
-    if (this.sleepTimers.has(sessionId)) return
+    if (this.sleepTimers.has(sessionId) || this.sleepInFlight.has(sessionId)) return
     const idleMs = resolveSleepConsolidate(this.config).idleMs
     const timer = setTimeout(() => {
       this.sleepTimers.delete(sessionId)
-      void this.runSleepMaintenance(sessionId, session).catch((error: unknown) => {
-        // Best-effort sweep, but never SILENT: the first version swallowed
-        // every failure here, which is how the no-route bug stayed invisible
-        // for a full production day.
-        const brief = error instanceof Error ? error.message.slice(0, 80) : String(error).slice(0, 80)
-        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: `sleep:failed=${brief}` })
-        this.ctx.logger.warn(`[ContextGovernor] Idle consolidation failed: ${brief}`)
-      })
+      // In-flight guard: sleepLastRun is only stamped on SUCCESS, so a slow
+      // local-model consolidation plus a second idle window (min 60s) would
+      // pass both the timer and rerun gates and run TWO merges concurrently
+      // (the lifecycle review's P2-5).
+      if (this.sleepInFlight.has(sessionId)) return
+      this.sleepInFlight.add(sessionId)
+      void this.runSleepMaintenance(sessionId, session)
+        .catch((error: unknown) => {
+          // Best-effort sweep, but never SILENT: the first version swallowed
+          // every failure here, which is how the no-route bug stayed invisible
+          // for a full production day.
+          const brief = error instanceof Error ? error.message.slice(0, 80) : String(error).slice(0, 80)
+          this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: `sleep:failed=${brief}` })
+          this.ctx.logger.warn(`[ContextGovernor] Idle consolidation failed: ${brief}`)
+        })
+        .finally(() => this.sleepInFlight.delete(sessionId))
     }, idleMs)
     timer.unref?.()
     this.sleepTimers.set(sessionId, timer)
@@ -4508,6 +4578,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       importance: 0.7,
       kind: 'project',
     })
+    // Consume the merged checkpoints: without the stamp they re-qualify
+    // forever and every idle window re-emits a near-duplicate long memory
+    // (the lifecycle review's P2-6).
+    this.ctx.memoryContext.markCheckpointsConsolidated(superseded.ids)
     this.sleepLastRun.set(sessionId, Date.now())
     this.usage.record(USAGE_KIND.foldCheck, 1, {
       sessionId,
@@ -4862,7 +4936,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // belong to a concurrent session on another model. A mid-session model
       // switch invalidates the provider prefix cache, so without the per-model
       // split that drop is indistinguishable from TTL expiry.
-      const attribution = usageAttribution(sessionId, session.requestContext())
+      // Guarded like routedTargetOf: a partial session object must skip the
+      // attribution, not the whole cycle bookkeeping after it (the lifecycle
+      // review's P2-8).
+      let attribution: { detail?: string }
+      try {
+        attribution = usageAttribution(sessionId, session.requestContext())
+      } catch {
+        attribution = {}
+      }
       this.usage.record(USAGE_KIND.llmRequests, 1, attribution)
       if (usage.inputTokens !== undefined) {
         this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, attribution)
@@ -4879,11 +4961,15 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Runway scheduler: accumulate this cycle's cache utility (the
       // cycle-cache-hit EMA is the "folds too frequent" signal — every fold
       // invalidates the KV prefix and these rows are what that costs).
+      // cacheReadTokens passes through RAW: an adapter that omits cache
+      // fields must leave the dip unmeasured (`undefined`), not fabricate a
+      // total-miss dip=1.00 — noteCycleUsage's own finite-check is the gate
+      // (the lifecycle review's P2-3).
       try {
         this.compressor.noteCycleUsage(
           sessionId,
           usage.inputTokens ?? 0,
-          usage.cacheReadTokens ?? 0,
+          usage.cacheReadTokens,
           usage.cacheWriteTokens ?? 0,
         )
       } catch {

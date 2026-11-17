@@ -598,9 +598,31 @@ export class MemoryContext extends Service {
    * @param sessionId - owning session.
    * @param limit - how many newest superseded texts to return.
    */
-  supersededCheckpointTexts(sessionId: string, limit?: number): { count: number; texts: string[] } {
+  supersededCheckpointTexts(sessionId: string, limit?: number): { count: number; ids: string[]; texts: string[] } {
     this.requireEngine()
-    return this.store?.supersededCheckpointTexts(sessionId, limit) ?? { count: 0, texts: [] }
+    return this.store?.supersededCheckpointTexts(sessionId, limit) ?? { count: 0, ids: [], texts: [] }
+  }
+
+  /**
+   * Stamp checkpoints as consumed by an idle consolidation, so they never
+   * re-qualify as consolidation input.
+   * @param ids - the checkpoint ids merged into the long memory.
+   */
+  markCheckpointsConsolidated(ids: readonly string[]): void {
+    this.requireEngine()
+    this.store?.markCheckpointsConsolidated(ids)
+  }
+
+  /**
+   * Back-fill one folded range's summary embedding AFTER the archive row
+   * exists — the fold commit path must not wait on a possibly-slow embedder
+   * (TransformersEmbedder inits/downloads its ONNX model on first use).
+   * @param ref - the archive ref.
+   * @param embedding - the summary embedding vector.
+   */
+  patchFoldEmbedding(ref: string, embedding: readonly number[]): void {
+    this.requireEngine()
+    this.store?.patchFoldEmbedding(ref, embedding)
   }
 
   /**
