@@ -4433,7 +4433,14 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     const idleMs = resolveSleepConsolidate(this.config).idleMs
     const timer = setTimeout(() => {
       this.sleepTimers.delete(sessionId)
-      void this.runSleepMaintenance(sessionId, session).catch(() => { /* best-effort sweep */ })
+      void this.runSleepMaintenance(sessionId, session).catch((error: unknown) => {
+        // Best-effort sweep, but never SILENT: the first version swallowed
+        // every failure here, which is how the no-route bug stayed invisible
+        // for a full production day.
+        const brief = error instanceof Error ? error.message.slice(0, 80) : String(error).slice(0, 80)
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: `sleep:failed=${brief}` })
+        this.ctx.logger.warn(`[ContextGovernor] Idle consolidation failed: ${brief}`)
+      })
     }, idleMs)
     timer.unref?.()
     this.sleepTimers.set(sessionId, timer)
@@ -4456,8 +4463,8 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   private async runSleepMaintenance(
     sessionId: string,
     session: Session,
-    summarize: (texts: readonly string[]) => Promise<string> = async texts =>
-      summarizeMemoriesWithLlm(this.ctx, this.config, texts, 'sleep consolidation'),
+    summarize: (texts: readonly string[], target: SummarizationTarget) => Promise<string> = async (texts, target) =>
+      summarizeMemoriesWithLlm(this.ctx, this.config, texts, 'sleep consolidation', target),
   ): Promise<void> {
     // The execution point re-checks the gate: the schedule side arms only
     // enabled sessions, but this method must stand on its own (defense in
@@ -4468,7 +4475,19 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (Date.now() - lastRun < GOV_SLEEP_RERUN_MS) return
     const superseded = this.ctx.memoryContext.supersededCheckpointTexts(sessionId, GOV_SLEEP_CONSOLIDATE_INPUTS)
     if (superseded.count < GOV_SLEEP_CONSOLIDATE_MIN) return
-    const merged = await summarize(superseded.texts)
+    // The consolidation LLM call MUST ride the session's own route: the
+    // fold path always passes one, but the first version of this call left
+    // the target unset — with no explicit config route the summarizer
+    // resolution threw, the schedule-side catch swallowed it, and idle
+    // consolidation silently never ran (zero ledger rows despite 10
+    // eligible superseded checkpoints — found by ledger diagnosis
+    // 2026-11-17).
+    const target = routedTargetOf(session)
+    if (target === undefined) {
+      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'sleep:skipped=no-route' })
+      return
+    }
+    const merged = await summarize(superseded.texts, target)
     if (merged.trim().length === 0) return
     // kind 'project': the fold's supersedePrior('checkpoint') must NOT retire
     // the consolidation — it is the session's long-term conclusion, not the
