@@ -1253,7 +1253,6 @@ export class HistoryCompressor {
     entry.cycleHadFailure = false
     entry.cycleCacheDip = undefined
     entry.cacheMeasured = undefined
-    entry.cacheMeasured = undefined
     this.persistCounter(sessionId)
     return {
       ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
@@ -2132,7 +2131,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     ctx.effect(() => () => {
       for (const timer of this.sleepTimers.values()) clearTimeout(timer)
       this.sleepTimers.clear()
-    })
+    }, 'clear idle-maintenance timers on teardown')
     ctx.on('agent/disposed', ({ agent }: { agent: Agent }) => {
       this.cancelIdleMaintenance(String(agent.session.id))
     })

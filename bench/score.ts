@@ -22,7 +22,7 @@ import {
   fitEvidenceOptions,
   renderEvidenceSection,
 } from '../src/fold-evidence.ts'
-import { extractiveSummary } from '../src/extractive-summary.ts'
+import { extractiveSummary, stripExtractiveHeader } from '../src/extractive-summary.ts'
 import type { ImportedMessage, ImportedRegion } from './import-session.ts'
 
 /** Flatten one imported message to its text, the way the meter does. */
@@ -72,7 +72,10 @@ export interface CommittedSummary {
  */
 export function commitSummaryLayer(region: ImportedRegion, rawText: string): CommittedSummary {
   const maxChars = summaryCharBudget(region.tokens, SUMMARY_OUTPUT_SHARE)
-  let summary = rawText.trim()
+  // postSummarize strips the degradation header from the durable text — the
+  // bench commit layer must too, or extractive baselines carry a header line
+  // production folds never land.
+  let summary = stripExtractiveHeader(rawText.trim())
   const clip = (value: string, budget: number): string =>
     value.length > budget ? value.slice(0, Math.max(0, budget - 14)) + '\n…[truncated]' : value
   summary = clip(summary, maxChars)
