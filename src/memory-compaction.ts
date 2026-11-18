@@ -723,6 +723,16 @@ const GOV_SLEEP_RERUN_MS = 6 * 3600_000
 // a single degenerate turn is a fluke the nudge fixes; a streak means the model
 // is wedged and a fourth retry would burn tokens on the same collapse.
 
+/**
+ * Max LLM merge rounds over the mechanical segment notes: a region segmented
+ * into dozens of pieces leaves a notes pile too long to feed back as one
+ * request — each round groups them under the merge input budget and merges
+ * every group into one higher-level note until the notes fit a single
+ * request. A safety bound, not an operating point: three rounds shrink any
+ * realistic note pile by orders of magnitude.
+ */
+const EMERGENCY_MERGE_ROUNDS_MAX = 3
+
 export class HistoryCompressor {
   // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
   // process restarts — without persistence a DSH restart reset the counters to
@@ -2734,11 +2744,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // Pacing: the learned cycle time owns the floor once a cycle has closed
     // (half the observed cadence, same envelope); the latency-based prior
     // covers the cold start.
+    // EMERGENCY: the surface has reached the FULL budget — the next agent
+    // request is structurally dead whatever the trigger says, so every
+    // pacing/importance/minimum-size gate below yields to getting a fold
+    // done (segmented summarization absorbs any range size; the merge
+    // rounds keep the summary completable at this scale).
+    const emergency = snapshot.surfaceTokens >= this.compressor.tokenBudget()
     const learnedInterval = this.foldLearningEnabled
       ? learnedMinIntervalMs(this.compressor.cycleLearningOf(sessionId))
       : undefined
     const minIntervalMs = learnedInterval ?? foldIntervalFor(learnedLatency)
-    if (!force && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
+    // EMERGENCY bypass: at 100% of the budget the NEXT agent request is
+    // structurally dead — pacing a fold that is the only way to keep the
+    // session alive is how a session dies twice (the min-interval gate held
+    // one production session at 137-145k tokens over a 126k trigger for
+    // three consecutive checks before anything folded).
+    if (!force && !emergency && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
       const last = this.compressor.lastFoldAt(sessionId)
       if (last !== undefined && Date.now() - last < minIntervalMs) {
         diag(`min-interval:${Math.round((Date.now() - last) / 1000)}/${Math.round(minIntervalMs / 1000)}s;`
@@ -2843,7 +2864,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // subject to the thin-fold gate — the net-saving bar is the churn
       // protection for pressure folds, and `escalated` (not `pressured`)
       // is what bypasses it below.
-      if (pressured) {
+      if (pressured || emergency) {
         let plainTokens = 0
         if (range !== null) {
           for (const node of meter.nodes) {
@@ -2858,12 +2879,26 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
             escalated = true
           }
         }
+        // EMERGENCY escalation: drop the importance boundary and the minimum
+        // fold size entirely — at 100% of the budget there is no "preserve
+        // the interesting middle" left to protect, and a fold that refuses
+        // to select a range IS the overflow the user sees. Tool-pair balance
+        // and the pinned head stay enforced by the selector itself.
+        if (range === null && emergency) {
+          const forcedRange = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), undefined)
+          if (forcedRange !== null) {
+            range = forcedRange
+            escalated = true
+            diag(`emergency-range;keep=0;surf=${snapshot.surfaceTokens}`)
+          }
+        }
       }
     }
     if (range === null) {
       diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
         + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
-        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`
+        + (emergency ? ';emergency' : ''))
       return null
     }
     // A fold that is smaller than the summarizer's own output cannot net a
@@ -2876,7 +2911,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     }
     // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
     // node); treat it as unknown and let compaction-basic's own size check decide.
-    if (!force && foldTokens > 0 && foldTokens < minFoldTokens) {
+    if (!force && !emergency && foldTokens > 0 && foldTokens < minFoldTokens) {
       diag(`small-fold:${foldTokens}<${minFoldTokens};escalated=${escalated};surf=${snapshot.surfaceTokens};`
         + `target=${plan.targetSurfaceTokens};`
         + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
@@ -2890,7 +2925,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // Force, surge, the fit-guard and ESCALATED folds bypass it: their
     // occasion is not optional (a thin emergency fold still beats an
     // overflow), while a NATURALLY-large pressure fold stays gated.
-    if (!force && !escalated && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
+    if (!force && !escalated && !emergency && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
       && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget,
         thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
       diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
@@ -3813,7 +3848,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           try {
             this.usage.record(USAGE_KIND.foldCheck, 1, {
               sessionId: String(agent.session.id),
-              detail: `chunked:n=${segments.length};attempts=${chunked.attempts};`
+              detail: `chunked:n=${segments.length};attempts=${chunked.attempts};rounds=${chunked.mergeRounds};`
                 + `degraded=${chunked.degraded ? 1 : 0};seg~${chunkTokens}`,
             })
             if (chunked.degraded) {
@@ -3979,11 +4014,12 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     segments: Message[][],
     agent: Agent,
     signal: AbortSignal | undefined,
-  ): Promise<{ result: SummaryResult; degraded: boolean; attempts: number }> {
+  ): Promise<{ result: SummaryResult; degraded: boolean; attempts: number; mergeRounds: number }> {
     const system = input.messages[0]?.role === 'system' ? input.messages[0] : undefined
-    const notes: string[] = []
+    let notes: string[] = []
     let degraded = false
     let attempts = 0
+    let mergeRounds = 0
     for (const segment of segments) {
       if (signal?.aborted === true) throw new Error('summarization aborted before a fold segment')
       const segInput: SummarizationInput = {
@@ -4034,6 +4070,59 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .map(block => block.text)
         .join('\n'))
     }
+    // EMERGENCY MERGE ROUNDS: a region large enough to segment into dozens of
+    // pieces (the 100%-full rescue case) leaves a notes pile that would be
+    // mechanically concatenated into a manifest nobody reads. Group the notes
+    // under the merge input budget and merge every GROUP into one higher-level
+    // note via the session's own route; iterate until the notes fit a single
+    // request (or the round cap — a safety bound, not an operating point).
+    // A failed group keeps its raw notes: degradation, never loss.
+    const mergeInputBudget = Math.max(2_000, Math.floor((this.config.maxTokens ?? 4096) * 0.7 * 0.8))
+    while (notes.length > 1 && mergeRounds < EMERGENCY_MERGE_ROUNDS_MAX
+      && notes.reduce((sum, note) => sum + estimateTokens(note), 0) > mergeInputBudget) {
+      const groups: string[][] = []
+      let group: string[] = []
+      let groupTokens = 0
+      for (const note of notes) {
+        const noteTokens = estimateTokens(note)
+        if (groupTokens > 0 && groupTokens + noteTokens > mergeInputBudget) {
+          groups.push(group)
+          group = []
+          groupTokens = 0
+        }
+        group.push(note)
+        groupTokens += noteTokens
+      }
+      if (group.length > 0) groups.push(group)
+      // Every note alone exceeding the budget cannot shrink — a further round
+      // would loop on the same pile.
+      if (groups.length === notes.length) break
+      const mergeTarget = resolveSummarizationTarget(this.config, agent.session)
+      if (mergeTarget === undefined) break
+      const nextNotes: string[] = []
+      let roundDegraded = false
+      for (const mergeGroup of groups) {
+        if (mergeGroup.length === 1 && estimateTokens(mergeGroup[0]!) <= mergeInputBudget * 0.5) {
+          nextNotes.push(mergeGroup[0]!)
+          continue
+        }
+        try {
+          nextNotes.push(await summarizeMemoriesWithLlm(
+            this.ctx, this.config, mergeGroup,
+            'Merge these partial fold summaries into ONE checkpoint that keeps every still-relevant fact',
+            mergeTarget, signal,
+          ))
+          attempts += 1
+        } catch {
+          // The group's raw notes survive a failed merge — degradation, not loss.
+          nextNotes.push(...mergeGroup)
+          roundDegraded = true
+        }
+      }
+      notes = nextNotes
+      if (roundDegraded) degraded = true
+      mergeRounds += 1
+    }
     // The budget basis MUST match the downstream global cap in summarize()
     // (shadowedTokens × SUMMARY_OUTPUT_SHARE), or the section-budget reflow
     // would reflow against one number and get blind-clipped to another.
@@ -4052,6 +4141,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       result: { summary: [{ type: 'text', text: merged }], provider: 'chunked', model: 'chunked' },
       degraded,
       attempts,
+      mergeRounds,
     }
   }
 
