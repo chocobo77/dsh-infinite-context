@@ -123,7 +123,7 @@ import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
 import type { FoldAttachmentInsert } from './memory-store.ts'
 import { DEGENERATE_RETRY_MAX_STREAK, degenerateRetryNudge, isDegenerateAssistantContent } from './degenerate-turn.ts'
 import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
-import { estimateContentTokens, estimateTokens } from './token-budget.ts'
+import { clipToTokens, estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import { redactCredentials } from './redact.ts'
 import {
@@ -408,6 +408,25 @@ async function summarizeMemoriesWithLlm(
     )
   }
   const { provider, model } = resolved
+  // INPUT BUDGET: the merge must be physically completable inside the output
+  // cap. targetTokens = min(floor(config.maxTokens × 0.7), 0.3 × input) — so
+  // once the raw input exceeds (0.7 × maxTokens) ÷ 0.3 tokens, the 30% share
+  // is pinned at the cap and the model CANNOT finish: production 2026-11-18
+  // produced three consecutive `sleep:failed=…token cap` rows merging eight
+  // large checkpoints (~120k CJK tokens of input against a 7000-token cap).
+  // Clip each text to its proportional share of the affordable input, then
+  // re-meter. The clipped-away detail stays in the original checkpoint rows —
+  // the merge narrows its scope, it does not delete anything.
+  const outputCap = Math.floor((config.maxTokens ?? 4096) * 0.7)
+  const inputBudgetTokens = Math.max(1024, Math.floor(outputCap / SUMMARY_OUTPUT_SHARE))
+  const rawTokens = texts.reduce((sum, text) => sum + estimateTokens(text), 0)
+  if (rawTokens > inputBudgetTokens) {
+    const scale = inputBudgetTokens / rawTokens
+    texts = texts.map(text => {
+      const share = Math.floor(estimateTokens(text) * scale)
+      return share < 64 ? '' : clipToTokens(text, share)
+    }).filter(text => text.length > 0)
+  }
   const textsJoined = texts.join('\n')
   const inputTokens = estimateTokens(textsJoined)
   const targetTokens = summarizationTargetTokens(config, inputTokens)
