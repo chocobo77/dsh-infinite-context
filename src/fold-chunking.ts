@@ -85,6 +85,27 @@ export function splitRegionIntoSegments<T extends ChunkableMessage>(
   let current: T[] = []
   let currentTokens = 0
   for (const group of groups) {
+    // A single GROUP over the cap (a monster tool result that was never
+    // stubbed — e.g. results produced while the plugin was not running —
+    // plus its call) used to become ONE segment unchanged, and the merge
+    // request for that segment exceeded the model window outright: the
+    // 262k-token 400 of session 8bba3079. Degrade to MESSAGE-level packing
+    // for such a group — the call/result pairing may split across segments
+    // (each segment is a standalone summarization prompt, not a protocol
+    // replay), and the caller clips oversize segments against the window.
+    if (group.tokens > maxTokensPerSegment) {
+      for (const message of group.msgs) {
+        const tk = Math.max(0, estimate(message))
+        if (current.length > 0 && currentTokens + tk > maxTokensPerSegment) {
+          segments.push(current)
+          current = []
+          currentTokens = 0
+        }
+        current.push(message)
+        currentTokens += tk
+      }
+      continue
+    }
     if (current.length > 0 && currentTokens + group.tokens > maxTokensPerSegment) {
       segments.push(current)
       current = []

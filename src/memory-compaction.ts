@@ -4020,7 +4020,33 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     let degraded = false
     let attempts = 0
     let mergeRounds = 0
-    for (const segment of segments) {
+    // SEGMENT WINDOW CLIP: message-level packing can still leave one segment
+    // over the model window (a single monster message no bucket can split).
+    // The segment request is a STANDALONE call — its window is the model's
+    // own, not the session's — so the text blocks are clipped to 80% of the
+    // adopted window; the clipped tail stays recoverable through the fold
+    // archive of the ORIGINAL messages (its own serialize is 16k/message).
+    const segmentWindowBudget = Math.max(2_000, Math.floor(this.ctx.memoryContext.contextWindow * 0.8))
+    const clippedSegments = segments.map(segment => {
+      const tokens = estimateTokens(segment.map(message => messageText(message)).join('\n'))
+      if (tokens <= segmentWindowBudget) return segment
+      let used = 0
+      return segment.map(message => {
+        if (!Array.isArray(message.content)) return message
+        const content = message.content.map(block => {
+          if (block.type !== 'text' || typeof block.text !== 'string') return block
+          const room = segmentWindowBudget - used
+          if (room <= 0) return { type: 'text' as const, text: '' }
+          // clipToTokens binary-searches against the REAL meter — the same
+          // CJK-aware accounting the budget itself was derived with.
+          const clipped = clipToTokens(block.text, room)
+          used += estimateTokens(clipped)
+          return { type: 'text' as const, text: clipped }
+        })
+        return { ...message, content }
+      })
+    })
+    for (const segment of clippedSegments) {
       if (signal?.aborted === true) throw new Error('summarization aborted before a fold segment')
       const segInput: SummarizationInput = {
         // Carry the envelope EVERY segment replays: the conversation's own
