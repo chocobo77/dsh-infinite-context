@@ -15,6 +15,12 @@ DeepSeek Harness 的上下文治理插件：长会话不爆窗、不丢事，折
 | 折叠节奏 | 16 分钟到 3.4 小时自适应，由插件自己学出来 |
 | 运行时依赖 | 零第三方包（SQLite、zstd 用 Node 内建） |
 
+直接装：
+
+```sh
+dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-context/releases/latest/download/dsh-infinite-context.tgz
+```
+
 ## English
 
 [跳到英文说明](#english)
@@ -31,6 +37,15 @@ DeepSeek Harness 的上下文治理插件：长会话不爆窗、不丢事，折
 2. **压缩即失忆** —— 常见的压缩把旧对话直接丢掉：做过什么决定、试过什么方案、有什么约束，全都没了。
 
 本插件的原则是**压缩不等于删除**：旧对话折叠成结构化摘要，原文完整存档、随时取回；"当前任务进行到哪了"由插件主动放到模型眼前，不指望它自己想起来查。
+
+### 和普通方案差在哪
+
+| 方案 | 长会话会发生什么 |
+|---|---|
+| 什么都不装 | 窗口满了报错；手动开新会话，上下文从零开始 |
+| 普通压缩 | 旧对话被摘要替换、原文丢弃——决定、约束、踩过的坑全部蒸发，模型在幻觉里继续干活 |
+| 纯 RAG 检索 | 靠"相似度"想起旧事：五十轮前的待办和当前问题不相似，生产实测模型自发检索 **0 次** |
+| **本插件** | 折叠 + 原文存档 + 每轮任务提醒 + 机械保真核对（锚点缺失 1.1% vs 无核对 71.2%），节奏、幅度、等待全部自学习 |
 
 ### 六个机制
 
@@ -146,6 +161,15 @@ Long-running sessions with an AI assistant hit two walls:
 2. **Compaction means amnesia** — naive compaction throws old context away: decisions made, approaches tried, constraints stated — all gone.
 
 This plugin's principle: **compaction is not deletion**. Old turns fold into a structured summary while the original text is archived and retrievable on demand; and the current task state is placed in front of the model every turn instead of relying on it to remember.
+
+### How it compares
+
+| Approach | What happens to a long session |
+|---|---|
+| Nothing installed | The window fills up and requests fail; starting a new session restarts from zero |
+| Naive compaction | Old turns are replaced by a summary and discarded — decisions, constraints, pitfalls evaporate while the model keeps working on guesses |
+| Pure RAG retrieval | Recall depends on similarity: a fifty-turn-old pending job is rarely similar to the current question — production measured **0** spontaneous retrievals |
+| **This plugin** | Folds + archived originals + per-turn task reminders + mechanical fidelity audit (1.1% vs 71.2% anchor loss), with rhythm, amplitude and waits learned from use |
 
 ### Measured, not claimed
 
