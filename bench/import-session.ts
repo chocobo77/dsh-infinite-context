@@ -14,7 +14,7 @@
 import { zstdDecompressSync } from 'node:zlib'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { estimateContentTokens } from '../src/token-budget.ts'
+import { estimateContentTokens, estimateTokens, clipToTokens } from '../src/token-budget.ts'
 
 /** One conversation message reconstructed from the session log. */
 export interface ImportedMessage {
@@ -128,26 +128,34 @@ export function chunkRegions(messages: readonly ImportedMessage[], options: Regi
     current = []
     currentTokens = 0
   }
-  const clipToTokens = (message: ImportedMessage, maxTokens: number): ImportedMessage => {
-    // 4 chars per token, mirroring the heuristic meter's text accounting;
-    // only text blocks are clipped, non-text blocks pass through.
-    const budgetChars = maxTokens * 4
+  const clipMessageToCeiling = (message: ImportedMessage, maxTokens: number): ImportedMessage => {
+    // Clip against the REAL meter, not a chars/token guess: the meter scores
+    // CJK at 1 token per char, so a ×4-chars guess is a no-op exactly for the
+    // language these sessions are written in (follow-up review F3). Binary
+    // search the code-point cut per text block, same shape as token-budget's
+    // clipToTokens; non-text blocks pass through.
     let spent = 0
     const content = (message.content as { type?: string; text?: string }[]).map(block => {
       if (block.type !== 'text' || typeof block.text !== 'string') return block
-      if (spent >= budgetChars) return { ...block, text: '' }
-      const room = budgetChars - spent
-      if (block.text.length <= room) {
-        spent += block.text.length
-        return block
+      if (spent >= maxTokens) return { ...block, text: '' }
+      const room = maxTokens - spent
+      const points = Array.from(block.text)
+      let lo = 0
+      let hi = points.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        const cost = estimateTokens(points.slice(0, mid).join(''))
+        if (cost + 1 <= room) lo = mid
+        else hi = mid - 1
       }
-      spent += room
-      return { ...block, text: block.text.slice(0, room) + '\n…[clipped to region ceiling]' }
+      const clipped = lo === 0 ? '' : points.slice(0, lo).join('') + '\n…[clipped to region ceiling]'
+      spent += estimateTokens(clipped)
+      return { ...block, text: clipped }
     })
     return { role: message.role, content, tokens: messageTokens(content) }
   }
   for (const raw of messages) {
-    const message = raw.tokens > o.maxTokens ? clipToTokens(raw, o.maxTokens) : raw
+    const message = raw.tokens > o.maxTokens ? clipMessageToCeiling(raw, o.maxTokens) : raw
     if (currentTokens > 0 && currentTokens + message.tokens > o.maxTokens) close()
     current.push(message)
     currentTokens += message.tokens

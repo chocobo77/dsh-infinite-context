@@ -42,30 +42,52 @@ function isRetriable(status: number): boolean {
 }
 
 async function postOnce(options: ChatOptions): Promise<{ text: string; usage?: { input?: number; output?: number } }> {
-  const response = await fetch(chatUrl(options.endpoint), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: options.model,
-      messages: options.messages,
-      max_tokens: options.maxTokens ?? 4096,
-      temperature: options.temperature ?? 0.2,
-      stream: false,
-    }),
-    signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-  })
+  let response: Response
+  try {
+    response = await fetch(chatUrl(options.endpoint), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: options.model,
+        messages: options.messages,
+        max_tokens: options.maxTokens ?? 4096,
+        temperature: options.temperature ?? 0.2,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    })
+  } catch (error: unknown) {
+    // A timeout abort is deliberate pacing, not a blip — do not re-queue a
+    // second full timeout on top of it. Any other fetch throw (DNS, refused,
+    // reset) is a genuine transport failure and IS retried.
+    const name = (error as { name?: string }).name
+    if (name === 'AbortError' || name === 'TimeoutError') {
+      throw Object.assign(new Error('chat timed out'), { transport: false })
+    }
+    throw Object.assign(new Error(`network failure: ${error instanceof Error ? error.message : String(error)}`), {
+      transport: true,
+    })
+  }
   if (!response.ok) {
     const body = await response.text().catch(() => '')
     throw Object.assign(new Error(`chat failed: HTTP ${response.status} ${body.slice(0, 200)}`), {
       status: response.status,
+      transport: false,
     })
   }
-  const payload = await response.json() as {
+  const payload = await response.json().catch(error => {
+    throw Object.assign(new Error(`chat returned malformed JSON: ${error instanceof Error ? error.message : String(error)}`), {
+      transport: false,
+    })
+  }) as {
     choices?: { message?: { content?: string } }[]
     usage?: { prompt_tokens?: number; completion_tokens?: number }
   }
   const text = payload.choices?.[0]?.message?.content ?? ''
-  if (text.length === 0) throw new Error('chat returned no content')
+  if (text.length === 0) {
+    // Received-and-unusable: deterministic at the same settings, never retried.
+    throw Object.assign(new Error('chat returned no content'), { transport: false })
+  }
   const usage = payload.usage === undefined
     ? undefined
     : {
@@ -78,18 +100,18 @@ async function postOnce(options: ChatOptions): Promise<{ text: string; usage?: {
   }
 }
 
-/** One completion with a single retry on transient failures. */
+/** One completion with a single retry on transport failures and HTTP 429/5xx. */
 export async function chatCompletion(options: ChatOptions): Promise<ChatResult> {
   try {
     return await postOnce(options)
   } catch (error: unknown) {
-    // Retry ONLY network/transport failures (fetch throws, no .status) and
-    // HTTP 429/5xx. A response we RECEIVED but disliked (empty content from a
-    // thinking model that spent its budget on reasoning, malformed JSON) is
+    // Retry a genuine transport failure (fetch threw) or an HTTP-level 429/5xx.
+    // A response we RECEIVED but disliked (empty content, malformed JSON) is
     // deterministic at the same settings — retrying doubles the latency for
-    // nothing and, on an aborting timeout, costs 2× timeoutMs per call.
-    const status = (error as { status?: number }).status
-    if (status === undefined || !isRetriable(status)) throw error
+    // nothing, and a timeout abort would cost 2× timeoutMs per call.
+    const err = error as { transport?: boolean; status?: number }
+    const retriable = err.transport === true || (err.status !== undefined && isRetriable(err.status))
+    if (!retriable) throw error
     await new Promise(resolve => setTimeout(resolve, RETRY_BACKOFF_MS))
     return postOnce(options)
   }
@@ -117,9 +139,12 @@ function parseVerdict(raw: string): JudgeVerdict {
   const starts: number[] = []
   for (let i = text.length - 1; i >= 0; i--) if (text[i] === '{') starts.push(i)
   let parsed: { faithfulness?: unknown; coverage?: unknown; notes?: unknown } | undefined
+  // Also tolerate prose AFTER the verdict: cut at the last closing brace.
+  const end = text.lastIndexOf('}')
   for (const start of starts) {
+    if (end <= start) break
     try {
-      parsed = JSON.parse(text.slice(start)) as typeof parsed
+      parsed = JSON.parse(text.slice(start, end + 1)) as typeof parsed
       break
     } catch { /* try an earlier opening brace */ }
   }

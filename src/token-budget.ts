@@ -22,7 +22,7 @@ import type { BudgetConfig, Tier } from './types.ts'
  * The longest CODE-POINT prefix of `line` whose estimated cost (plus its
  * newline) fits `budget` tokens; `''` when not even one character fits.
  */
-function clipToTokens(line: string, budget: number): string {
+export function clipToTokens(line: string, budget: number): string {
   if (budget <= 1) return ''
   const points = Array.from(line)
   let lo = 0

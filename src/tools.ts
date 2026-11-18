@@ -299,7 +299,12 @@ export function apply(ctx: Context) {
   }
   const bumpWriteCount = (capKey: string, count: number): void => {
     memoryWriteCounts.set(capKey, count)
-    ctx.memoryContext.kvSet('memory-write:' + capKey, String(count))
+    // The write already landed; a KV hiccup must not turn success into a
+    // tool error — the mirror advances and the KV catches up next write
+    // (follow-up review F6).
+    try {
+      ctx.memoryContext.kvSet('memory-write:' + capKey, String(count))
+    } catch { /* mirror stays authoritative for this process */ }
   }
 
   ctx.tools.register(defineTool({

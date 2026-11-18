@@ -535,7 +535,7 @@ export class MemoryStore {
       this.kvSet(DEDUP_RULE_KEY, DEDUP_RULE_VERSION)
       this.db.exec('COMMIT')
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
       throw error
     }
   }
@@ -874,7 +874,7 @@ export class MemoryStore {
       }
       this.db.exec('COMMIT')
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
       throw error
     }
     return ref
@@ -1046,7 +1046,7 @@ export class MemoryStore {
       this.db.exec('COMMIT')
       return Number(info.changes)
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
       throw error
     }
   }
@@ -1062,19 +1062,19 @@ export class MemoryStore {
     // it does not silently delete zero rows.
     const capped = Number.isFinite(maxEntries) ? Math.max(0, Math.round(maxEntries)) : 0
     const doomed = this.db.prepare(
-      'SELECT ref FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
+      'SELECT ref FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC, ref DESC LIMIT ?)',
     ).all(capped) as unknown as { ref: string }[]
     if (doomed.length === 0) return 0
     this.db.exec('BEGIN')
     try {
       const info = this.db.prepare(
-        'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC LIMIT ?)',
+        'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC, ref DESC LIMIT ?)',
       ).run(capped)
       this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
       this.db.exec('COMMIT')
       return Number(info.changes)
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
       throw error
     }
   }
@@ -1245,7 +1245,7 @@ export class MemoryStore {
       }
       this.db.exec('COMMIT')
     } catch (error) {
-      this.db.exec('ROLLBACK')
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
       throw error
     }
     return marked

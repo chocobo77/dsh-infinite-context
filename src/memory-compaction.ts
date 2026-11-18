@@ -547,6 +547,15 @@ interface SessionCounter {
    * learned from — the utility judgment stays with cacheUtilityVote.
    */
   cycleCacheDip?: number | undefined
+  /**
+   * Whether ANY request this cycle reported a cache-read figure. Without it,
+   * a cycle from an adapter that omits cache fields would report a
+   * FABRICATED cache-hit ratio of 0 (0 measured reads over a nonzero total),
+   * and cacheUtilityVote would treat it as evidence of "folds too frequent"
+   * every cycle — the runway servo inflating from data that does not exist
+   * (the follow-up review's F2).
+   */
+  cacheMeasured?: boolean | undefined
 }
 
 /** Persistent KV interface (backed by the SQLite plugin_kv table). */
@@ -1140,6 +1149,7 @@ export class HistoryCompressor {
     // to measure (lastCompressedAt undefined), and an adapter that omits
     // cache fields leaves the dip UNMEASURED — a fabricated 1.00 would read
     // as a total cache miss (the lifecycle review's P2-3).
+    if (cacheRead !== undefined && Number.isFinite(cacheRead)) entry.cacheMeasured = true
     if ((entry.cycleRequestsCount ?? 0) === 0 && entry.lastCompressedAt !== undefined
       && cacheRead !== undefined && Number.isFinite(cacheRead)) {
       const total = cacheRead + (Number.isFinite(inputTokens) ? inputTokens : 0)
@@ -1172,10 +1182,11 @@ export class HistoryCompressor {
     cacheWrite: number
     hadFailure: boolean
     cacheDip?: number
+    cacheMeasured: boolean
   } {
     const entry = this.turnCounters.get(sessionId)
     if (entry === undefined) {
-      return { cycleRequests: 0, cacheRead: 0, cacheInput: 0, cacheWrite: 0, hadFailure: false }
+      return { cycleRequests: 0, cacheRead: 0, cacheInput: 0, cacheWrite: 0, hadFailure: false, cacheMeasured: false }
     }
     return {
       ...(entry.lastLandedTokens === undefined ? {} : { lastLandedTokens: entry.lastLandedTokens }),
@@ -1186,6 +1197,7 @@ export class HistoryCompressor {
       cacheWrite: entry.cycleCacheWrite ?? 0,
       hadFailure: entry.cycleHadFailure === true,
       ...(entry.cycleCacheDip === undefined ? {} : { cacheDip: entry.cycleCacheDip }),
+      cacheMeasured: entry.cacheMeasured === true,
     }
   }
 
@@ -1240,6 +1252,8 @@ export class HistoryCompressor {
     entry.cycleRequestsCount = 0
     entry.cycleHadFailure = false
     entry.cycleCacheDip = undefined
+    entry.cacheMeasured = undefined
+    entry.cacheMeasured = undefined
     this.persistCounter(sessionId)
     return {
       ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
@@ -1375,7 +1389,6 @@ export class HistoryCompressor {
   ): string {
     const options = resolveFoldOptions(this.config)
     if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
-    let headerRef: string | null = null
     try {
       const original = serializeMessagesForSummary(messages)
       // Code points, not UTF-16 units: memory_expand reports code points and
@@ -1391,7 +1404,6 @@ export class HistoryCompressor {
         sessionId,
         ...(attachments.length > 0 ? { attachments } : {}),
       })
-      headerRef = ref
       this.enforceFoldRetention(options)
       // The summary embedding is BACK-FILLED after the archive row exists:
       // awaiting the embedder here sat on the fold commit path, and a
@@ -2128,7 +2140,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // degenerate streak and the implicit-recall cooldown compare ABSOLUTE
     // turn numbers, so stale-era stamps would silently block matches (and a
     // wedged model would inherit a consumed streak). Start clean per era
-    // (the lifecycle review's P2-9).
+    // (the lifecycle review's P2-9; follow-up review's F1 was a false alarm —
+    // the dev-checkout agent/created DOES carry source, the stale built .d.ts
+    // inside the harness's node_modules does not).
     ctx.on('agent/created', ({ agent, source }: { agent: Agent; source: string }) => {
       if (source !== 'clear' && source !== 'startup') return
       const sessionId = String(agent.session.id)
@@ -2931,7 +2945,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           : Math.max(0, snapshot.surfaceTokens - (cycleInputs.lastLandedTokens ?? snapshot.surfaceTokens)),
         cycleTimeMs: cycleInputs.lastCompressedAt === undefined ? 0 : Math.max(0, Date.now() - cycleInputs.lastCompressedAt),
         cycleRequests: cycleInputs.cycleRequests,
-        ...(cycleCacheTotal > 0
+        // Fabricated ratios are poison: a cycle whose adapter never reported
+        // cache reads must omit cycleCacheHit — 0 measured reads over a nonzero
+        // total reads as a 0% hit, and cacheUtilityVote would inflate the servo
+        // every cycle from data that does not exist (follow-up review F2).
+        ...(cycleCacheTotal > 0 && cycleInputs.cacheMeasured === true
           ? { cycleCacheHit: cycleInputs.cacheRead / cycleCacheTotal }
           : {}),
         ...(cycleInputs.cacheDip === undefined ? {} : { cacheDip: cycleInputs.cacheDip }),
@@ -4939,11 +4957,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // Guarded like routedTargetOf: a partial session object must skip the
       // attribution, not the whole cycle bookkeeping after it (the lifecycle
       // review's P2-8).
-      let attribution: { detail?: string }
+      let attribution: { detail?: string; sessionId?: string }
       try {
         attribution = usageAttribution(sessionId, session.requestContext())
       } catch {
-        attribution = {}
+        // Keep the session id: usage rows without it orphan from their session
+        // in ledger queries (follow-up review F12).
+        attribution = { sessionId }
       }
       this.usage.record(USAGE_KIND.llmRequests, 1, attribution)
       if (usage.inputTokens !== undefined) {
