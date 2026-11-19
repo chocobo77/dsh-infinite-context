@@ -257,3 +257,8 @@
     # 3) Manual tools (memory_search, memory_status, etc.).
     - id: memory-tools
       name: dsh-infinite-context/tools
+
+    # 4) /compress-force command — manual compaction through the plugin
+    # pipeline (segmented; works at 100% of the window).
+    - id: command-compress-force
+      name: dsh-infinite-context/command-compress-force

@@ -260,3 +260,6 @@
 #    memory_force_compress, memory_expand, memory_ingest).
 - id: memory-tools
   name: ./src/tools.ts
+
+- id: command-compress-force
+  name: ./src/command-compress-force.ts
