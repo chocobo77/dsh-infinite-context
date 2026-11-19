@@ -1763,7 +1763,14 @@ function redactedSummary(result: SummaryResult): SummaryResult {
 
 /** The multi-tier memory compaction backend. */
 export class MemoryCompactionEngine extends BasicCompactionEngine {
-  static override inject = ['llm', 'tokenMeter', 'sessions', 'memoryContext']
+  // Inject list MUST be a superset of the parent's: BasicCompactionEngine's
+  // constructor reads ctx.sessionProjections (the answered-route projection),
+  // and overriding inject REPLACES the inherited list rather than extending
+  // it — the missing 4th entry made the engine fail to construct with
+  // `cannot get property "sessionProjections" without inject`, which unloaded
+  // the whole plugin silently (production 2026-11-18→19: a session ran 17h
+  // unguarded, overflowed, and /compact 400'd on a 262k merge request).
+  static override inject = ['llm', 'tokenMeter', 'sessions', 'memoryContext', 'sessionProjections']
 
   static override Config: z<MemoryCompactionConfig> = MemoryCompactionConfigSchema
 
