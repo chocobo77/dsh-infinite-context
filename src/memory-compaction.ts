@@ -36,7 +36,8 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId, type Session, type SessionSeq } from '@deepseek-ai/dsh-session'
-import { toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
+import type { ForcedFoldOutcome } from './memory-context.ts'
+import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only: brings the `ctx.tokenMeter` service declaration into scope.
 import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
@@ -631,13 +632,26 @@ export function selectFoldRange(
   }
   const types = surfaceNodes.map(seq => session.eventAt(seq)?.type ?? '')
   const firstIdx = firstFoldableIndex(types)
+  // CUT balance at surface POSITION keepFromIdx — exactly the boundary
+  // compaction-basic validates: `end`'s cut must be balanced AFTER the end
+  // node (validateSurfaceRegion), which equals balanced-BEFORE the node at
+  // the cut. Past the tail there is no such node: the final cut still has a
+  // balance, and a surface ending inside an abandoned step (tool-call whose
+  // result never arrived — an aborted or 400'd run leaves one) makes it
+  // UNBALANCED. Treating the off-end position as trivially balanced is what
+  // made forced folds throw `end seq N is not a balanced boundary (… or the
+  // step is still open)` (2026-11-19).
+  const cutBalancedAt = (index: number): boolean => {
+    if (index < surfaceNodes.length) {
+      const seq = surfaceNodes[index]
+      return seq !== undefined && toolPairingBalancedBefore(session, seq)
+    }
+    const last = surfaceNodes[index - 1]
+    return last !== undefined && toolPairingBalancedAfter(session, last)
+  }
   let keepFromIdx = retainedTailStart(priced.map(node => node.tokens), retainTokens)
   if (keepFromIdx <= firstIdx) return null
-  while (keepFromIdx > firstIdx) {
-    const seq = surfaceNodes[keepFromIdx]
-    if (seq === undefined || toolPairingBalancedBefore(session, seq)) break
-    keepFromIdx -= 1
-  }
+  while (keepFromIdx > firstIdx && !cutBalancedAt(keepFromIdx)) keepFromIdx -= 1
   // High-value cut boundary: a user message immediately BEFORE the cut would
   // be folded while the model's response to it stays verbatim — context
   // inversion. Extend the kept tail over trailing user messages, and over
@@ -660,6 +674,11 @@ export function selectFoldRange(
     walked += 1
     keepFromIdx -= 1
   }
+  // The boundary walk steps over importance-kept nodes whose content carries
+  // tool-calls or results (delta ≠ 0), which can drag the cut off balance —
+  // user messages never do, so only the importance tier can need this.
+  // Correctness beats adjacency: retract to the nearest balanced cut.
+  while (keepFromIdx > firstIdx && !cutBalancedAt(keepFromIdx)) keepFromIdx -= 1
   if (keepFromIdx <= firstIdx) return null
   // ESCALATION: the range above the retained tail cannot net its own summary —
   // usually one huge tail node overshooting `retain`, or a speculation frozen
@@ -676,8 +695,7 @@ export function selectFoldRange(
   let sum = 0
   for (let i = firstIdx; i < keepFromIdx; i += 1) sum += priced[i]?.tokens ?? 0
   while (sum < minimumTokens && keepFromIdx < surfaceNodes.length - 1) {
-    const nextCut = surfaceNodes[keepFromIdx + 1]
-    if (nextCut === undefined || !toolPairingBalancedBefore(session, nextCut)) break
+    if (!cutBalancedAt(keepFromIdx + 1)) break
     sum += priced[keepFromIdx]?.tokens ?? 0
     keepFromIdx += 1
   }
@@ -686,6 +704,31 @@ export function selectFoldRange(
   const end = surfaceNodes[keepFromIdx - 1]
   return start === undefined || end === undefined ? null : { start, end }
 }
+
+/**
+ * Whether the durable log leaves a turn open (a `turn/start` with no later
+ * `turn/end`). The host's compaction transaction keys its mode on exactly
+ * this (`inspectCompactionEntryState` in compaction-basic): `compactRegion`
+ * is the AUTOMATIC mode and requires an open turn, an idle session admits
+ * only standalone manual transactions. Routine/emergency folds fire at step
+ * boundaries (open turn); `/compact-force` may run while idle. The scan is
+ * bounded: it stops at the first lifecycle marker, which is recent in every
+ * state. The `SessionSeq` brander is not exported by the installed
+ * dsh-session package (see {@link SessionSeqOf}), hence the numeric cast.
+ * @param session - durable session to scan backwards from its tail.
+ */
+function sessionHasOpenTurn(session: Session): boolean {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq as SessionSeq)
+    if (event === undefined) continue
+    if (event.type === 'turn/start') return true
+    if (event.type === 'turn/end') return false
+  }
+  return false
+}
+
+/** Persisted queue marker for a forced fold requested while the session is idle. */
+const FORCED_FOLD_PENDING_PREFIX = 'dsh-infinite-context/forced-fold-pending:'
 
 /** In-memory session counters idle this long are evicted (RAM only). */
 /** Speculation launches when the surface is at least this share of the trigger. */
@@ -2092,6 +2135,7 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     ctx.memoryContext.compactionEngine = {
       agentFor: (id: string) => this.agentFor(id),
       foldNow: (agent, signal, force) => this.foldNow(agent, signal, force),
+      requestForcedFold: (agent, signal) => this.requestForcedFold(agent, signal),
       sanitizerConfig: this.sanitizerConfig,
     }
     ctx.memoryContext.retriever = { ingest: (text, source) => this.retriever.ingest(text, source) }
@@ -2558,6 +2602,46 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
   }
 
   /**
+   * `/compact-force` entry point. The host ties the compaction transaction
+   * mode to the session's turn state: this plugin's fold rides
+   * `compactRegion`, i.e. AUTOMATIC mode, which requires an OPEN turn (that
+   * is how every routine, surge and emergency fold commits — at a step
+   * boundary). An idle session admits only standalone MANUAL transactions,
+   * whose single public entry (`compactNow`) re-selects with its own retain-0
+   * range — discarding the tail retention this plugin exists to guarantee —
+   * so it is not a usable lane for a forced fold. Therefore: open turn → the
+   * fold runs now; idle → the forced fold is marked in the KV and consumed by
+   * the next pre-step's fold pass, which runs it inside a real turn with
+   * force semantics — before the next model request, exactly when the freed
+   * window is needed. The marker survives restarts; an explicit force then
+   * replaces it (latest request wins).
+   * @param agent - attached agent owning the session to force-fold.
+   * @param signal - the command invocation's cancellation signal.
+   * @returns `'ran'` with the fold result, or `'queued'` for the next pre-step.
+   */
+  async requestForcedFold(agent: Agent, signal: AbortSignal): Promise<ForcedFoldOutcome> {
+    if (sessionHasOpenTurn(agent.session)) {
+      return { lane: 'ran', result: await this.foldNow(agent, signal, true) }
+    }
+    const sessionId = String(agent.session.id)
+    try {
+      this.ctx.memoryContext.kvSet(FORCED_FOLD_PENDING_PREFIX + sessionId, String(Date.now()))
+    } catch {
+      // Without the KV the request would be silently dropped; run the fold
+      // on the spot instead — the host turn gate may still reject it, and
+      // the command maps that error honestly (2026-11-19 incident: the
+      // rejection text at least surfaced the reason).
+      return { lane: 'ran', result: await this.foldNow(agent, signal, true) }
+    }
+    try {
+      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'forced-queued' })
+    } catch {
+      // Diagnostics must never break the command.
+    }
+    return { lane: 'queued', result: null }
+  }
+
+  /**
    * Fold the session SURFACE to the unified fold target.
    *
    * This is the fold lane's ONLY executor. `agent/pre-step` carries just the
@@ -2590,6 +2674,22 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
       } catch {
         // Diagnostics must never break governance.
+      }
+    }
+    // A forced fold queued by /compact-force on an idle session (the fold
+    // lane can only commit inside an open turn — see requestForcedFold):
+    // consume the persisted marker exactly once and run this pass with force
+    // semantics, past the pacing, importance and size gates.
+    if (!force) {
+      try {
+        const pending = this.ctx.memoryContext.kvGet(FORCED_FOLD_PENDING_PREFIX + sessionId)
+        if (pending !== undefined) {
+          this.ctx.memoryContext.kvDelete(FORCED_FOLD_PENDING_PREFIX + sessionId)
+          force = true
+          diag('forced-pending-consumed')
+        }
+      } catch {
+        // A dead KV leaves the fold routine; it must never break the step.
       }
     }
     // Same route resolution as the thinking guard: the routed model may exist
@@ -2833,8 +2933,25 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         // tier still proves the conversational thread is verbatim.
         if (regionMessagesFingerprint(projection) === rebased.regionFingerprint
           || regionStableFingerprint(projection) === rebased.stableFingerprint) {
-          range = { start: rebased.start, end: rebased.end }
-          speculationUsed = true
+          // The checkpoint's boundary was balanced when captured; a surface
+          // rewrite since (stub churn, expand) can in principle drift it into
+          // an open step. Re-check against validateSurfaceRegion's contract —
+          // a stale boundary (or a seq no longer on the surface, which the
+          // predicates reject by throwing) drops the checkpoint and selection
+          // re-runs fresh, rather than throwing host-side inside compactRegion.
+          let boundaryOk = false
+          try {
+            boundaryOk = toolPairingBalancedBefore(session, rebased.start)
+              && toolPairingBalancedAfter(session, rebased.end)
+          } catch {
+            boundaryOk = false
+          }
+          if (boundaryOk) {
+            range = { start: rebased.start, end: rebased.end }
+            speculationUsed = true
+          } else {
+            this.speculative.delete(sessionId)
+          }
         } else {
           this.speculative.delete(sessionId)
         }
@@ -4030,10 +4147,28 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // SEGMENT WINDOW CLIP: message-level packing can still leave one segment
     // over the model window (a single monster message no bucket can split).
     // The segment request is a STANDALONE call — its window is the model's
-    // own, not the session's — so the text blocks are clipped to 80% of the
-    // adopted window; the clipped tail stays recoverable through the fold
-    // archive of the ORIGINAL messages (its own serialize is 16k/message).
-    const segmentWindowBudget = Math.max(2_000, Math.floor(this.ctx.memoryContext.contextWindow * 0.8))
+    // own, not the session's — so the text blocks are clipped against the
+    // summarization route's ADOPTED per-model window (registry first,
+    // declared global as fallback — the bare global budgets one model off
+    // another's); the clipped tail stays recoverable through the fold archive
+    // of the ORIGINAL messages (its own serialize is 16k/message).
+    // The clip must also leave room for the ENVELOPE every segment replays:
+    // the system head and tool schemas ride OUTSIDE the clipped text blocks
+    // (SummarizationInput fields, prepended by the base), so a bare 80%-of-
+    // window on the TEXT alone can still push the assembled request over the
+    // line on a tool-heavy route. Estimate the real replayed envelope and
+    // subtract it FIRST; the 20% band then stays purely as answer headroom.
+    const segmentTarget = resolveSummarizationTarget(this.config, agent.session)
+    const segmentWindow = this.ctx.memoryContext.windowForModelOrDeclared(segmentTarget?.model)
+    // The live-fold path carries the system head as messages[0] (buildRegionInput),
+    // NOT the system field — and it is re-prepended to every segment below
+    // without clipping — so BOTH carriers count toward the replayed envelope.
+    const envelopeTokens = estimateTokens(
+      (input.system ?? '')
+      + (system === undefined ? '' : messageText(system))
+      + (input.tools === undefined ? '' : JSON.stringify(input.tools)),
+    )
+    const segmentWindowBudget = Math.max(2_000, Math.floor(segmentWindow * 0.8) - envelopeTokens)
     const clippedSegments = segments.map(segment => {
       const tokens = estimateTokens(segment.map(message => messageText(message)).join('\n'))
       if (tokens <= segmentWindowBudget) return segment

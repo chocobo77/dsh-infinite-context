@@ -73,6 +73,21 @@ export interface ExpandRestoreEvent {
   readonly sessionId?: string | undefined
 }
 
+/**
+ * Where a `/compact-force` request landed. The host compaction contract only
+ * permits standalone manual transactions on an idle session (and the base
+ * `compactNow` opens those with its own retain-0 range), while the plugin fold
+ * rides `compactRegion`'s turn envelope — so on an idle session the forced
+ * fold is queued (persisted) to the next pre-step, where the fold lane runs
+ * inside a real turn, before the next model request.
+ */
+export interface ForcedFoldOutcome {
+  /** `'ran'`: the fold attempted now; `'queued'`: it runs at the next pre-step. */
+  readonly lane: 'ran' | 'queued'
+  /** The fold result when `lane === 'ran'`; `null` means nothing foldable. */
+  readonly result: CompactionResult | null
+}
+
 /** The `memoryContext` service. */
 export class MemoryContext extends Service {
   static Config: z<MemoryContextConfig> = MemoryContextConfigSchema
@@ -899,6 +914,13 @@ export class MemoryContext extends Service {
     agentFor: (sessionId: string) => Agent | undefined
     /** Fold the session SURFACE to the unified fold target. */
     foldNow: (agent: Agent, signal: AbortSignal, force?: boolean) => Promise<CompactionResult | null>
+    /**
+     * `/compact-force` entry honoring the host compaction turn contract: with
+     * an open turn the fold runs now (`lane: 'ran'`); on an idle session the
+     * forced fold is queued (persisted) to the next pre-step (`lane: 'queued'`),
+     * where it runs inside a real turn before the next model request.
+     */
+    requestForcedFold: (agent: Agent, signal: AbortSignal) => Promise<ForcedFoldOutcome>
     /** The compaction engine's sanitizer cap, reused by the memory_ingest tool. */
     sanitizerConfig: SanitizerConfig | null
   } | null = null
