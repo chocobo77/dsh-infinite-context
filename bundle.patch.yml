@@ -5,8 +5,20 @@
 - id: compaction-basic
   disabled: true
 
-# Insert the three plugin entries.
+# Insert the plugin entries.
 - insert:
+    # 0) Bare package entry — REQUIRED for the browser half. The web "/" menu
+    # style row (强制压缩) ships as this package's dsh.client module, and
+    # dsh-client-modules only composes `window.__DSH_BOOT__` rows for packages
+    # mounted under their EXACT package name: subpath rows (`…/memory-context`)
+    # are host-only by construction (exactPackageSpecifier → undefined). Without
+    # this row the client half is silently never served while the host half
+    # still hides the raw row — the menu then shows NO compact-force at all
+    # (2026-11-19 incident). The root module's host face is a no-op fiber;
+    # all real host behavior stays in the subpath entries below.
+    - id: infinite-context-root
+      name: dsh-infinite-context
+
     # 1) Persistent multi-tier memory store + embedder + index + budget.
     # Bare subpath specifiers resolve through node_modules against the
     # installed package's exports map. RELATIVE paths resolve against the
@@ -258,7 +270,7 @@
     - id: memory-tools
       name: dsh-infinite-context/tools
 
-    # 4) /compress-force command — manual compaction through the plugin
+    # 4) /compact-force command — manual compaction through the plugin
     # pipeline (segmented; works at 100% of the window).
-    - id: command-compress-force
-      name: dsh-infinite-context/command-compress-force
+    - id: command-compact-force
+      name: dsh-infinite-context/command-compact-force

@@ -22,6 +22,7 @@
   ],
   "files": [
     "dist",
+    "client",
     "bundle.patch.yml",
     "cordis.yml"
   ],
@@ -43,6 +44,11 @@
       "types": "./dist/tools.d.ts",
       "default": "./dist/tools.js"
     },
+    "./command-compact-force": {
+      "types": "./dist/command-compact-force.d.ts",
+      "default": "./dist/command-compact-force.js"
+    },
+    "./client": "./client/compact-force.js",
     "./core": {
       "types": "./dist/core.d.ts",
       "default": "./dist/core.js"
@@ -52,6 +58,13 @@
   "dsh": {
     "bundle": {
       "patch": "./bundle.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-commands"
+      ],
+      "platform": "web"
     }
   },
   "scripts": {

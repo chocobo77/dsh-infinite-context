@@ -91,6 +91,34 @@ try {
   }
   Write-Host "    entries: $($entries.Count)"
 
+  # bundle.patch.yml 的裸子路径条目经安装包的 exports 映射解析（见 patch 内注释）。
+  # 条目名缺 exports 时 loader 静默加载失败——/compact-force 曾因此失踪（2026-11-19）。
+  Write-Host "==> 校验 patch 条目可经 exports 解析" -ForegroundColor Cyan
+  $check = @(& node -e '
+const fs = require("fs");
+const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+const yml = fs.readFileSync("bundle.patch.yml", "utf8");
+const problems = [];
+const subs = [...yml.matchAll(/^[ ]*name:[ ]*dsh-infinite-context\/([A-Za-z0-9_-]+)[ ]*$/gm)].map(m => m[1]);
+for (const s of subs) if (pkg.exports?.["./" + s] === undefined) problems.push("exports 缺少子路径 ./" + s);
+if (pkg.dsh?.client) {
+  const c = pkg.exports?.["./client"];
+  if (c === undefined) problems.push("声明了 dsh.client 但 exports[\"./client\"] 缺失（浏览器半不会加载）");
+  else if (!fs.existsSync(c)) problems.push("exports[\"./client\"] 指向不存在的文件：" + c);
+  if (!/^[ ]*name:[ ]*dsh-infinite-context[ ]*$/m.test(yml)) problems.push("声明了 dsh.client 但 bundle.patch.yml 没有裸包名条目（name: dsh-infinite-context）——子路径条目不会合成浏览器半（2026-11-19 事故）");
+}
+if (problems.length > 0) {
+  console.error(problems.join("\n"));
+  process.exit(1);
+}
+console.log("    patch entries: " + subs.length + "，全部可解析" + (pkg.dsh?.client ? "；client 半已声明且裸包名条目在位" : ""));
+')
+  if ($LASTEXITCODE -ne 0) {
+    if ($check) { Write-Host ($check -join [Environment]::NewLine) }
+    throw "bundle.patch.yml/dsh.client 与 exports 不一致（安装后 loader 将无法加载对应模块）。"
+  }
+  Write-Host ($check -join [Environment]::NewLine)
+
   $hash = (Get-FileHash -Algorithm SHA256 $tgz).Hash.ToLowerInvariant()
   $sumFile = Join-Path $OutDir "SHA256SUMS.txt"
   "$hash  $tgzName" | Set-Content -Encoding ASCII $sumFile

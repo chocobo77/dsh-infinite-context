@@ -12,6 +12,13 @@
 # injects it). Ordering in the file does not matter — Cordis orders by the
 # `inject` dependency.
 
+# 0) Bare package-root entry: activates this package's dsh.client browser half
+# (the styled /compact-force menu row). Browser composition only recognizes
+# rows mounted at the package root (see bundle.patch.yml comment #0); the root
+# module's host face is a no-op, all behavior lives in the entries below.
+- id: infinite-context-root
+  name: ./src/index.ts
+
 # 1) The persistent multi-tier memory store + embedder + index + budget.
 - id: memory-context
   name: ./src/memory-context.ts
@@ -261,5 +268,5 @@
 - id: memory-tools
   name: ./src/tools.ts
 
-- id: command-compress-force
-  name: ./src/command-compress-force.ts
+- id: command-compact-force
+  name: ./src/command-compact-force.ts
