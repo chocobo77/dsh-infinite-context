@@ -2620,10 +2620,18 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
    * @returns `'ran'` with the fold result, or `'queued'` for the next pre-step.
    */
   async requestForcedFold(agent: Agent, signal: AbortSignal): Promise<ForcedFoldOutcome> {
+    const sessionId = String(agent.session.id)
     if (sessionHasOpenTurn(agent.session)) {
+      // An explicit force run SATISFIES any queued request: clear the marker
+      // here, or the next pre-step would consume it into a second unplanned
+      // forced fold past the pacing gates (latest request wins — 2026-11-20 review).
+      try {
+        this.ctx.memoryContext.kvDelete(FORCED_FOLD_PENDING_PREFIX + sessionId)
+      } catch {
+        // A dead KV has nothing durably queued anyway.
+      }
       return { lane: 'ran', result: await this.foldNow(agent, signal, true) }
     }
-    const sessionId = String(agent.session.id)
     try {
       this.ctx.memoryContext.kvSet(FORCED_FOLD_PENDING_PREFIX + sessionId, String(Date.now()))
     } catch {
