@@ -1,6 +1,6 @@
 {
   "name": "dsh-infinite-context",
-  "version": "0.9.21",
+  "version": "0.9.22",
   "description": "DSH 上下文治理插件：长会话不爆窗、不失忆——1.04 亿 token 实测，19 次折叠全部可逆、51 万 token 净省，摘要机械核对（锚点缺失 1.1% vs 无核对 71.2%），参数随用随学。/ Context governance for DeepSeek Harness: long sessions stay in-window without amnesia — 104M tokens, 19 reversible folds, 511k saved, summaries mechanically audited (1.1% vs 71.2% anchor loss), knobs learned from use.",
   "type": "module",
   "license": "MIT",
