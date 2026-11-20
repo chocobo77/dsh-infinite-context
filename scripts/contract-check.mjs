@@ -19,7 +19,7 @@ import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 
 const dist = new URL('../dist/', import.meta.url)
-if (!existsSync(new URL('redact.js', dist))) {
+if (!existsSync(new URL('redact.js', dist)) || !existsSync(new URL('event-shapes.js', dist))) {
   console.error('dist/ missing — run `npm run build` first (this check tests the shipped module).')
   process.exit(2)
 }
@@ -49,6 +49,13 @@ const redaction = [
   // URL / DSN userinfo: password masked, scheme+user kept, port-only URLs untouched.
   ['postgres://admin:p@ssw0rd@db.internal:5432/app', 'postgres://admin:[REDACTED]@db.internal:5432/app'],
   ['http://localhost:8080/api/v1', 'http://localhost:8080/api/v1'],
+  // Port + query/fragment containing `@`: the port must NOT be eaten as a
+  // password — the userinfo value excludes `/ ? #` for exactly this.
+  ['http://example.com:8080/callback?email=a@b.com', 'http://example.com:8080/callback?email=a@b.com'],
+  ['http://host:3000/status?user=joe@corp', 'http://host:3000/status?user=joe@corp'],
+  ['http://h:9090/x#frag@tag', 'http://h:9090/x#frag@tag'],
+  // A DSN with port AND path and a real password still redacts.
+  ['redis://user:pa:ss@host:6379/0', 'redis://user:[REDACTED]@host:6379/0'],
   // Well-known shapes.
   ['key sk-abcdefghijklmnopqrstuvwx', 'key [REDACTED]'],
   ['AIzaSyD-abcdefghijklmnopqrstuvwxyz12345', '[REDACTED]'],

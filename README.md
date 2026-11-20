@@ -101,7 +101,7 @@ dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-con
 
 ### 数字从哪来
 
-上面首屏的数字读自插件自己的 SQLite 账本（`fold_cycle`、`compaction_saved_tokens`、`folded_ranges`、`expand_restore` 等逐次记录），装上后用 `memory_status` 或直接查库即可复核。摘要保真的对照回放用的是同一台本地模型：10 段真实会话内容分别走"折叠管线摘要 / 无核对的降级摘要 / 原文截断"三条路，数关键锚点的缺失比例。该对照的评分由同一台模型自己判（self-judging，`bench-results/9df5ae49-…/report.md` 首行已标注 `judge on (self-judging bias)`），两个百分比应当作同一批内容下的相对差距来读，不是绝对错误率。
+上面首屏的数字读自插件自己的 SQLite 账本（`fold_cycle`、`compaction_saved_tokens`、`folded_ranges`、`expand_restore` 等逐次记录），装上后用 `memory_status` 或直接查库即可复核。摘要保真的对照回放用的是同一台本地模型：10 段真实会话内容分别走"折叠管线摘要 / 无核对的降级摘要 / 原文截断"三条路，数关键锚点的缺失比例。该对照的评分由同一台模型自己判（self-judging，`bench-results/9df5ae49-…/report.md` 第 3 行已标注 `judge on (self-judging bias)`），两个百分比应当作同一批内容下的相对差距来读，不是绝对错误率。
 
 ### 配置
 

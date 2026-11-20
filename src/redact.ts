@@ -62,9 +62,11 @@ const TOKEN_SHAPES: readonly RegExp[] = [
  * strings carry in logs and error output (postgres://, mysql://, redis:// …).
  * The `@` lookahead is what keeps `http://host:8080/` untouched; the value may
  * itself contain `@` (`p@ssw0rd`), so the greedy value runs to the LAST `@`
- * that still precedes the host.
+ * that still precedes the host. The value excludes `/ ? #`: without that,
+ * `http://host:8080/path?email=a@b.com` would treat the port as a password.
+ * (A literal `/` inside a DSN password is the accepted miss; `@` still works.)
  */
-const URL_USERINFO = /([a-z][a-z0-9+.-]*:\/\/[^\s:@/"']+):([^\s"']+(?=@[^\s@/]*(?:[/:]|\s|['")\],;]|$)))/gi
+const URL_USERINFO = /([a-z][a-z0-9+.-]*:\/\/[^\s:@/"']+):([^\s"'/?#]+(?=@[^\s@/]*(?:[/:]|\s|['")\],;]|$)))/gi
 
 /** PEM private-key blocks, masked whole. */
 const PEM_BLOCK = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
