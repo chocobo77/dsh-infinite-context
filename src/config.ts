@@ -496,7 +496,8 @@ export interface MemoryCompactionConfig {
   /**
    * @deprecated The unified fold planner (`planFoldCompaction`) always steers
    * within the hard bounds; this key is accepted for backward compatibility
-   * and has no effect. Use `compaction_governance` to switch the planner.
+   * and has no effect. There is NO switch back: `compaction_governance` below
+   * is likewise a no-op — the planner is not toggleable.
    */
   compress_dynamic_levels?: boolean
   /**

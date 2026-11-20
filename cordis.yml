@@ -116,16 +116,24 @@
     # History-compression trigger: lowered from 0.85 to 0.75 so the plugin's own
     # per-step history compression also fires earlier — again keeping
     # short-context local models out of the slow long-context zone.
+    # NOTE: writing either ratio PINS the fold tempo — fold_learning's
+    # self-learning stands down as long as an anchor is hand-set, so this
+    # shipped config runs its fold rhythm UNLEARNED. Delete both lines to let
+    # the plugin learn its own tempo; `fold_learning: true` alone does not
+    # unpin a hand-set ratio.
     compress_trigger_ratio: 0.75
     compress_target_ratio: 0.6   # progressive: only the oldest overflow is summarized
-    # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN and
-    # the target DEEPER as the session heats up (growth EMA) or matures (prior
-    # compressions). Trigger <= 0.92 (never overflow), >= 0.65; target >= 0.25;
-    # band 0.08..0.45. Set false to disable the steering; hard bounds still apply.
+    # DEPRECATED (no-op since 0.8.6): true, false or dropping the key all behave
+    # the same — the unified planner steers inside the hard bounds
+    # unconditionally, and the actual tempo/amplitude come from fold_learning.
+    # Hard bounds still hold either way: trigger <= 0.92 (never overflow) and
+    # >= 0.65; target >= 0.25; band 0.08..0.45. Key kept for compatibility only.
     compress_dynamic_levels: true
-    # Unified governor: one policy (planCompaction) decides lane + water levels,
-    # and the fold executor obeys it. Off = legacy per-lane triggers (shared
-    # curves still apply). Explicit opt-in for existing configs.
+    # DEPRECATED (no-op since 0.8.6): the lane takeover is unconditional — with
+    # the plugin installed the fold lane owns routine pressure compaction and
+    # the base durable lane stands down (fit-guard and provider-overflow
+    # recovery remain as emergency doors). There is no legacy per-lane mode to
+    # switch back to. Key kept for compatibility only.
     compaction_governance: true
     # Hard timeout (ms) for ONE summarizer LLM call during a compaction. Each
     # attempt gets a fresh timer; after one retry the fold degrades to a
@@ -262,9 +270,10 @@
     # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
     # rag_ingest_denylist: []
 
-# 3) Manual tools (memory_search, memory_status, memory_index, memory_maintain,
-#    memory_model_probe, memory_forget, memory_consolidate, memory_reset,
-#    memory_force_compress, memory_expand, memory_ingest).
+# 3) Manual tools — 12, all registered by ./src/tools.ts (memory_search,
+#    memory_status, memory_model_probe, memory_index, memory_maintain,
+#    memory_write, memory_forget, memory_consolidate, memory_reset,
+#    memory_ingest, memory_force_compress, memory_expand).
 - id: memory-tools
   name: ./src/tools.ts
 

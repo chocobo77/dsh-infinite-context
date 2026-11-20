@@ -144,14 +144,18 @@
         sleep_idle_ms: 900000
         degenerate_retry: true
         compress_target_ratio: 0.6
-        # Dynamic water levels: inside hard safety bounds, slide the trigger DOWN
-        # and the target DEEPER as the session heats up (growth EMA) or matures
-        # (prior compressions). Trigger <= 0.92 / >= 0.65; target >= 0.25;
-        # band 0.08..0.45. Set false to disable steering; hard bounds still apply.
+        # NOTE: both ratios above are hand-written, which PINS the fold tempo —
+        # fold_learning's self-learning stands down while an anchor is set.
+        # Delete the two ratio lines to let the plugin learn its own rhythm.
+        # DEPRECATED (no-op since 0.8.6): the unified planner steers inside the
+        # hard bounds unconditionally (trigger <= 0.92 / >= 0.65; target >=
+        # 0.25; band 0.08..0.45), and tempo/amplitude come from fold_learning.
         compress_dynamic_levels: true
-        # Unified governor: one policy decides lane + water levels; the fold
-        # executor obeys it. Off = legacy per-lane triggers.
-        compaction_governance: true        # Track the routed model's REAL context window (probe / modelWindows):
+        # DEPRECATED (no-op since 0.8.6): lane takeover is unconditional — the
+        # fold lane owns routine compaction, and there is no legacy per-lane
+        # mode to switch back to. Key kept for compatibility only.
+        compaction_governance: true
+        # Track the routed model's REAL context window (probe / modelWindows):
         # when it is smaller than the declared window, force durable-history
         # compaction at a threshold derived from the REAL window instead of
         # waiting for a declared-window threshold the model can never reach.

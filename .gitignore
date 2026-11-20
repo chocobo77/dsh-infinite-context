@@ -59,12 +59,19 @@ scripts/install-dsh-plugin.cfg
 
 # === Local development only (not published) ===
 docs/
-scripts/
+scripts/*
+!scripts/contract-check.mjs
 ARCHITECTURE.md
 # The vitest suite left the repository on 2026-11-14 (operator decision):
-# tests/, vitest.config.ts and tsconfig.typecheck.json are gone; the suite
-# remains recoverable from git history (tag v0.9.8 and earlier). verify is
-# typecheck + build only.
+# tests/ and vitest.config.ts are gone; the suite remains recoverable from git
+# history (tag v0.9.8 and earlier). What replaced it is scripts/contract-check.mjs
+# — plain node:test over the COMPILED dist/, pinning the host event shape and
+# the redaction line. Unlike the rest of scripts/ (local operator tooling),
+# contract-check.mjs IS tracked: package.json's `test:contract` runs it inside
+# `verify`, `prepack` gates verify, and src/ comments cite it as the contract
+# pin — a fresh clone without it breaks verify and pack (2026-11-20 review).
+# The tarball stays clean: pack.sh rejects package/scripts/ outright.
+# verify = typecheck + build + test:contract.
 
 release/
 

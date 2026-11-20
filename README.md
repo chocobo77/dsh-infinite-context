@@ -4,6 +4,8 @@ DeepSeek Harness 的上下文治理插件：长会话不爆窗、不丢事，折
 
 一台本地小模型带着这个插件连续工作 **31 小时**、吞吐 **1.04 亿 token**，插件自动折叠了 **19 次**——每一次都有存档可回读，最后一次落库前没有丢过任何一份摘要。下面的数字全部来自这次运行的本地账本，装上插件你也能查到同样的一套。
 
+该组数字来自单次生产运行的本地账本，仓库内没有对应的产物可供直接核对；`bench-results/` 是另一项摘要保真对照实验，不是这组数字的来源。
+
 | 实测（单次生产长会话，本地部署的量化模型） | |
 |---|---|
 | 连续工作时长 | 31 小时，656 次请求，无人值守过夜 |
@@ -78,7 +80,7 @@ dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-con
 - 每条模型路线"摘要实际要多久"持续测量、自动调整等待——本地大模型慢但健康就放宽，云端卡死的流不给第二次耐心。
 - 折叠触发点与幅度来自对实际周期的观察：两次折叠间的余量、缓存命中起伏、摘要被回读的频率都影响下一次判断。一次真实长会话里，触发系数从 1.05 一路学到 2.50（增长快就拉开折叠间隔）。
 - 提供商报"装不下"时记下服务器真实容量，之后按真实容量规划，不按声明值硬撑。
-- 你在配置里指定的值优先级最高，学习只在未指定时生效。
+- 你在配置里指定的值优先级最高，学习只在未指定时生效。但折叠**节奏**的自学习会被锚点钉扎：配置里写了 `compress_trigger_ratio` 或 `compress_target_ratio` 任意一行，就被当作手工钉扎，节奏自学习随之停用。出厂 `cordis.yml` 恰好写了这两行，所以默认安装的这一项其实是关的；要自学习就得删掉这两行——单独写 `fold_learning: true` 解不开钉扎，钉扎优先。
 
 **之外还有**：折叠触发点与摘要历史的语义比对（模型从不主动回读摘要时，召回信号照常积累）；Agent 空闲时自动整理记忆库、把被取代的检查点合并成长期记忆；模型可以主动往记忆里写事实（每会话 20 条上限，防滥用）；一轮回复只产出思考、没有任何可见结果时自动补一步，不静默丢单。
 
@@ -99,7 +101,7 @@ dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-con
 
 ### 数字从哪来
 
-上面首屏的数字读自插件自己的 SQLite 账本（`fold_cycle`、`compaction_saved_tokens`、`folded_ranges`、`expand_restore` 等逐次记录），装上后用 `memory_status` 或直接查库即可复核。摘要保真的对照回放用的是同一台本地模型：10 段真实会话内容分别走"折叠管线摘要 / 无核对的降级摘要 / 原文截断"三条路，数关键锚点的缺失比例。
+上面首屏的数字读自插件自己的 SQLite 账本（`fold_cycle`、`compaction_saved_tokens`、`folded_ranges`、`expand_restore` 等逐次记录），装上后用 `memory_status` 或直接查库即可复核。摘要保真的对照回放用的是同一台本地模型：10 段真实会话内容分别走"折叠管线摘要 / 无核对的降级摘要 / 原文截断"三条路，数关键锚点的缺失比例。该对照的评分由同一台模型自己判（self-judging，`bench-results/9df5ae49-…/report.md` 首行已标注 `judge on (self-judging bias)`），两个百分比应当作同一批内容下的相对差距来读，不是绝对错误率。
 
 ### 配置
 
@@ -107,7 +109,8 @@ dsh plugin --profile <profile> add https://github.com/chocobo77/dsh-infinite-con
 
 | 配置 | 作用 | 默认 |
 |---|---|---|
-| `compaction_governance` | 统一折叠调度（建议保持开启） | `true` |
+| `compaction_governance` | **已废弃（no-op since 0.8.6）**：车道接管是无条件的，写了这个键不生效，也没有可退回的旧按 lane 模式 | `true`（出厂 cordis.yml 仍带，纯兼容占位） |
+| `fold_learning` | 折叠节奏自学习（触发时机与幅度随实测周期调）。**配置里写了 `compress_trigger_ratio` 或 `compress_target_ratio` 任意一行即视为手工钉扎，自学习自动关闭** | `true`，但出厂 cordis.yml 写了那两个 ratio，所以默认安装下实际是关的 |
 | `summarization_timeout_ms` | 单次摘要等待上限（毫秒）；`0` = 不限制 | 自动：本地 240s / 云端 90s，随输入伸缩，随实测学习 |
 | `task_state_enabled` | 每轮注入任务状态提醒 | `true` |
 | `speculative_fold` | 后台提前准备折叠摘要 | `true` |
@@ -175,6 +178,8 @@ This plugin's principle: **compaction is not deletion**. Old turns fold into a s
 
 One locally-deployed quantized model ran **31 hours** with this plugin, through **104 million tokens** (99.84M cache reads + 3.65M input + 0.51M output), folding automatically **19 times** — 19 archives, 19 checkpoint memories, nothing lost. All numbers below come from that run's local ledger:
 
+These figures are from a single production run's local ledger; the repository holds no artifact to check them against directly. `bench-results/` is a separate summary-fidelity experiment, not the source of this set.
+
 | Measured (single production session) | |
 |---|---|
 | Session | 31 hours, 656 requests, unattended overnight |
@@ -212,7 +217,7 @@ The plugin predicts the launch moment from growth speed and summary duration and
 
 **6. Parameters that learn**
 
-Per-route summary latency is measured continuously and waits adjust themselves; the fold trigger and amplitude come from observed cycles (one real session's trigger coefficient learned from 1.05 to 2.50); real server capacity is recorded when a provider rejects a request for size. Values you set explicitly always win.
+Per-route summary latency is measured continuously and waits adjust themselves; the fold trigger and amplitude come from observed cycles (one real session's trigger coefficient learned from 1.05 to 2.50); real server capacity is recorded when a provider rejects a request for size. Values you set explicitly always win — and for fold **tempo**, writing either `compress_trigger_ratio` or `compress_target_ratio` counts as manually pinning the anchor, which stands the self-learning down. The shipped `cordis.yml` writes both lines, so on a default install this learning is off; delete those two lines to get it — `fold_learning: true` on its own does not unpin it, the pin wins.
 
 **Also included**: semantic matching between new input and fold summaries (recall signal accumulates even when the model never reads back); idle-time memory consolidation; agent-curated memory writes (20/session cap); an invisible retry when a turn ends with zero visible output.
 
@@ -233,7 +238,7 @@ Per-route summary latency is measured continuously and waits adjust themselves; 
 
 ### Where the numbers come from
 
-The headline numbers are read from the plugin's own SQLite ledger (`fold_cycle`, `compaction_saved_tokens`, `folded_ranges`, `expand_restore`, one row per event) — install it and verify with `memory_status` or by querying the store. The fidelity replay ran the same local model over 10 segments of real session content through three lanes (the fold pipeline, unchecked fallback, raw truncation) and counted missing key anchors.
+The headline numbers are read from the plugin's own SQLite ledger (`fold_cycle`, `compaction_saved_tokens`, `folded_ranges`, `expand_restore`, one row per event) — install it and verify with `memory_status` or by querying the store. The fidelity replay ran the same local model over 10 segments of real session content through three lanes (the fold pipeline, unchecked fallback, raw truncation) and counted missing key anchors. That replay is scored by the same model being measured (self-judging — the report header at `bench-results/9df5ae49-…/report.md` flags `judge on (self-judging bias)`), so the two percentages are a relative gap on identical content, not absolute error rates.
 
 ### Configuration
 
@@ -241,7 +246,8 @@ Everything lives in `cordis.yml` with a comment on every key. The common ones:
 
 | Key | Purpose | Default |
 |---|---|---|
-| `compaction_governance` | Unified fold scheduling (keep on) | `true` |
+| `compaction_governance` | **Deprecated (no-op since 0.8.6)**: the fold lane's takeover of routine compaction is unconditional, the key does nothing and there is no legacy per-lane mode to go back to | `true` (still in the shipped cordis.yml, kept for compatibility only) |
+| `fold_learning` | Self-learned fold tempo (trigger timing and amplitude follow observed cycles). **Writing either `compress_trigger_ratio` or `compress_target_ratio` pins the anchor by hand and stands this learning down** | `true`, but the shipped cordis.yml writes both ratios, so on a default install it is effectively off |
 | `summarization_timeout_ms` | Per-attempt summary deadline (ms); `0` = unlimited | auto: local 240s / cloud 90s, scaled by input, refined by learning |
 | `task_state_enabled` | Per-turn task-state reminder | `true` |
 | `speculative_fold` | Background precomputation of fold summaries | `true` |

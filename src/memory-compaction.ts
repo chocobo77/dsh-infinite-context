@@ -127,6 +127,7 @@ import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
 import { clipToTokens, estimateContentTokens, estimateTokens } from './token-budget.ts'
 import { registerThinkingGuard } from './thinking-guard.ts'
 import { redactCredentials } from './redact.ts'
+import { isToolResultError } from './event-shapes.ts'
 import {
   GOV_GUARD_RESERVE_MIN,
   GOV_MIN_NET_SAVING_RATIO,
@@ -2548,7 +2549,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           : false
         signals.push({ type: event.type, tokens, text, hasToolCalls })
       } else if (event.type === 'tool/result') {
-        const isError = (event.data as unknown as { isError?: boolean }).isError === true
+        // The host flags tool errors on the frozen message, not on the frame
+        // data: data.message.isError. The previous `data.isError` read silently
+        // pinned recentErrors to 0 (scripts/contract-check.mjs pins the shape).
+        const isError = isToolResultError(event.data)
         signals.push({ type: event.type, tokens, isError })
       } else {
         signals.push({ type: event.type, tokens })
@@ -4490,9 +4494,16 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         .filter(value => value.length > 0)
         .slice(-12)
         .map(value => `- ${value.length > 300 ? `${value.slice(0, 300)}…` : value}`)
-      const digest = userInstructions.length === 0
+      const digestRaw = userInstructions.length === 0
         ? ''
         : `## 折叠区用户指令 / User instructions in the folded range\n${userInstructions.join('\n')}`
+      // The verbatim user-words channel crosses the SAME redaction line as the
+      // model's summary: a credential typed mid-session must not be quoted
+      // into folded_ranges, the mid-tier checkpoint and every later surface
+      // (the incident class redact.ts documents). The evidence audit below
+      // measures the UNREDACTED digest, so masking never fabricates a
+      // "missing anchor" that would then be re-attached.
+      const digest = digestRaw.length === 0 ? '' : redactCredentials(digestRaw)
       // Fold evidence audit (deterministic fidelity floor): the deviation EMA
       // measures a summary's SIZE, never its FIDELITY — a checkpoint can land
       // exactly on budget and still have dropped the one line the resume
@@ -4507,8 +4518,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         try {
           // Audit against EVERYTHING the fold lands, digest included: an
           // anchor the user-instructions digest carries is kept and must not
-          // be re-attached a second time.
-          const auditDomain = digest.length > 0 ? `${modelText}\n\n${digest}` : modelText
+          // be re-attached a second time. The audit domain carries the
+          // UNREDACTED digest on purpose — anchors are compared verbatim,
+          // and a masked digest would count its own anchors as missing.
+          const auditDomain = digestRaw.length > 0 ? `${modelText}\n\n${digestRaw}` : modelText
           const evidenceOptions = fitEvidenceOptions({}, Math.floor(maxChars * 0.25))
           const anchors = extractAnchors(shadowed.map(message => ({
             role: message.role,
@@ -4517,7 +4530,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
           })), evidenceOptions)
           const poolCapped = anchorsPoolCapped(anchors, evidenceOptions)
           let audit = auditEvidence(anchors, auditDomain, evidenceOptions, poolCapped)
-          let candidate = renderEvidenceSection(audit)
+          // Missing anchors are re-attached VERBATIM — the channel most likely
+          // to quote a raw error line containing a credential — so the
+          // rendered block crosses redaction before any budget math sees it.
+          let candidate = redactCredentials(renderEvidenceSection(audit))
           if (candidate.length > 0 && modelText.length + candidate.length + 2 > maxChars) {
             // The re-attached block must fit the SAME budget: tighten the
             // model's share (same cumulative text-block clip), then re-audit
@@ -4541,9 +4557,9 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
               .map(block => block.text)
               .join('\n')
               .trim()
-            const tightened = digest.length > 0 ? `${modelText}\n\n${digest}` : modelText
+            const tightened = digestRaw.length > 0 ? `${modelText}\n\n${digestRaw}` : modelText
             audit = auditEvidence(anchors, tightened, evidenceOptions, poolCapped)
-            candidate = renderEvidenceSection(audit)
+            candidate = redactCredentials(renderEvidenceSection(audit))
           }
           if (candidate.length > 0) {
             evidenceSection = candidate
@@ -4562,7 +4578,11 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       // The degradation header stays on the SURFACE copy (result.summary)
       // only: the durable copies must not persist a transient provider error
       // into the folded_ranges summary and the mid-tier memory.
-      const text = [digest, stripExtractiveHeader(modelText), evidenceSection].filter(Boolean).join('\n\n')
+      // Belt-and-braces: every component above is already redacted at its own
+      // channel (digest, evidence, and the summarize exits for modelText), and
+      // redactCredentials is idempotent — wrapping the composition means any
+      // FUTURE verbatim channel added here inherits the line automatically.
+      const text = redactCredentials([digest, stripExtractiveHeader(modelText), evidenceSection].filter(Boolean).join('\n\n'))
       if (text.length > 0) {
         // One place records compaction savings for BOTH lanes (durable and
         // fold), using the plugin's CJK-aware surface estimate.
