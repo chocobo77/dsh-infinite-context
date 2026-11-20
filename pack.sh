@@ -131,7 +131,19 @@ if (problems.length > 0) {
 console.log("    patch entries: " + subs.length + "，全部可解析" + (pkg.dsh?.client ? "；client 半已声明且裸包名条目在位" : ""));
 ' || fail "bundle.patch.yml/dsh.client 与 exports 不一致（安装后 loader 将无法加载对应模块）。"
 
-hash="$(sha256sum "$tgz" | cut -d' ' -f1)"
+# 哈希三条路，探测后使用：MSYS bash 未必带 sha256sum 或 openssl，pipefail 下
+# 第一条缺失会直接中断脚本；node 是本项目的硬依赖，所以是永远可用的兜底。
+hash=""
+if command -v sha256sum >/dev/null 2>&1; then
+  hash="$(sha256sum "$tgz" | cut -d' ' -f1)"
+elif command -v openssl >/dev/null 2>&1; then
+  hash="$(openssl dgst -sha256 -r "$tgz" | cut -d' ' -f1)"
+else
+  hash="$(node -e 'const c=require("crypto"),f=require("fs");console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$tgz")"
+fi
+if [ -z "$hash" ]; then
+  fail "无法计算 sha256（sha256sum / openssl / node 都不可用）。"
+fi
 printf '%s  %s\n' "$hash" "$tgz_name" > "$OUT_DIR/SHA256SUMS.txt"
 echo "    sha256: $hash"
 
