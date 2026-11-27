@@ -486,7 +486,12 @@ async function summarizeMemoriesWithLlm(
       provider,
       model,
       messages,
-      maxTokens: config.maxTokens,
+      // HARD CAP = the per-call target (+ 25% tail headroom, clamped to the
+      // output cap): local quantized models ignore the prose "aim for ~N
+      // tokens" instruction and generate to the configured cap — 10,000-token
+      // outputs for 6k-token segments at 2.5 minutes each were the 2026-11-27
+      // fold stall. The hard cap makes the target real.
+      maxTokens: Math.min(outputCap, Math.floor(targetTokens * 1.25) + 64),
       purpose: 'compaction',
       ...(signal === undefined ? {} : { signal }),
     }
@@ -548,6 +553,55 @@ async function summarizeMemoriesWithLlm(
     return mergeOnce(parts, `${purpose} (final merge)`, true)
   }
   return mergeOnce(texts, purpose, false)
+}
+
+/**
+ * One fold-segment summary call with a HARD output cap. The host summarizer
+ * sends `config.maxTokens` as the request's max_tokens; local quantized
+ * models ignore the prose "aim for ~N tokens" instruction and generate to
+ * that cap — 10,000-token outputs for 6k-token segments at ~2.5 minutes each
+ * were the 2026-11-27 fold stall (a ~90k-token region × ~15 segments ×
+ * doubled by the resilience retry ≈ an hour of frozen surface). This call
+ * mirrors the host summarizer's envelope (tools, toolHistory, sessionId,
+ * purpose) but sends the segment's OWN ~30% target (+25% tail headroom) as
+ * the hard cap, so each segment lands in tens of seconds with a dense note.
+ */
+async function summarizeSegmentWithLlm(
+  ctx: Context,
+  config: ResolvedConfig,
+  target: SummarizationTarget,
+  agent: Agent,
+  input: SummarizationInput,
+  outputCap: number,
+  signal?: AbortSignal,
+): Promise<SummaryResult> {
+  const options: GenerateOptions = {
+    provider: target.provider,
+    model: target.model,
+    messages: [...input.messages] as GenerateOptions['messages'],
+    toolHistory: agent.session.toolHistory(),
+    ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
+    maxTokens: outputCap,
+    sessionId: agent.session.id,
+    purpose: 'compaction',
+    ...(signal === undefined ? {} : { signal }),
+  }
+  const assembler = new BlockAssembler()
+  for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
+  const error = finishError(assembler.finish)
+  if (error !== undefined) throw error
+  const summary = assembler.blocks()
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+  if (!summary.some(block => block.text.trim().length > 0)) {
+    throw new Error('summarization produced no text summary content')
+  }
+  return {
+    summary,
+    provider: target.provider,
+    model: target.model,
+    maxTokens: outputCap,
+    ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
+  } satisfies SummaryResult
 }
 
 /* -------------------------------------------------------------------------- */
