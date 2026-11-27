@@ -3188,6 +3188,37 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
         range = null
       }
     }
+    // NON-BLOCKING FOLD (2026-11-27 "死循环" incident): the blocking chunked
+    // summarization of a ~90k-token region froze the turn for 8-30+ minutes
+    // on a slow local model — segments generating to their caps, doubled by
+    // the resilience retry, the surface unable to move while the model
+    // "repeatedly produced replies". When the fold is ROUTINE (pressure or
+    // nudge — not a rescue lane) and the surface still has real room (well
+    // below the physical fit boundary of the window), the fold is DEFERRED
+    // instead: the summarization runs in the BACKGROUND via the speculation
+    // launcher (a detached 30-minute budget — nobody waits on it), and the
+    // NEXT pre-step consumes the prepared checkpoint and commits instantly.
+    // Only genuine overflow risk (surface at/above the physical fit line) or
+    // a rescue lane still blocks and folds synchronously.
+    const completionReserve = Math.min(this.config.maxTokens ?? 8192, Math.floor(window * 0.25))
+    const fitLine = window - completionReserve - 2048
+    const routine = plan.reason === 'pressure' || plan.reason === 'nudge'
+    if (!force && !speculationUsed && routine && snapshot.surfaceTokens < fitLine) {
+      void this.maybeSpeculate({
+        agent,
+        session,
+        sessionId,
+        plan,
+        snapshot,
+        meter,
+        pressureBudget,
+        force: true,
+      }).catch(() => {
+        // The background speculation never breaks the step it defers.
+      })
+      diag(`fold:deferred;surf=${snapshot.surfaceTokens};fitLine=${fitLine};background=1`)
+      return null
+    }
     let escalated = false
     if (range === null) {
       range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), importanceKeep)
@@ -3685,6 +3716,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     snapshot: SurfaceSnapshot
     meter: TokenMeasurement
     pressureBudget: number
+    /**
+     * Deferred-fold launch (2026-11-27 non-blocking fold): skip the
+     * predictive-timing gate and carry a generous background budget — the
+     * caller has ALREADY decided to fold this step and chose to defer, so
+     * nobody is waiting on the call.
+     */
+    force?: boolean
   }): Promise<void> {
     if (!resolveSpeculativeFold(this.config)) return
     if (input.plan.surfaceTriggerTokens <= 0) return
@@ -3698,7 +3736,10 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     // checkpoint sat stale through refresh cycles).
     const growthRate = this.compressor.growthRateOf(input.sessionId)
     const latencyMs = this.routeLatency(input.session)
-    if (!speculationDue({
+    // Deferred-fold launches skip the predictive gate: the caller already
+    // decided to defer THIS step's fold, so the background call starts now
+    // regardless of the predicted crossing time.
+    if (input.force !== true && !speculationDue({
       surfaceTokens: input.snapshot.surfaceTokens,
       triggerTokens: input.plan.surfaceTriggerTokens,
       ...(growthRate === undefined ? {} : { growthRate }),
@@ -3738,14 +3779,17 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
       if (this.speculationStalled(input.sessionId)) return
       this.speculativeInFlight.add(input.sessionId)
       const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
+      // Deferred launches carry a 30-minute background budget: nobody waits
+      // on the call, and a slow local model must never abort mid-summary.
+      const deadlineMs = input.force === true ? Math.max(timeoutMs, 1_800_000) : timeoutMs
       // Wrapper disabled (timeout 0): the speculative path cannot honor it
       // (its calls are raw super.summarize with a hard AbortSignal) — skip;
       // the live fold path bypasses the wrapper itself.
-      if (timeoutMs <= 0) {
+      if (deadlineMs <= 0) {
         this.speculativeInFlight.delete(input.sessionId)
         return
       }
-      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, startCallId, endCallId, timeoutMs)
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, startCallId, endCallId, deadlineMs)
       return
     }
     // REFRESH: merge the delta (everything after the cached range end) into
@@ -3789,11 +3833,13 @@ export class MemoryCompactionEngine extends BasicCompactionEngine {
     if (this.speculationStalled(input.sessionId)) return
     this.speculativeInFlight.add(input.sessionId)
     const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
-    if (timeoutMs <= 0) {
+    // Deferred-refresh launches carry the same 30-minute background budget.
+    const deadlineMs = input.force === true ? Math.max(timeoutMs, 1_800_000) : timeoutMs
+    if (deadlineMs <= 0) {
       this.speculativeInFlight.delete(input.sessionId)
       return
     }
-    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, endCallId, timeoutMs, existing)
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, endCallId, deadlineMs, existing)
   }
 
   /**
