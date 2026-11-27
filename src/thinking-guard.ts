@@ -20,26 +20,22 @@
  * the exact same path as a provider overflow: compact durably → retry with
  * room.
  *
- * ## The dynamic trigger line
+ * ## The guard line
  *
- * The plugin can only "take a breath" (compact) if the CURRENT model still has
- * enough REMAINING context to run the compression itself: the compaction
- * replays the compactable surface (≈ the request input) through a summarizer
- * call and must fit that input + the summary output + the system/tools prefix
- * in the window. So the guard fires when
+ * The line is the request's PHYSICAL fit boundary:
  *
- *   input + output >= window − reserve
+ *   line = min(window − completionReserve − GUARD_MARGIN, floor(window × ratio))
  *
- * where the reserve is DYNAMIC:
- *
- *   reserve = systemToolsTokens + summaryOutputEstimate + GUARD_MARGIN
- *
- * — it grows with the current request's own system/tools size and with the
- * summary the compaction would need to produce for this input, and it follows
- * whichever model the session is calling right now (live probe for local /
- * settings declaration for online, via the per-model registry). A takeover
- * whose input is ALREADY over the line is compacted before any output, so the
- * agent never wastes a generation it cannot finish.
+ * The guard is a pre-flight impossibility door, not a routine compactor: it
+ * aborts only when input plus the completion the request needs cannot fit the
+ * window — the point where sending is guaranteed to fail and the durable lane
+ * is the only way out. Routine pressure belongs to the fold lane, whose
+ * trigger sits far below this line by design; the guard deliberately does not
+ * compete with it. (2026-11-27: the earlier line reserved replay room for the
+ * guard's own compaction — system/tools + a 30% summary estimate — and sat at
+ * 43% of the window; fresh sessions with a large fixed prefix aborted into an
+ * unwinnable compaction spiral: foldable surface 351 tokens against a
+ * required removal of 8,271.)
  *
  * The pure decision helpers are exported for unit testing; the cordis wiring
  * lives in {@link registerThinkingGuard}.
@@ -54,11 +50,8 @@ import { estimateContentTokens, estimateTokens } from './token-budget.ts'
 /** Default ceiling: the guard never waits past this fraction of the window. */
 export const DEFAULT_GUARD_RATIO = 0.9
 
-/** Fixed safety margin reserved beyond system/tools + the summary output. */
+/** Fixed safety margin reserved beyond the completion. */
 export const GUARD_MARGIN = 2048
-
-/** Minimum summary-output estimate the reserve always carries. */
-const MIN_SUMMARY_OUTPUT = 300
 
 /** Clamp a configured guard ratio into the supported range. */
 export function clampGuardRatio(ratio: number): number {
@@ -126,47 +119,54 @@ export function estimateSystemToolsTokens(request: {
 }
 
 /**
- * Estimate the summary the compaction would need to produce for an input of
- * `inputTokens`: a dense ~30% compression, clamped to a safety margin below
- * `maxTokens` (mirrors the plugin's summarization target).
- */
-export function estimateSummaryOutputTokens(inputTokens: number, maxTokens = 8192): number {
-  const cap = Math.max(400, Math.floor((maxTokens > 0 ? maxTokens : 8192) * 0.7))
-  return Math.min(cap, Math.max(MIN_SUMMARY_OUTPUT, Math.floor(inputTokens * 0.3)))
-}
-
-/**
- * Compute the dynamic trigger line (in tokens) for one request:
+ * Compute the guard line (in tokens) for one request — the PHYSICAL fit
+ * boundary of the current model:
  *
- *   line = min(window − reserve, floor(window × ratio))
+ *   line = min(window − completionReserve − GUARD_MARGIN, floor(window × ratio))
  *
- * `window − reserve` guarantees the CURRENT model's remaining context after the
- * trigger is enough to run the plugin's own compression (system/tools + the
- * summary replay + a fixed margin); `floor(window × ratio)` is the ceiling so
- * the guard never waits past `ratio` of the window even when the reserve is
- * tiny. Returns `undefined` when the window is unknown, non-positive, or so
- * small that the line cannot rise above the fixed system/tools prefix (no
- * compression can rescue such a request, so a trigger would fire forever).
+ * The guard is a pre-flight impossibility door, not a routine compactor: it
+ * aborts only when input plus the completion the request needs cannot fit the
+ * window — the point where sending is guaranteed to fail and the durable lane
+ * is the only way out. Routine pressure belongs to the fold lane, whose
+ * trigger sits far below this line by design.
+ *
+ * The completion reserve models the REQUEST's own cap: a `maxTokens` at or
+ * above the whole window is the "never truncate" declaration and carries no
+ * information about the next completion (placeholder 8192); otherwise it is
+ * honored but never above a quarter of the window. The earlier line reserved
+ * replay room for the guard's own compaction (system/tools + a 30% summary
+ * estimate) — with the summarizer running as its own small request that
+ * reserve was obsolete, and on the 2026-11-27 deployment it pushed the line
+ * to 27,750 against a 65,536-token server: a perfectly servable 37,731-token
+ * opening request was aborted into an unwinnable compaction spiral (foldable
+ * surface: 351 tokens; required removal: 8,272). Returns `undefined` when the
+ * window is unknown, non-positive, or so small that the line cannot rise
+ * above the fixed system/tools prefix (no compaction can rescue such a
+ * request, so a trigger would fire forever).
  */
 export function computeGuardLine(
   window: number,
-  inputTokens: number,
   systemToolsTokens: number,
   maxTokens: number,
   ratio: number,
 ): number | undefined {
   if (!Number.isFinite(window) || window <= 0) return undefined
-  if (inputTokens < 0 || systemToolsTokens < 0) return undefined
-  const reserve = systemToolsTokens + estimateSummaryOutputTokens(inputTokens, maxTokens) + GUARD_MARGIN
+  if (systemToolsTokens < 0) return undefined
+  const requested = Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 0
+  // At/above the window: "never truncate" — the declaration carries no
+  // information about how much room the next completion needs; assume a
+  // generous agent output instead.
+  const placeholder = requested === 0 || requested >= window ? 8192 : requested
+  const completionReserve = Math.min(placeholder, Math.floor(window * 0.25))
   const ceiling = Math.floor(window * clampGuardRatio(ratio))
-  const dynamicLine = Math.floor(window - reserve)
+  const line = Math.floor(window - completionReserve - GUARD_MARGIN)
   // A line at or below the fixed prefix is not a trigger, it is a guarantee: no
-  // compression can bring the request under it, so clamping to 1 would fire
+  // compaction can bring the request under it, so clamping to 1 would fire
   // before EVERY generation until the retry cap and a small-window model could
   // never answer. Stand down and let the provider's own overflow path — which
   // can itself compact — handle the request instead.
-  if (dynamicLine <= systemToolsTokens) return undefined
-  return Math.min(dynamicLine, ceiling)
+  if (line <= systemToolsTokens) return undefined
+  return Math.min(line, ceiling)
 }
 
 /**
@@ -239,7 +239,10 @@ export interface ThinkingGuardDeps {
   readonly enabled: boolean
   /** The configured ceiling ratio (clamped internally). */
   readonly ratio: number
-  /** The configured summarization max output (for the summary reserve). */
+  /**
+   * The request completion cap feeding the fit reserve: honored up to 25% of
+   * the window, placeholder 8192 when it is 0 or at/above the window.
+   */
   readonly maxTokens: number
   /** Exact-agent-request test (`isAgentLoopRequest`); false skips the guard. */
   readonly isAgentLoopRequest: (request: GenerateOptions) => boolean
@@ -275,7 +278,7 @@ export function registerThinkingGuard(ctx: Context, deps: ThinkingGuardDeps): ()
       if (window === undefined || window <= 0) return next()
       const inputTokens = estimateRequestTokens(options)
       const systemToolsTokens = estimateSystemToolsTokens(options)
-      const guardLine = computeGuardLine(window, inputTokens, systemToolsTokens, deps.maxTokens, deps.ratio)
+      const guardLine = computeGuardLine(window, systemToolsTokens, deps.maxTokens, deps.ratio)
       if (guardLine === undefined) return next()
       if (inputTokens >= guardLine) {
         // Takeover backstop: the input ALONE already reaches the dynamic line —
