@@ -347,7 +347,10 @@ function finishError(finish: FinishReason): Error | undefined {
       return error
     }
     case 'max-tokens':
-      return new Error('memory consolidation truncated at the token cap (incomplete summary)')
+      return Object.assign(
+        new Error('memory consolidation truncated at the token cap (incomplete summary)'),
+        { code: 'max-tokens' },
+      )
     default:
       return undefined
   }
@@ -417,7 +420,7 @@ async function summarizeMemoriesWithLlm(
   const resolved = target ?? resolveSummarizationTarget(config)
   if (resolved === undefined) {
     throw new Error(
-      'memory pyramid consolidation requires summarizationProvider/Model configured '
+      'memory consolidation requires summarizationProvider/Model configured '
       + 'or a session-routed model',
     )
   }
@@ -428,66 +431,123 @@ async function summarizeMemoriesWithLlm(
   // is pinned at the cap and the model CANNOT finish: production 2026-11-18
   // produced three consecutive `sleep:failed=…token cap` rows merging eight
   // large checkpoints (~120k CJK tokens of input against a 7000-token cap).
-  // Clip each text to its proportional share of the affordable input, then
-  // re-meter. The clipped-away detail stays in the original checkpoint rows —
-  // the merge narrows its scope, it does not delete anything.
   const outputCap = Math.floor((config.maxTokens ?? 4096) * 0.7)
   const inputBudgetTokens = Math.max(1024, Math.floor(outputCap / SUMMARY_OUTPUT_SHARE))
+
+  /** Proportionally clip a batch to the affordable input; the clipped-away
+   *  detail stays in the original checkpoint rows — the merge narrows its
+   *  scope, it does not delete anything. */
+  const clipBatch = (batch: readonly string[]): readonly string[] => {
+    const total = batch.reduce((sum, text) => sum + estimateTokens(text), 0)
+    if (total <= inputBudgetTokens) return batch
+    return batch
+      .map(text => {
+        const share = Math.floor(estimateTokens(text) * (inputBudgetTokens / total))
+        return share < 64 ? '' : clipToTokens(text, share)
+      })
+      .filter(text => text.length > 0)
+  }
+
+  /** One merge call over a batch. `preClipped` marks a batch that already had
+   *  the proportional clip applied, disabling the single clip-retry below. */
+  const mergeOnce = async (
+    batch: readonly string[],
+    label: string,
+    preClipped: boolean,
+  ): Promise<string> => {
+    const clipped = preClipped ? batch : clipBatch(batch)
+    const textsJoined = clipped.join('\n')
+    const inputTokens = estimateTokens(textsJoined)
+    const targetTokens = summarizationTargetTokens(config, inputTokens)
+    const instruction = [
+      label,
+      '',
+      'Rules:',
+      '- PRESERVE verbatim: code snippets, file paths, function names, config values, decisions, goals, and open questions',
+      '- DROP stale or redundant detail that is no longer actionable',
+      '- De-duplicate facts that appear in multiple memories',
+      '- PRESERVE the original language of each memory — do NOT translate',
+      '- NEVER invent facts that are not present in the memories',
+      '- Keep the summary self-contained: it must make sense without the source memories',
+      '',
+      `Output budget: the input is ~${inputTokens} tokens. Aim for ~${targetTokens} tokens of`,
+      'output (a dense ~30% compression). Stay well under this; do not pad or repeat.',
+      '',
+      ...clipped.map((text, index) => `--- Memory ${index + 1} ---\n${text}`),
+    ].join('\n')
+    const assembler = new BlockAssembler()
+    const messages: Message[] = [
+      createUserMessage({
+        content: [{ type: 'text', text: instruction }],
+        source: { kind: 'plugin:' + PLUGIN } as any,
+      }),
+    ]
+    const options: GenerateOptions = {
+      provider,
+      model,
+      messages,
+      maxTokens: config.maxTokens,
+      purpose: 'compaction',
+      ...(signal === undefined ? {} : { signal }),
+    }
+    for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
+    const error = finishError(assembler.finish)
+    if (error !== undefined) {
+      // LETTA-STYLE SMALL CHUNKS, MULTIPLE PASSES (2026-11-27): a model that
+      // overshoots the output cap on the unclipped batch gets exactly one
+      // retry on the clipped batch — guaranteed to fit the affordable input.
+      // A second truncation still fails closed (same ledger row as before).
+      if ((error as { code?: string }).code === 'max-tokens' && !preClipped) {
+        return mergeOnce(clipBatch(batch), label, true)
+      }
+      throw error
+    }
+    if (contentHasImage(assembler.blocks())) {
+      throw new LlmError('memory consolidation cannot contain image output', 'UNSUPPORTED_CONTENT')
+    }
+    const text = assembler.blocks()
+      .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+      .trim()
+    if (text.length === 0) throw new Error('memory consolidation produced no text content')
+    return text
+  }
+
+  // LETTA-STYLE SMALL CHUNKS, MULTIPLE PASSES (2026-11-27): one big merge call
+  // betting the model on a 30% compression of many checkpoints is where local
+  // quantized models blow the output cap ('max-tokens' → sleep:failed, five
+  // occurrences in the 11-26 audit). Batches sized to HALF the affordable
+  // input make every call's 30% target sit well under the cap; the part
+  // summaries merge in one final pass. Sequential calls: a local server
+  // queues generation anyway. Small inputs (or few memories) keep the single
+  // call path.
   const rawTokens = texts.reduce((sum, text) => sum + estimateTokens(text), 0)
-  if (rawTokens > inputBudgetTokens) {
-    const scale = inputBudgetTokens / rawTokens
-    texts = texts.map(text => {
-      const share = Math.floor(estimateTokens(text) * scale)
-      return share < 64 ? '' : clipToTokens(text, share)
-    }).filter(text => text.length > 0)
+  const halfBudget = Math.max(1024, Math.floor(inputBudgetTokens / 2))
+  if (texts.length >= 2 && rawTokens > halfBudget) {
+    const bins: string[][] = []
+    let bin: string[] = []
+    let binTokens = 0
+    for (const text of texts) {
+      const size = estimateTokens(text)
+      // A single text larger than halfBudget rides alone; mergeOnce's clip
+      // caps it to the affordable input.
+      if (bin.length > 0 && binTokens + size > halfBudget) {
+        bins.push(bin)
+        bin = []
+        binTokens = 0
+      }
+      bin.push(text)
+      binTokens += size
+    }
+    if (bin.length > 0) bins.push(bin)
+    const parts: string[] = []
+    for (let i = 0; i < bins.length; i += 1) {
+      parts.push(await mergeOnce(bins[i]!, `${purpose} (part ${i + 1}/${bins.length})`, false))
+    }
+    return mergeOnce(parts, `${purpose} (final merge)`, true)
   }
-  const textsJoined = texts.join('\n')
-  const inputTokens = estimateTokens(textsJoined)
-  const targetTokens = summarizationTargetTokens(config, inputTokens)
-  const instruction = [
-    purpose,
-    '',
-    'Rules:',
-    '- PRESERVE verbatim: code snippets, file paths, function names, config values, decisions, goals, and open questions',
-    '- DROP stale or redundant detail that is no longer actionable',
-    '- De-duplicate facts that appear in multiple memories',
-    '- PRESERVE the original language of each memory — do NOT translate',
-    '- NEVER invent facts that are not present in the memories',
-    '- Keep the summary self-contained: it must make sense without the source memories',
-    '',
-    `Output budget: the input is ~${inputTokens} tokens. Aim for ~${targetTokens} tokens of`,
-    'output (a dense ~30% compression). Stay well under this; do not pad or repeat.',
-    '',
-    ...texts.map((text, index) => `--- Memory ${index + 1} ---\n${text}`),
-  ].join('\n')
-  const assembler = new BlockAssembler()
-  const messages: Message[] = [
-    createUserMessage({
-      content: [{ type: 'text', text: instruction }],
-      source: { kind: 'plugin:' + PLUGIN } as any,
-    }),
-  ]
-  const options: GenerateOptions = {
-    provider,
-    model,
-    messages,
-    maxTokens: config.maxTokens,
-    purpose: 'compaction',
-    ...(signal === undefined ? {} : { signal }),
-  }
-  for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
-  const error = finishError(assembler.finish)
-  if (error !== undefined) throw error
-  if (contentHasImage(assembler.blocks())) {
-    throw new LlmError('memory consolidation cannot contain image output', 'UNSUPPORTED_CONTENT')
-  }
-  const text = assembler.blocks()
-    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
-    .map(block => block.text)
-    .join('\n')
-    .trim()
-  if (text.length === 0) throw new Error('memory consolidation produced no text content')
-  return text
+  return mergeOnce(texts, purpose, false)
 }
 
 /* -------------------------------------------------------------------------- */
