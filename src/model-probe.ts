@@ -1,0 +1,269 @@
+/**
+ * Live model-context probing for local servers whose model listing does not
+ * advertise a context window.
+ *
+ * The plugin normally adopts the context window DSH already resolved from the
+ * model catalog (online providers) or from an OpenAI-compatible `/models`
+ * listing (gateways like llama-server / vLLM / LiteLLM). Some local servers —
+ * notably Ollama — never report `context_length` on their listing, so this
+ * module speaks each server's native endpoint as a fallback:
+ *
+ * - `llama`   → `GET /props`          (`default_generation_settings.n_ctx`)
+ * - `ollama`  → `POST /api/show`      (`model_info['llama.context_length']`)
+ * - `openai`  → `GET /models`         (`context_length`/`context_window`/`max_model_len`)
+ *
+ * Every probe is best-effort: a failure returns `undefined` and never throws
+ * into the caller. Probes are bounded by a timeout so a dead local server
+ * cannot stall the request path (probing runs off the request path anyway).
+ *
+ * @module dsh-infinite-context/model-probe
+ */
+
+import type { ModelProbeKind } from './config.ts'
+
+/** Timeout for one live probe, in milliseconds. */
+export const PROBE_TIMEOUT_MS = 5000
+
+/** Hostnames that unambiguously point back at this machine. */
+const LOOPBACK_HOSTS = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '::',
+  '0.0.0.0',
+  '::ffff:127.0.0.1',
+  '::ffff:7f00:1', // Node's normalized form of ::ffff:127.0.0.1
+])
+
+/**
+ * Whether a hostname denotes a LOCAL server (loopback or an RFC1918 private
+ * LAN address), as opposed to a public online API. The probe path uses this to
+ * decide which models deserve a live context probe: local models are probed
+ * for their REAL runtime context, while online models are trusted at the
+ * window settings/DSH declared for them (and probing them would just hit a
+ * remote endpoint that neither advertises `context_length` nor answers
+ * unauthenticated).
+ */
+export function isLocalHostname(host: string): boolean {
+  // `URL.hostname` keeps the brackets around an IPv6 literal (`[::1]`), and a
+  // dotted IPv4-mapped literal is normalized to hex (`::ffff:7f00:1`); both
+  // spellings must resolve to local or a server on ::1 is never context-probed.
+  const normalized = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+  if (normalized.length === 0) return false
+  if (LOOPBACK_HOSTS.has(normalized)) return true
+  if (normalized.startsWith('10.')) return true
+  if (normalized.startsWith('192.168.')) return true
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(normalized)) return true
+  return false
+}
+
+/**
+ * Whether a base URL points at a LOCAL server (loopback / RFC1918 private LAN
+ * host). A provider whose baseURL passes this check is eligible for a live
+ * context probe; public online APIs never are. An unparseable or empty URL is
+ * non-local — the safe default (no probe).
+ */
+export function isLocalBaseURL(baseURL: string): boolean {
+  if (typeof baseURL !== 'string' || baseURL.length === 0) return false
+  try {
+    return isLocalHostname(new URL(baseURL).hostname)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One LLM provider's settings location, exactly as
+ * `ctx.llm.listConfigurableProviders()` reports it.
+ */
+export interface ConfigurableProviderSettings {
+  readonly provider: string
+  readonly settingsNs: string
+  readonly settingsPath?: readonly string[]
+}
+
+/** One namespace entry, exactly as `ctx.settings.describe()` reports it. */
+export interface SettingsNamespaceEntry {
+  readonly ns: string
+  readonly value?: unknown
+}
+
+/**
+ * Resolve one provider's settings profile: find its namespace among the
+ * described settings and walk the provider's `settingsPath` into the namespace
+ * value (an `llm-pi-ai` provider lives at `value.providers[provider]`). Returns
+ * `undefined` when the namespace, any path segment, or the profile is missing.
+ */
+export function providerProfile(
+  namespaces: readonly SettingsNamespaceEntry[],
+  provider: ConfigurableProviderSettings | undefined,
+): Record<string, unknown> | undefined {
+  if (provider === undefined) return undefined
+  let value: unknown = namespaces.find(entry => entry.ns === provider.settingsNs)?.value
+  for (const key of provider.settingsPath ?? []) {
+    value = typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined
+  }
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+/**
+ * The provider's configured `baseURL`, or `undefined` when its profile carries
+ * no usable URL (a blank value counts as absent, so callers keep their safe
+ * default of treating the provider as remote).
+ */
+export function providerBaseURL(
+  namespaces: readonly SettingsNamespaceEntry[],
+  provider: ConfigurableProviderSettings | undefined,
+): string | undefined {
+  const url = providerProfile(namespaces, provider)?.baseURL
+  return typeof url === 'string' && url.length > 0 ? url : undefined
+}
+
+/** A positive integer field, or `undefined` when absent/unusable. */
+function positiveInt(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const n = Number(value)
+    if (Number.isInteger(n) && n > 0) return n
+  }
+  return undefined
+}
+
+/** A non-empty string field, or `undefined`. */
+function label(...candidates: readonly unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.length > 0) return candidate
+  }
+  return undefined
+}
+
+/** Join a base URL with a path, keeping any deployment prefix segments. */
+function joinPath(baseURL: string, path: string): string {
+  return `${baseURL.replace(/\/+$/, '')}${path}`
+}
+
+/**
+ * Fetch JSON with the probe timeout covering the WHOLE exchange — headers AND
+ * body. Clearing the timer as soon as `fetch` resolved covered only the headers,
+ * so a server that answered with headers and then stalled the body hung the
+ * probe forever, contradicting this module's "probes are bounded by a timeout".
+ * Resolves to `null` on a transport failure, a non-OK status, or a non-JSON body.
+ */
+async function boundedFetchJson(url: string, init?: RequestInit): Promise<Record<string, unknown> | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    if (!response.ok) return null
+    const body: unknown = await response.json()
+    return typeof body === 'object' && body !== null ? body as Record<string, unknown> : null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** `GET /props` on llama-server: the effective `n_ctx` of the running model. */
+export async function probeLlama(baseURL: string): Promise<number | undefined> {
+  const body = await boundedFetchJson(joinPath(baseURL, '/props'))
+  if (body === null) return undefined
+  const settings = body.default_generation_settings as Record<string, unknown> | undefined
+  return positiveInt(settings?.n_ctx) ?? positiveInt(body.n_ctx)
+}
+
+/** `POST /api/show` on Ollama: the loaded model's context length. */
+export async function probeOllama(baseURL: string, model?: string): Promise<number | undefined> {
+  const name = label(model)
+  if (name === undefined) return undefined
+  const body = await boundedFetchJson(joinPath(baseURL, '/api/show'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: name }),
+  })
+  if (body === null) return undefined
+  const info = body.model_info as Record<string, unknown> | undefined
+  const params = body.parameters as Record<string, unknown> | undefined
+  return positiveInt(info?.['llama.context_length']) ?? positiveInt(params?.num_ctx)
+}
+
+/** Context-length fields advertised by standard OpenAI-compatible `/models` listings. */
+const CONTEXT_FIELDS = ['context_length', 'context_window', 'max_model_len', 'n_ctx'] as const
+
+/**
+ * Context-length fields reported by local servers' NATIVE listings that never
+ * advertise one on their OpenAI-compatible surface — LM Studio's
+ * `/api/v0/models` reports the loaded model's runtime context here.
+ */
+const NATIVE_CONTEXT_FIELDS = ['max_total_tokens', 'max_completion_tokens', 'n_ctx'] as const
+
+/**
+ * Read a context length from one listing entry: first the entry's own fields,
+ * then the nested `meta` object. llama-server's OpenAI-compatible listing
+ * reports the runtime context only as `meta.n_ctx` (never as a top-level
+ * `context_length`), so without this fallback the probe would not discover
+ * the real `--ctx-size` of a local llama.cpp model.
+ */
+function entryContext(entry: Record<string, unknown>, fields: readonly string[]): number | undefined {
+  for (const field of fields) {
+    const found = positiveInt(entry[field])
+    if (found !== undefined) return found
+  }
+  const meta = entry.meta
+  if (typeof meta === 'object' && meta !== null) {
+    const record = meta as Record<string, unknown>
+    for (const field of fields) {
+      const found = positiveInt(record[field])
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
+
+/** Read a context length from a `{ data: [...] }` listing, filtered by model id. */
+async function probeListing(
+  url: string,
+  model: string | undefined,
+  fields: readonly string[],
+): Promise<number | undefined> {
+  const body = await boundedFetchJson(url)
+  if (body === null) return undefined
+  const data = body.data
+  if (!Array.isArray(data)) return undefined
+  const name = label(model)
+  const entries = name === undefined
+    ? data
+    : data.filter(entry => (entry as { id?: unknown })?.id === name)
+  for (const raw of entries) {
+    // Listings are remote input: a null or primitive entry must be skipped, not
+    // dereferenced — every probe is best-effort and never throws into its caller.
+    if (typeof raw !== 'object' || raw === null) continue
+    const found = entryContext(raw as Record<string, unknown>, fields)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/** `GET /models` (OpenAI-compatible), with an LM Studio native fallback. */
+export async function probeOpenAI(baseURL: string, model?: string): Promise<number | undefined> {
+  // Standard OpenAI-compatible listing first (vLLM / llama-server / LiteLLM).
+  const fromModels = await probeListing(joinPath(baseURL, '/models'), model, CONTEXT_FIELDS)
+  if (fromModels !== undefined) return fromModels
+  // LM Studio's /v1/models never advertises a context length, but its native
+  // /api/v0/models reports the loaded model's runtime context (max_total_tokens).
+  const nativeBase = baseURL.replace(/\/v1$/, '')
+  return probeListing(joinPath(nativeBase, '/api/v0/models'), model, NATIVE_CONTEXT_FIELDS)
+}
+
+/** Probe the configured local server for a model's context window. */
+export async function probeModelContext(
+  config: { enabled: boolean; kind: ModelProbeKind; baseURL: string },
+  model?: string,
+): Promise<number | undefined> {
+  if (!config.enabled || config.baseURL.length === 0) return undefined
+  switch (config.kind) {
+    case 'llama': return probeLlama(config.baseURL)
+    case 'ollama': return probeOllama(config.baseURL, model)
+    case 'openai': return probeOpenAI(config.baseURL, model)
+  }
+}

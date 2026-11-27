@@ -1,0 +1,1320 @@
+/**
+ * A SQLite-backed persistent store for memory documents.
+ *
+ * Uses Node's built-in `node:sqlite` (`DatabaseSync`), the same medium DSH's
+ * own `storage-sqlite` backend uses, so no native `sqlite3` dependency is
+ * required. Embeddings are stored as `Float32` BLOBs; `mergedFrom` as JSON.
+ *
+ * @module dsh-infinite-context/memory-store
+ */
+
+import { randomUUID } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { IN_MEMORY_STORE } from './config.ts'
+import type { MemoryDoc, MemoryKind, Tier } from './types.ts'
+
+/** Serialize a vector to a Float32 BLOB payload. */
+function vectorToBlob(vector: readonly number[]): Buffer {
+  const f32 = new Float32Array(vector.length)
+  for (let i = 0; i < vector.length; i++) f32[i] = vector[i]
+  return Buffer.from(f32.buffer)
+}
+
+/** Deserialize a Float32 BLOB payload back to a number array. */
+function blobToVector(blob: Buffer | null | undefined): number[] | undefined {
+  if (blob === null || blob === undefined || blob.byteLength === 0) return undefined
+  const byteLength = blob.byteLength
+  if (byteLength % 4 !== 0) return undefined
+  const f32 = new Float32Array(blob.buffer, blob.byteOffset, byteLength / 4)
+  const out = new Array<number>(f32.length)
+  for (let i = 0; i < f32.length; i++) out[i] = f32[i]
+  return out
+}
+
+/**
+ * An archived oversized tool result: the exact text of a tool result that was
+ * replaced in the transcript by a short stub carrying `ref`.
+ */
+export interface ToolResultRecord {
+  readonly ref: string
+  readonly tool: string
+  readonly callId?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly chars: number
+  readonly text: string
+  /** Distilled signal lines (see absorb.ts); absent for pre-absorb rows. */
+  readonly digest?: string | undefined
+}
+
+/** A listing view of an archived result: everything but the full text. */
+export interface ToolResultMeta {
+  readonly ref: string
+  readonly tool: string
+  readonly callId?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly chars: number
+  readonly preview: string
+  /** Distilled signal lines (see absorb.ts), when the result was absorbed. */
+  readonly digest?: string | undefined
+}
+
+/**
+ * One row of the context-accounting ledger (see usage-ledger.ts): either a
+ * measurement of what the plugin did to the request, or a provider usage count.
+ */
+export interface UsageEventRecord {
+  readonly ts: number
+  readonly kind: string
+  readonly value: number
+  readonly sessionId?: string | undefined
+  readonly detail?: string | undefined
+}
+
+/** Aggregated ledger rows for one kind. */
+export interface UsageTotal {
+  readonly kind: string
+  readonly events: number
+  readonly value: number
+}
+
+/** Aggregated ledger rows for one kind, split by the `detail` label. */
+export interface UsageDetailTotal {
+  readonly kind: string
+  readonly detail: string
+  readonly events: number
+  readonly value: number
+}
+
+/**
+ * One folded (summarized) history range, archived verbatim before the summary
+ * replaced it on the surface. This is what makes compaction *reversible*: the
+ * summary stays in the conversation while the exact messages stay readable
+ * here (`memory_expand` with the ref) — the engine-layer equivalent of the
+ * upstream `decompress` tool.
+ */
+export interface FoldedRangeRecord {
+  readonly ref: string
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly messages: number
+  readonly chars: number
+  readonly tokens: number
+  readonly summary: string
+  readonly original: string
+  readonly restoredCount: number
+}
+
+/** A listing view of a folded range: everything but the original text. */
+export interface FoldedRangeMeta {
+  readonly ref: string
+  readonly sessionId?: string | undefined
+  readonly createdAt: number
+  readonly messages: number
+  readonly chars: number
+  readonly tokens: number
+  readonly preview: string
+  readonly restoredCount: number
+}
+
+/** One insert of a non-text block folded into a range (attachment JSON). */
+export interface FoldAttachmentInsert {
+  readonly msgIdx: number
+  readonly blockIdx: number
+  readonly kind: 'image' | 'file'
+  /** The serializable host attachment reference, JSON-encoded. */
+  readonly payload: string
+}
+
+/** One stored non-text block of a folded range, ref included. */
+export interface FoldAttachmentRecord extends FoldAttachmentInsert {
+  readonly ref: string
+}
+
+/** Row shape of `folded_ranges` as stored. */
+interface FoldedRangeRow {
+  ref: string
+  ts: number
+  session_id: string | null
+  messages: number
+  chars: number
+  tokens: number
+  summary: string
+  original: string
+  restored_count: number
+}
+
+/** A ledger row as stored. */
+interface UsageEventRow {
+  ts: number
+  kind: string
+  value: number
+  session_id: string | null
+  detail: string | null
+}
+
+interface MemoryRow {
+  id: string
+  tier: string
+  text: string
+  created_at: number
+  importance: number
+  source_session_id: string | null
+  source_turn_start: number | null
+  source_turn_end: number | null
+  embedding: Buffer | null
+  merged_from: string | null
+  kind: string | null
+  superseded_by: string | null
+}
+
+interface ToolResultRow {
+  ref: string
+  tool: string
+  call_id: string | null
+  session_id: string | null
+  created_at: number
+  chars: number
+  text: string
+  digest: string | null
+}
+
+interface ToolResultMetaRow {
+  ref: string
+  tool: string
+  call_id: string | null
+  session_id: string | null
+  created_at: number
+  chars: number
+  preview: string | null
+  digest: string | null
+}
+
+/** Collapse a preview blob to one short line. */
+function previewOf(text: string | null): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)
+}
+
+function rowToToolResult(row: ToolResultRow): ToolResultRecord {
+  return {
+    ref: row.ref,
+    tool: row.tool,
+    ...(row.call_id !== null ? { callId: row.call_id } : {}),
+    ...(row.session_id !== null ? { sessionId: row.session_id } : {}),
+    createdAt: row.created_at,
+    chars: row.chars,
+    text: row.text,
+    ...(row.digest !== null ? { digest: row.digest } : {}),
+  }
+}
+
+function rowToToolResultMeta(row: ToolResultMetaRow): ToolResultMeta {
+  return {
+    ref: row.ref,
+    tool: row.tool,
+    ...(row.call_id !== null ? { callId: row.call_id } : {}),
+    ...(row.session_id !== null ? { sessionId: row.session_id } : {}),
+    createdAt: row.created_at,
+    chars: row.chars,
+    preview: previewOf(row.preview),
+    ...(row.digest !== null ? { digest: row.digest } : {}),
+  }
+}
+
+/** Ref prefix of a folded history range (see `memory_expand`). */
+export const FOLDED_REF_PREFIX = 'fl_'
+
+/** Collision-free ref for one folded range. */
+function newFoldedRef(): string {
+  return FOLDED_REF_PREFIX + randomUUID().replace(/-/g, '').slice(0, 12)
+}
+
+function rowToFoldedRange(row: FoldedRangeRow): FoldedRangeRecord {
+  return {
+    ref: row.ref,
+    ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+    createdAt: row.ts,
+    messages: row.messages,
+    chars: row.chars,
+    tokens: row.tokens,
+    summary: row.summary,
+    original: row.original,
+    restoredCount: row.restored_count,
+  }
+}
+
+/**
+ * Columns a folded-range LISTING needs. `original` is deliberately excluded:
+ * it holds whole conversation ranges (often hundreds of KB) and the meta type
+ * does not expose it, so `SELECT *` would materialize every payload for nothing.
+ */
+const FOLDED_RANGE_META_COLUMNS =
+  'ref, ts, session_id, messages, chars, tokens, summary, restored_count'
+
+function rowToFoldedRangeMeta(row: Omit<FoldedRangeRow, 'original'>): FoldedRangeMeta {
+  return {
+    ref: row.ref,
+    ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+    createdAt: row.ts,
+    messages: row.messages,
+    chars: row.chars,
+    tokens: row.tokens,
+    preview: previewOf(row.summary),
+    restoredCount: row.restored_count,
+  }
+}
+
+/**
+ * Normalize text for fuzzy-exact dedup: lowercases, collapses whitespace, and
+ * masks only the VOLATILE number shapes so a repeat differing just by its
+ * timestamp still matches — ISO dates/times (`2026-10-04`, `12:30:00.123`) and
+ * long digit runs (8+ digits: epochs, long ids, counters).
+ *
+ * 4–7 digit runs are masked too (counters, ids), EXCEPT when the text labels
+ * them as a stable endpoint — `port 3000`, `pid 4242`, `listening on 8080`.
+ * Those are facts, not noise: masking them made ingest treat `port 3000` and
+ * `port 8080` as one memory and silently drop the second. Used by ingest dedup.
+ */
+/** `plugin_kv` key holding the normalization rule version used for `text_norm`. */
+const DEDUP_RULE_KEY = 'dedup:normalize-version'
+/**
+ * Bump whenever `normalizeForDedup` changes shape. The next open then rebuilds
+ * every stored `text_norm`, instead of comparing new texts against keys an older
+ * rule produced (which would silently defeat dedup).
+ */
+const DEDUP_RULE_VERSION = '3'
+
+export function normalizeForDedup(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\d{4}[-/.]\d{2}[-/.]\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?z?)?/g, '#')
+    .replace(/\b\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?\b/g, '#')
+    .replace(/\d{8,}/g, '#')
+    .replace(
+      // Bare runs mask at 5+ digits: 4-digit runs are YEARS and amounts
+      // ("预算 5000" vs "预算 6000" are DIFFERENT facts that a 4-digit mask
+      // silently deduplicated away).
+      /\b(?:port|pid)\s+\d{1,7}\b|\blisten(?:ing)? on\s+\d{1,7}\b|\b(\d{5,7})\b/g,
+      (match, bare) => (bare === undefined ? match : '#'),
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** A persistent, tiered store of memory documents. */
+export class MemoryStore {
+  private readonly db: DatabaseSync
+  private closed = false
+
+  /**
+   * @param path - SQLite file path, or `:memory:` for an in-process database
+   *   (tests). Missing parent directories are created.
+   */
+  constructor(path: string) {
+    if (path !== IN_MEMORY_STORE) mkdirSync(dirname(path), { recursive: true })
+    this.db = new DatabaseSync(path)
+    this.db.exec('PRAGMA journal_mode = WAL')
+    // node:sqlite's default busy timeout is 0: any concurrent writer (a second
+    // harness instance, a standalone script against the same store) makes every
+    // write throw immediately — including Service.init's backfill transaction,
+    // which would take the whole plugin down. Wait instead of failing.
+    this.db.exec('PRAGMA busy_timeout = 5000')
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memories (
+        id                TEXT PRIMARY KEY,
+        tier              TEXT NOT NULL,
+        text              TEXT NOT NULL,
+        created_at        INTEGER NOT NULL,
+        importance        REAL NOT NULL,
+        source_session_id TEXT,
+        source_turn_start INTEGER,
+        source_turn_end   INTEGER,
+        embedding         BLOB,
+        merged_from       TEXT,
+        kind              TEXT,
+        text_norm         TEXT
+      )
+    `)
+    // Migration for stores created before the `kind` column existed: ALTER
+    // TABLE ADD COLUMN is idempotent-guarded by checking PRAGMA table_info.
+    const columns = this.db.prepare('PRAGMA table_info(memories)').all() as { name: string }[]
+    if (!columns.some(col => col.name === 'kind')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN kind TEXT')
+    }
+    // Indexed dedup key: `hasTextNormalized` used to read every row and
+    // re-normalize it per ingested chunk, which grows linearly with the store.
+    if (!columns.some(col => col.name === 'text_norm')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN text_norm TEXT')
+    }
+    // Supersession chain (Zep-style invalidation): a newer memory of the same
+    // family sets superseded_by = its id on the ones it replaces. Superseded
+    // rows leave retrieval and the vector index but stay for audit.
+    if (!columns.some(col => col.name === 'superseded_by')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT')
+    }
+    // Idle-consolidation consumption stamp: without it, consumed checkpoints
+    // re-qualify forever and every idle window re-emits a near-duplicate long
+    // memory (the lifecycle review's P2-6).
+    if (!columns.some(col => col.name === 'consolidated_at')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN consolidated_at INTEGER')
+    }
+    // One-time migration (D): fold digests written before the 0.8.13 digest
+    // fix lead with the base engine's checkpoint preamble instead of the
+    // user's own instructions — they quote injected artifacts as if the user
+    // had said them, and retrieval kept serving them (production: 11-06
+    // entries still live on 11-09). Mark them superseded rather than delete:
+    // the audit trail survives, retrieval stops returning them. Preamble
+    // string is compaction-basic's exact CHECKPOINT_PREAMBLE opener. Idempotent
+    // (guarded by superseded_by IS NULL): a failure leaves the rows for the
+    // next init to retry.
+    try {
+      this.db.prepare(`
+        UPDATE memories SET superseded_by = 'legacy-pre-0.8.13'
+        WHERE superseded_by IS NULL
+          AND tier IN ('mid', 'short')
+          AND substr(text, 1, 220) LIKE '%This is an automatically generated checkpoint condensing%'
+      `).run()
+    } catch {
+      // Never fail store init over a cleanup migration; the next init retries.
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_text_norm ON memories (text_norm)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories (tier)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_created ON memories (created_at)')
+    // supersededCheckpointTexts (idle consolidation) filters by
+    // source_session_id + kind; supersede chains keep every retired row, so
+    // `memories` grows unbounded and the per-idle-window scan needs this index.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_session_kind ON memories (source_session_id, kind, created_at)')
+    // Generic key/value table for plugin state that must survive restarts
+    // (e.g. the HistoryCompressor per-session turn counters). Kept separate
+    // from the memories table so it never pollutes retrieval.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS plugin_kv (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      )
+    `)
+    // Migration: stores created before `updated_at` existed. Stamp existing
+    // rows with the current time so the age-based sweep cannot delete a
+    // counter that is merely old by creation order.
+    const kvColumns = this.db.prepare('PRAGMA table_info(plugin_kv)').all() as { name: string }[]
+    if (!kvColumns.some(col => col.name === 'updated_at')) {
+      this.db.exec('ALTER TABLE plugin_kv ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0')
+      this.db.prepare('UPDATE plugin_kv SET updated_at = ? WHERE updated_at = 0').run(Date.now())
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_plugin_kv_updated ON plugin_kv (updated_at)')
+    // Exact-text archive for oversized tool results. The transcript keeps only
+    // a short stub carrying `ref`; the full text stays here so `memory_expand`
+    // can hand it back verbatim after the built-in pruner (or a compaction) has
+    // replaced the middle with an unrecoverable marker. Content-addressed: the
+    // same payload archives once, however many times it is produced.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tool_results (
+        ref        TEXT PRIMARY KEY,
+        tool       TEXT NOT NULL,
+        call_id    TEXT,
+        session_id TEXT,
+        created_at INTEGER NOT NULL,
+        chars      INTEGER NOT NULL,
+        text       TEXT NOT NULL,
+        digest     TEXT
+      )
+    `)
+    // Same idempotent migration guard as `memories.kind`: stores created before
+    // the absorb digest existed gain the column instead of failing on INSERT.
+    const toolColumns = this.db.prepare('PRAGMA table_info(tool_results)').all() as { name: string }[]
+    if (!toolColumns.some(col => col.name === 'digest')) {
+      this.db.exec('ALTER TABLE tool_results ADD COLUMN digest TEXT')
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_created ON tool_results (created_at)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results (session_id, created_at)')
+    // findToolResultByCallId runs per oversized node on every archive pass and
+    // SELECT * materializes the payload — without this index each lookup is a
+    // full scan over rows carrying 40k+ char texts.
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tool_results_call ON tool_results (call_id, created_at)')
+    // Context-accounting ledger (see usage-ledger.ts): append-only, pruned by
+    // age, and never read by retrieval. One row per measurement.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS usage_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         INTEGER NOT NULL,
+        kind       TEXT NOT NULL,
+        value      INTEGER NOT NULL,
+        session_id TEXT,
+        detail     TEXT
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events (ts)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_events_kind ON usage_events (kind, ts)')
+    // Folded history ranges (see memory-compaction.ts): the exact messages a
+    // compression replaced with a summary. Written best-effort, read back only
+    // by memory_expand, never by retrieval.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS folded_ranges (
+        ref            TEXT PRIMARY KEY,
+        ts             INTEGER NOT NULL,
+        session_id     TEXT,
+        messages       INTEGER NOT NULL,
+        chars          INTEGER NOT NULL,
+        tokens         INTEGER NOT NULL,
+        summary        TEXT NOT NULL,
+        original       TEXT NOT NULL,
+        restored_count INTEGER NOT NULL DEFAULT 0
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_ts ON folded_ranges (ts)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_folded_ranges_session ON folded_ranges (session_id, ts)')
+    // Non-text blocks (images, files) of folded ranges: the `original` column
+    // is a text-only rendering, so without this side table the durable
+    // attachment references would be dropped at fold time and the pixels'
+    // only remaining identity lost. Rows hold the SERIALIZABLE attachment
+    // refs (host attachment service owns the bytes), not the bytes.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS fold_attachments (
+        ref       TEXT NOT NULL,
+        msg_idx   INTEGER NOT NULL,
+        block_idx INTEGER NOT NULL,
+        kind      TEXT NOT NULL,
+        payload   TEXT NOT NULL,
+        PRIMARY KEY (ref, msg_idx, block_idx)
+      )
+    `)
+    // Folded-range summary embedding (implicit-recall matching). Same guarded
+    // ALTER pattern as tool_results.digest: older stores gain the column.
+    {
+      const columns = this.db.prepare('PRAGMA table_info(folded_ranges)').all() as unknown as { name: string }[]
+      if (!columns.some(column => column.name === 'embedding')) {
+        this.db.exec('ALTER TABLE folded_ranges ADD COLUMN embedding BLOB')
+      }
+    }
+    this.backfillDedupKeys()
+  }
+
+  /**
+   * Read a value from the generic key/value table.
+   * @param key - the key.
+   * @returns the stored value, or `undefined` when absent.
+   */
+  kvGet(key: string): string | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT value FROM plugin_kv WHERE key = ?').get(key) as { value: string } | undefined
+    return row?.value
+  }
+
+  /**
+   * Write a value to the generic key/value table (upsert).
+   * @param key - the key.
+   * @param value - the value to store.
+   */
+  kvSet(key: string, value: string): void {
+    this.assertOpen()
+    this.db.prepare(`
+      INSERT INTO plugin_kv (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(key, value, Date.now())
+  }
+
+  /**
+   * Bring every row's dedup key (`text_norm`) up to date on open.
+   *
+   * Rows written before the column existed are NULL, and rows written under an
+   * older normalization rule hold a stale key. `DEDUP_RULE_VERSION` is kept in
+   * `plugin_kv`, so a rule change rebuilds every key exactly once on the next
+   * open instead of leaving old keys behind to silently defeat dedup.
+   */
+  private backfillDedupKeys(): void {
+    if (this.kvGet(DEDUP_RULE_KEY) === DEDUP_RULE_VERSION) return
+    const rows = this.db.prepare('SELECT id, text FROM memories').all() as { id: string; text: string }[]
+    const update = this.db.prepare('UPDATE memories SET text_norm = ? WHERE id = ?')
+    this.db.exec('BEGIN')
+    try {
+      for (const row of rows) update.run(normalizeForDedup(row.text), row.id)
+      this.kvSet(DEDUP_RULE_KEY, DEDUP_RULE_VERSION)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
+      throw error
+    }
+  }
+
+  /**
+   * Delete a key from the generic key/value table. A no-op when absent.
+   * @param key - the key to delete.
+   */
+  kvDelete(key: string): void {
+    this.assertOpen()
+    this.db.prepare('DELETE FROM plugin_kv WHERE key = ?').run(key)
+  }
+
+  /**
+   * Delete prefixed keys whose last write is older than `cutoffMs`.
+   *
+   * Session counters are evicted from memory after an hour of idleness but
+   * must SURVIVE that eviction: a long session with a multi-hour gap would
+   * otherwise lose its rate-limit/stage/growth state and recompress the moment
+   * it resumes. Retention is therefore long (see HistoryCompressor).
+   * @param prefix - key prefix, e.g. `compression:`.
+   * @param cutoffMs - epoch-ms cutoff; rows last written before it are removed.
+   * @returns the number of rows deleted.
+   */
+  kvDeleteOlderThan(prefix: string, cutoffMs: number): number {
+    this.assertOpen()
+    const info = this.db.prepare(
+      'DELETE FROM plugin_kv WHERE key LIKE ? AND updated_at < ?',
+    ).run(`${prefix}%`, cutoffMs)
+    return Number(info.changes)
+  }
+
+  /**
+   * Archive the exact text of one oversized tool result (idempotent by ref).
+   * Re-archiving identical bytes reuses the row but refreshes its recency and
+   * attribution, so retention cannot discard a ref the surface just re-stubbed.
+   * @param record - the archived payload.
+   * @returns `true` when a new row was inserted.
+   */
+  archiveToolResult(record: ToolResultRecord): boolean {
+    this.assertOpen()
+    const info = this.db.prepare(`
+      INSERT OR IGNORE INTO tool_results (ref, tool, call_id, session_id, created_at, chars, text, digest)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.ref,
+      record.tool,
+      record.callId ?? null,
+      record.sessionId ?? null,
+      record.createdAt,
+      record.chars,
+      record.text,
+      record.digest ?? null,
+    )
+    if (Number(info.changes) > 0) return true
+    // The row already exists (content-addressed): the caller may have just put a
+    // NEW stub in the transcript that points at it, and retention (age + entry
+    // cap) runs immediately afterwards. Refresh recency and attribution first,
+    // or a stale created_at lets that retention delete a row the live
+    // transcript still references — the payload would be unrecoverable.
+    this.db.prepare(
+      `UPDATE tool_results SET created_at = ?,
+       call_id = COALESCE(call_id, ?),
+       session_id = COALESCE(session_id, ?)
+       WHERE ref = ?`,
+    ).run(record.createdAt, record.callId ?? null, record.sessionId ?? null, record.ref)
+    // Backfill a digest computed on a later rewrite, but never overwrite one
+    // that is already there.
+    if (record.digest !== undefined && record.digest.length > 0) {
+      this.db.prepare(
+        `UPDATE tool_results SET digest = ? WHERE ref = ? AND (digest IS NULL OR digest = '')`,
+      ).run(record.digest, record.ref)
+    }
+    return false
+  }
+
+  /**
+   * Nudge one memory's importance up (capped): retrieval-reinforcement —
+   * a memory the model actually got shown is worth keeping longer than an
+   * identical-scored one that was never retrieved.
+   * @param id - the memory id.
+   * @param delta - the importance increment (positive).
+   * @param max - the ceiling the bumped value is clamped to.
+   */
+  bumpImportance(id: string, delta: number, max = 0.95): void {
+    this.assertOpen()
+    this.db.prepare(
+      'UPDATE memories SET importance = MIN(?, importance + ?) WHERE id = ?',
+    ).run(max, delta, id)
+  }
+
+  /**
+   * Replace one memory's embedding vector in place (embedder migration:
+   * the recorded signature changed, so every stored vector must be rebuilt
+   * under the current embedder before it means anything again).
+   */
+  updateEmbedding(id: string, embedding: readonly number[]): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE memories SET embedding = ? WHERE id = ?')
+      .run(vectorToBlob(embedding), id)
+  }
+
+  /**
+   * Read an archived tool result by ref.
+   * @param ref - the content-addressed ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getToolResult(ref: string): ToolResultRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM tool_results WHERE ref = ?').get(ref) as ToolResultRow | undefined
+    return row === undefined ? undefined : rowToToolResult(row)
+  }
+
+  /**
+   * Find the newest archived result produced by one tool call.
+   * @param callId - the tool call id.
+   * @returns the record, or `undefined` when the call was never archived.
+   */
+  findToolResultByCallId(callId: string): ToolResultRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM tool_results WHERE call_id = ? ORDER BY created_at DESC LIMIT 1').get(callId) as ToolResultRow | undefined
+    return row === undefined ? undefined : rowToToolResult(row)
+  }
+
+  /**
+   * List archived results, newest first, without their full text.
+   * @param limit - maximum rows to return.
+   * @returns the listing.
+   */
+  listToolResults(limit = 20): ToolResultMeta[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, tool, call_id, session_id, created_at, chars, digest, substr(text, 1, 400) AS preview FROM tool_results ORDER BY created_at DESC LIMIT ?',
+    ).all(limit) as unknown as ToolResultMetaRow[]
+    return rows.map(rowToToolResultMeta)
+  }
+
+  /**
+   * Search archived text by substring (case-insensitive for ASCII).
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings, newest first.
+   */
+  searchToolResults(query: string, limit = 5): ToolResultMeta[] {
+    this.assertOpen()
+    const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
+    const rows = this.db.prepare(
+      `SELECT ref, tool, call_id, session_id, created_at, chars, digest, substr(text, 1, 400) AS preview FROM tool_results WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?`,
+    ).all(pattern, limit) as unknown as ToolResultMetaRow[]
+    return rows.map(rowToToolResultMeta)
+  }
+
+  /**
+   * Count archived tool results.
+   * @returns the number of rows.
+   */
+  countToolResults(): number {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM tool_results').get() as { n: number }
+    return row.n
+  }
+
+  /**
+   * Total archived text size in code points.
+   * @returns the summed archived character count.
+   */
+  toolResultChars(): number {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT COALESCE(SUM(chars), 0) AS n FROM tool_results').get() as { n: number }
+    return row.n
+  }
+
+  /**
+   * Delete archived results older than a timestamp.
+   * @param timestamp - epoch milliseconds cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  deleteToolResultsBefore(timestamp: number): number {
+    this.assertOpen()
+    const info = this.db.prepare('DELETE FROM tool_results WHERE created_at < ?').run(timestamp)
+    return Number(info.changes)
+  }
+
+  /**
+   * Keep only the newest N archived results.
+   * @param maxEntries - the number of rows to keep.
+   * @returns the number of deleted rows.
+   */
+  trimToolResults(maxEntries: number): number {
+    this.assertOpen()
+    // SQLite reads `LIMIT -1` as "no limit": a negative cap made the subquery
+    // return EVERY ref, so `NOT IN` matched nothing and the trim deleted zero
+    // rows while reporting success. Clamp like `trimFoldedRanges` does.
+    const keep = Number.isFinite(maxEntries) ? Math.max(0, Math.floor(maxEntries)) : 0
+    const info = this.db.prepare(`
+      DELETE FROM tool_results WHERE ref NOT IN (
+        SELECT ref FROM tool_results ORDER BY created_at DESC, ref DESC LIMIT ?
+      )
+    `).run(keep)
+    return Number(info.changes)
+  }
+
+  /**
+   * Append one ledger measurement.
+   * @param record - the event to store.
+   */
+  recordUsageEvent(record: UsageEventRecord): void {
+    this.assertOpen()
+    this.db.prepare(
+      'INSERT INTO usage_events (ts, kind, value, session_id, detail) VALUES (?, ?, ?, ?, ?)',
+    ).run(
+      record.ts,
+      record.kind,
+      record.value,
+      record.sessionId ?? null,
+      record.detail ?? null,
+    )
+  }
+
+  /**
+   * Sum ledger values per kind.
+   * @param sinceTs - epoch-millisecond lower bound (inclusive); omit for all time.
+   * @returns one row per kind, ordered by kind.
+   */
+  usageTotals(sinceTs?: number): UsageTotal[] {
+    this.assertOpen()
+    const rows = sinceTs === undefined
+      ? this.db.prepare('SELECT kind, COUNT(*) AS events, SUM(value) AS value FROM usage_events GROUP BY kind ORDER BY kind').all()
+      : this.db.prepare('SELECT kind, COUNT(*) AS events, SUM(value) AS value FROM usage_events WHERE ts >= ? GROUP BY kind ORDER BY kind').all(sinceTs)
+    return (rows as unknown as { kind: string; events: number; value: number }[]).map(row => ({
+      kind: row.kind,
+      events: Number(row.events),
+      value: Number(row.value),
+    }))
+  }
+
+  /**
+   * Read the newest ledger events.
+   * @param limit - maximum rows.
+   * @returns the events, newest first.
+   */
+  listUsageEvents(limit = 20): UsageEventRecord[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ts, kind, value, session_id, detail FROM usage_events ORDER BY id DESC LIMIT ?',
+    ).all(limit) as unknown as UsageEventRow[]
+    return rows.map(row => ({
+      ts: row.ts,
+      kind: row.kind,
+      value: row.value,
+      ...(row.session_id === null ? {} : { sessionId: row.session_id }),
+      ...(row.detail === null ? {} : { detail: row.detail }),
+    }))
+  }
+
+  /**
+   * Delete ledger events older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneUsageEvents(beforeTs: number): number {
+    this.assertOpen()
+    const info = this.db.prepare('DELETE FROM usage_events WHERE ts < ?').run(beforeTs)
+    return Number(info.changes)
+  }
+
+  /**
+   * Sum ledger values per kind *and* detail label (e.g. one bucket per
+   * provider/model), so a mid-session model switch stays visible instead of
+   * being averaged away in the per-kind totals.
+   * @param sinceTs - epoch-millisecond lower bound (inclusive); omit for all time.
+   * @returns one row per (kind, detail) pair, ordered by kind then detail.
+   */
+  usageTotalsByDetail(sinceTs?: number): UsageDetailTotal[] {
+    this.assertOpen()
+    const sql = 'SELECT kind, detail, COUNT(*) AS events, SUM(value) AS value FROM usage_events WHERE detail IS NOT NULL'
+    const rows = sinceTs === undefined
+      ? this.db.prepare(sql + ' GROUP BY kind, detail ORDER BY kind, detail').all()
+      : this.db.prepare(sql + ' AND ts >= ? GROUP BY kind, detail ORDER BY kind, detail').all(sinceTs)
+    return (rows as unknown as { kind: string; detail: string; events: number; value: number }[]).map(row => ({
+      kind: row.kind,
+      detail: row.detail,
+      events: Number(row.events),
+      value: Number(row.value),
+    }))
+  }
+
+  // --- folded history ranges: compaction that can be undone --------------
+
+  /**
+   * Archive the exact messages a compression folded into a summary, so the
+   * summary on the surface stays reversible (read back with `memory_expand`).
+   * @param input - the folded payload; the ref is generated when omitted.
+   * @returns the archive ref to embed in the summary that replaced the range.
+   */
+  archiveFoldedRange(input: {
+    readonly messages: number
+    readonly chars: number
+    readonly tokens: number
+    readonly summary: string
+    readonly original: string
+    readonly sessionId?: string | undefined
+    readonly ref?: string | undefined
+    readonly createdAt?: number | undefined
+    readonly attachments?: readonly FoldAttachmentInsert[] | undefined
+    readonly embedding?: readonly number[] | undefined
+  }): string {
+    this.assertOpen()
+    const ref = input.ref ?? newFoldedRef()
+    // One transaction: a folded_ranges row with HALF its attachments (or
+    // none) is worse than no row — the surface header would promise a
+    // read-back the archive cannot honor, and nothing sweeps the partial
+    // state (the 0.9.8 review's F2).
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare(
+        'INSERT INTO folded_ranges (ref, ts, session_id, messages, chars, tokens, summary, original, embedding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(ref) DO NOTHING',
+      ).run(
+        ref,
+        input.createdAt ?? Date.now(),
+        input.sessionId ?? null,
+        input.messages,
+        input.chars,
+        input.tokens,
+        input.summary,
+        input.original,
+        input.embedding === undefined ? null : vectorToBlob(input.embedding),
+      )
+      if (input.attachments !== undefined && input.attachments.length > 0) {
+        const insert = this.db.prepare(
+          'INSERT INTO fold_attachments (ref, msg_idx, block_idx, kind, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT(ref, msg_idx, block_idx) DO NOTHING',
+        )
+        for (const attachment of input.attachments) {
+          insert.run(ref, attachment.msgIdx, attachment.blockIdx, attachment.kind, attachment.payload)
+        }
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
+      throw error
+    }
+    return ref
+  }
+
+  /**
+   * Read the non-text blocks stored for one folded range.
+   * @param ref - the archive ref.
+   * @returns the records in message order, empty when the range had none.
+   */
+  getFoldAttachments(ref: string): FoldAttachmentRecord[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, msg_idx, block_idx, kind, payload FROM fold_attachments WHERE ref = ? ORDER BY msg_idx, block_idx',
+    ).all(ref) as unknown as { ref: string; msg_idx: number; block_idx: number; kind: string; payload: string }[]
+    return rows.map(row => ({
+      ref: row.ref,
+      msgIdx: Number(row.msg_idx),
+      blockIdx: Number(row.block_idx),
+      kind: row.kind as FoldAttachmentRecord['kind'],
+      payload: row.payload,
+    }))
+  }
+
+  /**
+   * The newest folded ranges of one session that carry a summary embedding —
+   * the matching side of the implicit-recall scan.
+   * @param sessionId - owning session.
+   * @param limit - how many recent folds to consider.
+   * @returns ref + embedding pairs, newest first.
+   */
+  recentFoldEmbeddings(sessionId: string, limit: number): { ref: string; embedding: number[] }[] {
+    this.assertOpen()
+    const rows = this.db.prepare(
+      'SELECT ref, embedding FROM folded_ranges WHERE session_id = ? AND embedding IS NOT NULL ORDER BY ts DESC LIMIT ?',
+    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { ref: string; embedding: Buffer }[]
+    return rows.flatMap(row => {
+      const embedding = blobToVector(row.embedding)
+      return embedding === undefined ? [] : [{ ref: row.ref, embedding }]
+    })
+  }
+
+  /**
+   * Count and list the SUPERSEDED checkpoint texts of one session that have
+   * NOT been consumed by an idle consolidation yet — the raw material of
+   * sleep-time merging (each fold replaced the previous session digest; the
+   * replaced ones hold the session's own history). Without the
+   * `consolidated_at` filter the same rows would re-qualify forever and the
+   * consolidation would emit a near-duplicate long memory every idle window
+   * (the lifecycle review's P2-6).
+   * @param sessionId - owning session.
+   * @param limit - how many newest superseded texts to return.
+   * @returns `{ count, ids, texts }` — count is unbounded, ids/texts capped at limit.
+   */
+  supersededCheckpointTexts(sessionId: string, limit = 8): { count: number; ids: string[]; texts: string[] } {
+    this.assertOpen()
+    const count = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND consolidated_at IS NULL AND source_session_id = ?',
+    ).get(sessionId) as unknown as { n: number }
+    const rows = this.db.prepare(
+      'SELECT id, text FROM memories WHERE kind = \'checkpoint\' AND superseded_by IS NOT NULL AND consolidated_at IS NULL AND source_session_id = ? ORDER BY created_at DESC LIMIT ?',
+    ).all(sessionId, Math.max(1, Math.round(limit))) as unknown as { id: string; text: string }[]
+    return { count: Number(count.n), ids: rows.map(row => row.id), texts: rows.map(row => row.text) }
+  }
+
+  /** Stamp checkpoints as consumed by an idle consolidation. */
+  markCheckpointsConsolidated(ids: readonly string[]): void {
+    this.assertOpen()
+    const update = this.db.prepare('UPDATE memories SET consolidated_at = ? WHERE id = ?')
+    const now = Date.now()
+    for (const id of ids) update.run(now, id)
+  }
+
+  /**
+   * Back-fill the summary embedding of an already-archived folded range —
+   * the fold commit path stores the row first and lets the embedder run
+   * off the critical path.
+   * @param ref - the archive ref.
+   * @param embedding - the summary embedding vector.
+   */
+  patchFoldEmbedding(ref: string, embedding: readonly number[]): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE folded_ranges SET embedding = ? WHERE ref = ?').run(vectorToBlob(embedding), ref)
+  }
+
+  /** Delete the attachment rows of the given folded-range refs. */
+  private deleteFoldAttachmentsForRefs(refs: readonly string[]): void {
+    if (refs.length === 0) return
+    const del = this.db.prepare('DELETE FROM fold_attachments WHERE ref = ?')
+    for (const ref of refs) del.run(ref)
+  }
+
+  /**
+   * Read one folded range back, exact text included.
+   * @param ref - the archive ref.
+   * @returns the record, or `undefined` when unknown.
+   */
+  getFoldedRange(ref: string): FoldedRangeRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM folded_ranges WHERE ref = ?').get(ref) as unknown as FoldedRangeRow | undefined
+    return row === undefined ? undefined : rowToFoldedRange(row)
+  }
+
+  /**
+   * List folded ranges newest first, without the original text.
+   * @param limit - maximum rows.
+   * @returns the listings.
+   */
+  listFoldedRanges(limit = 20): FoldedRangeMeta[] {
+    this.assertOpen()
+    const rows = this.db
+      .prepare('SELECT ' + FOLDED_RANGE_META_COLUMNS + ' FROM folded_ranges ORDER BY ts DESC LIMIT ?')
+      .all(limit) as unknown as Omit<FoldedRangeRow, 'original'>[]
+    return rows.map(rowToFoldedRangeMeta)
+  }
+
+  /**
+   * Keyword-search folded ranges by their summary and original text.
+   * @param query - the substring to look for.
+   * @param limit - maximum rows to return.
+   * @returns matching listings, newest first.
+   */
+  searchFoldedRanges(query: string, limit = 5): FoldedRangeMeta[] {
+    this.assertOpen()
+    const pattern = '%' + query.replace(/[\\%_]/g, ch => '\\' + ch) + '%'
+    const rows = this.db.prepare(
+      'SELECT ' + FOLDED_RANGE_META_COLUMNS
+        + ' FROM folded_ranges WHERE summary LIKE ? ESCAPE \'\\\' OR original LIKE ? ESCAPE \'\\\' ORDER BY ts DESC LIMIT ?',
+    ).all(pattern, pattern, limit) as unknown as Omit<FoldedRangeRow, 'original'>[]
+    return rows.map(rowToFoldedRangeMeta)
+  }
+
+  /**
+   * Record that a folded range was read back through `memory_expand`.
+   * @param ref - the archive ref.
+   */
+  markFoldedRangeRestored(ref: string): void {
+    this.assertOpen()
+    this.db.prepare('UPDATE folded_ranges SET restored_count = restored_count + 1 WHERE ref = ?').run(ref)
+  }
+
+  /**
+   * Aggregate size of the folded-range archive.
+   * @returns row count and summed chars/tokens.
+   */
+  foldedRangeStats(): { count: number; chars: number; tokens: number } {
+    this.assertOpen()
+    const row = this.db.prepare(
+      'SELECT COUNT(*) AS count, COALESCE(SUM(chars), 0) AS chars, COALESCE(SUM(tokens), 0) AS tokens FROM folded_ranges',
+    ).get() as unknown as { count: number; chars: number; tokens: number }
+    return { count: Number(row.count), chars: Number(row.chars), tokens: Number(row.tokens) }
+  }
+
+  /**
+   * Delete folded ranges older than a timestamp.
+   * @param beforeTs - epoch-millisecond cutoff (exclusive).
+   * @returns the number of deleted rows.
+   */
+  pruneFoldedRanges(beforeTs: number): number {
+    this.assertOpen()
+    const doomed = this.db.prepare('SELECT ref FROM folded_ranges WHERE ts < ?').all(beforeTs) as unknown as { ref: string }[]
+    if (doomed.length === 0) return 0
+    // One transaction: a crash between the folded delete and the attachment
+    // sweep would leave orphan attachment rows nothing ever cleans up.
+    this.db.exec('BEGIN')
+    try {
+      const info = this.db.prepare('DELETE FROM folded_ranges WHERE ts < ?').run(beforeTs)
+      this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
+      this.db.exec('COMMIT')
+      return Number(info.changes)
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
+      throw error
+    }
+  }
+
+  /**
+   * Keep only the newest N folded ranges.
+   * @param maxEntries - the cap (<= 0 clears the archive).
+   * @returns the number of deleted rows.
+   */
+  trimFoldedRanges(maxEntries: number): number {
+    this.assertOpen()
+    // Same NaN discipline as trimToolResults: a bad LIMIT throws in node:sqlite,
+    // it does not silently delete zero rows.
+    const capped = Number.isFinite(maxEntries) ? Math.max(0, Math.round(maxEntries)) : 0
+    const doomed = this.db.prepare(
+      'SELECT ref FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC, ref DESC LIMIT ?)',
+    ).all(capped) as unknown as { ref: string }[]
+    if (doomed.length === 0) return 0
+    this.db.exec('BEGIN')
+    try {
+      const info = this.db.prepare(
+        'DELETE FROM folded_ranges WHERE ref NOT IN (SELECT ref FROM folded_ranges ORDER BY ts DESC, ref DESC LIMIT ?)',
+      ).run(capped)
+      this.deleteFoldAttachmentsForRefs(doomed.map(row => row.ref))
+      this.db.exec('COMMIT')
+      return Number(info.changes)
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
+      throw error
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error('MemoryStore is closed')
+  }
+
+  private rowToDoc(row: MemoryRow): MemoryDoc {
+    const embedding = blobToVector(row.embedding)
+    let mergedFrom: string[] | undefined
+    if (row.merged_from !== null) {
+      try {
+        const parsed = JSON.parse(row.merged_from) as unknown
+        if (Array.isArray(parsed)) mergedFrom = parsed as string[]
+      } catch {
+        // Corrupt merged_from is non-fatal; provenance is best-effort.
+      }
+    }
+    return {
+      id: row.id,
+      tier: row.tier as Tier,
+      text: row.text,
+      createdAt: row.created_at,
+      importance: row.importance,
+      ...(row.source_session_id !== null ? { sourceSessionId: row.source_session_id } : {}),
+      ...(row.source_turn_start !== null && row.source_turn_end !== null
+        ? { sourceTurns: { start: row.source_turn_start, end: row.source_turn_end } as const }
+        : {}),
+      ...(embedding !== undefined ? { embedding } : {}),
+      ...(mergedFrom !== undefined ? { mergedFrom } : {}),
+      ...(row.kind !== null && row.kind !== undefined
+        ? { kind: row.kind as MemoryKind }
+        : {}),
+      ...(row.superseded_by != null ? { supersededBy: row.superseded_by } : {}),
+    }
+  }
+
+  /**
+   * Insert a new memory document. Fails if the id already exists.
+   * @param doc - the document to store.
+   */
+  insert(doc: MemoryDoc): void {
+    this.assertOpen()
+    this.db.prepare(`
+      INSERT INTO memories (
+        id, tier, text, created_at, importance,
+        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind, text_norm
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      doc.id,
+      doc.tier,
+      doc.text,
+      doc.createdAt,
+      doc.importance,
+      doc.sourceSessionId ?? null,
+      doc.sourceTurns?.start ?? null,
+      doc.sourceTurns?.end ?? null,
+      doc.embedding === undefined ? null : vectorToBlob(doc.embedding),
+      doc.mergedFrom === undefined ? null : JSON.stringify(doc.mergedFrom),
+      doc.kind ?? null,
+      normalizeForDedup(doc.text),
+    )
+  }
+
+  /**
+   * Replace an existing memory document (upsert by id).
+   * @param doc - the document to write.
+   */
+  upsert(doc: MemoryDoc): void {
+    this.assertOpen()
+    this.db.prepare(`
+      INSERT INTO memories (
+        id, tier, text, created_at, importance,
+        source_session_id, source_turn_start, source_turn_end, embedding, merged_from, kind, text_norm
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        tier = excluded.tier,
+        text = excluded.text,
+        created_at = excluded.created_at,
+        importance = excluded.importance,
+        source_session_id = excluded.source_session_id,
+        source_turn_start = excluded.source_turn_start,
+        source_turn_end = excluded.source_turn_end,
+        embedding = excluded.embedding,
+        merged_from = excluded.merged_from,
+        kind = excluded.kind,
+        text_norm = excluded.text_norm
+    `).run(
+      doc.id,
+      doc.tier,
+      doc.text,
+      doc.createdAt,
+      doc.importance,
+      doc.sourceSessionId ?? null,
+      doc.sourceTurns?.start ?? null,
+      doc.sourceTurns?.end ?? null,
+      doc.embedding === undefined ? null : vectorToBlob(doc.embedding),
+      doc.mergedFrom === undefined ? null : JSON.stringify(doc.mergedFrom),
+      doc.kind ?? null,
+      normalizeForDedup(doc.text),
+    )
+  }
+
+  /**
+   * Fetch a single document by id.
+   * @param id - the document id.
+   * @returns the document, or `undefined` if absent.
+   */
+  get(id: string): MemoryDoc | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as MemoryRow | undefined
+    return row === undefined ? undefined : this.rowToDoc(row)
+  }
+
+  /**
+   * List documents, optionally restricted to a tier, ordered newest first.
+   * @param tier - optional tier filter.
+   * @param opts - `withEmbeddings: false` skips the embedding column: the
+   *   vectors are the bulk of each row, and most readers (forget, maintain,
+   *   generateIndex, status) never look at them.
+   * @returns the matching documents.
+   */
+  list(tier?: Tier, opts?: { withEmbeddings?: boolean }): MemoryDoc[] {
+    this.assertOpen()
+    const withEmbeddings = opts?.withEmbeddings ?? true
+    const columns = withEmbeddings ? '*' : 'id, tier, text, created_at, importance, source_session_id, source_turn_start, source_turn_end, merged_from, kind, text_norm, superseded_by'
+    const rows = tier === undefined
+      ? (this.db.prepare(`SELECT ${columns} FROM memories ORDER BY created_at DESC, rowid DESC`).all() as unknown as MemoryRow[])
+      : (this.db.prepare(`SELECT ${columns} FROM memories WHERE tier = ? ORDER BY created_at DESC, rowid DESC`).all(tier) as unknown as MemoryRow[])
+    return rows.map(row => this.rowToDoc(row))
+  }
+
+  /**
+   * Count documents, optionally restricted to a tier.
+   * @param tier - optional tier filter.
+   * @returns the count.
+   */
+  count(tier?: Tier): number {
+    this.assertOpen()
+    const row = tier === undefined
+      ? this.db.prepare('SELECT COUNT(*) AS n FROM memories').get() as { n: number }
+      : this.db.prepare('SELECT COUNT(*) AS n FROM memories WHERE tier = ?').get(tier) as { n: number }
+    return row.n
+  }
+
+  /**
+   * Mark memories as superseded (Zep-style invalidation): the rows stay for
+   * audit, retrieval stops returning them, and the caller drops them from the
+   * vector index. Idempotent — an already-superseded row keeps its FIRST
+   * superseder (COALESCE preserves the chain's head).
+   * @param ids - the memory ids to mark.
+   * @param byId - the id of the superseding memory.
+   * @returns how many rows were marked (not previously superseded).
+   */
+  markSuperseded(ids: readonly string[], byId: string): number {
+    this.assertOpen()
+    if (ids.length === 0) return 0
+    const update = this.db.prepare(`
+      UPDATE memories SET superseded_by = ?
+      WHERE id = ? AND superseded_by IS NULL
+    `)
+    let marked = 0
+    this.db.exec('BEGIN')
+    try {
+      for (const id of ids) {
+        marked += Number(update.run(byId, id).changes)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* not in a transaction */ }
+      throw error
+    }
+    return marked
+  }
+
+  /**
+   * Whether any stored memory has exactly this text (used for ingest dedup).
+   * @param text - the exact text to look up.
+   * @returns true when a memory with this text already exists.
+   */
+  hasText(text: string): boolean {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT 1 FROM memories WHERE text = ? LIMIT 1').get(text) as { 1?: number } | undefined
+    return row !== undefined
+  }
+
+  /**
+   * Whether any stored memory has this text after fuzzy normalization
+   * (lowercase, whitespace-collapsed, volatile number shapes masked). Catches
+   * repeats that differ only by timestamps/counters. The normalized key lives in
+   * `memories.text_norm` and is indexed, so this is one indexed lookup instead of
+   * reading and re-normalizing every stored memory per ingested chunk.
+   * @param text - the raw text to normalize and look up.
+   * @returns true when a memory with the same normalized text exists.
+   */
+  hasTextNormalized(text: string): boolean {
+    this.assertOpen()
+    const target = normalizeForDedup(text)
+    if (target.length === 0) return false
+    const row = this.db.prepare('SELECT 1 FROM memories WHERE text_norm = ? LIMIT 1').get(target) as { 1?: number } | undefined
+    return row !== undefined
+  }
+
+  /**
+   * Delete a document by id. A no-op if absent.
+   * @param id - the id to delete.
+   */
+  delete(id: string): void {
+    this.assertOpen()
+    this.db.prepare('DELETE FROM memories WHERE id = ?').run(id)
+  }
+
+  /**
+   * Delete many documents by id.
+   * @param ids - the ids to delete.
+   */
+  deleteMany(ids: readonly string[]): void {
+    this.assertOpen()
+    if (ids.length === 0) return
+    const stmt = this.db.prepare('DELETE FROM memories WHERE id = ?')
+    for (const id of ids) stmt.run(id)
+  }
+
+  /** Remove every document. */
+  clear(): void {
+    this.assertOpen()
+    this.db.exec('DELETE FROM memories')
+  }
+
+  /**
+   * Close the underlying database. Idempotent.
+   *
+   * Note: the plugin does not call close() on shutdown — DSH manages the
+   * process lifecycle and SQLite's WAL mode guarantees data safety on exit.
+   * Call close() explicitly only in tests or standalone scripts.
+   */
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.db.close()
+  }
+}

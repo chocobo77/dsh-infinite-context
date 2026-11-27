@@ -1,0 +1,1367 @@
+/**
+ * Unified compaction governance: ONE bounded water-level curve shared by the
+ * durable-region lane (compaction-basic) and the progressive-fold lane
+ * (HistoryCompressor).
+ *
+ * Before this module the two lanes each owned a private curve:
+ *   - durable: dynamicCompactionRatio(base, floor, fill) — driven only by how
+ *     full the window is;
+ *   - fold:    dynamicHistoryLevels(...) — driven only by growth EMA + maturity.
+ * They could disagree about the same session at the same moment, and every fix
+ * had to be reasoned about twice. Here they become two views of one curve.
+ *
+ * Dependency-free so it is unit-testable without a Cordis context.
+ *
+ * @module dsh-infinite-context/compaction-governance
+ */
+
+import type { CompactionIntent } from './compaction-intelligence.ts'
+import {
+  OPP_BONUS_MAX,
+  OPP_EARLY_PENALTY,
+  OPP_NUDGE_MIN,
+  type CompactionOpportunity,
+} from './compaction-opportunity.ts'
+
+/** Hard ceiling on the trigger (fraction of the basis). Nothing may raise it. */
+export const GOV_TRIGGER_CEILING = 0.92
+/**
+ * Floor for the trigger slide: a hot/mature session cannot churn earlier than
+ * this WHEN the configured anchor is at or above it. A deliberately lower
+ * anchor (small-window local model) is respected, because the floor exists to
+ * prevent churn, not to override an intentional early-compress setting; the
+ * absolute anti-overflow limit is {@link GOV_TRIGGER_CEILING}.
+ */
+export const GOV_TRIGGER_FLOOR = 0.65
+/** Hard floor on the post-compression target. */
+export const GOV_TARGET_FLOOR = 0.25
+/**
+ * Memory floor for the retained tail: never fold the surface below this share
+ * of the budget. The tail is what the agent keeps verbatim, and a mature
+ * session used to widen its band until the tail was gone.
+ */
+export const GOV_TARGET_MEMORY_FLOOR = 0.55
+/**
+ * Clean-seam deep fold line (2026-11-26 water-level complaint, pushed three
+ * times — depth is AI-OWNED now, floor AND ceiling): at a clean seam the
+ * timing/milestone strength opened the deep lane; since the third pass the
+ * dial is the STRONGER of that timing judgment and the content magnitude, so
+ * disposable-heavy content can drain deep even mid tool-loop. The dial
+ * interpolates the target line from the tool-loop memory anchor down to THIS
+ * ratio — which defaults to 0, no policy floor at all. What remains below
+ * the AI's line is only structure: the retained tail, the summary and the
+ * pinned head cannot be folded, so a "drain everything" judgment lands
+ * wherever those physically sit. The learned recall servo is the
+ * misjudgment brake (a needed fold narrows the next band), and every fold
+ * stays reversible through the fl_ archive. Pin a positive
+ * `fold_seam_floor` only to overrule the AI downward.
+ */
+export const GOV_SEAM_MEMORY_FLOOR = 0
+/** Intent timing at or above which a step counts as a clean seam. */
+export const GOV_SEAM_MIN_TIMING = 0.7
+/** Minimum trigger-to-target band so every compression creates real headroom. */
+export const GOV_MIN_BAND = 0.08
+/** Maximum band so a pathological growth estimate cannot empty the context. */
+export const GOV_MAX_BAND = 0.45
+/** Safety margin added to the measured-growth reserve. */
+export const GOV_SAFETY_MARGIN = 0.03
+/** Extra band added as the session matures, to amortize compressions. */
+export const GOV_STAGE_BAND = 0.08
+/**
+ * Cap on the maturity (compression-count) term of the trigger curve. Mature
+ * sessions used to fold at the floor because stage pressure reached 1; the
+ * fold lane now keeps the anchor unless fill/growth actually demand earlier.
+ */
+export const GOV_STAGE_TRIGGER_CAP = 0
+/** Growth (fraction of budget per step) that counts as fully 'hot'. */
+export const GOV_HOT_GROWTH = 0.05
+/** Successful compressions at which a session counts as fully mature. */
+export const GOV_MATURE_COMPRESSIONS = 8
+/**
+ * Minimum NET saving of a routine fold, as a share of the fold budget: the
+ * folded tokens minus the summarizer's own expected output. A fold that nets
+ * less costs a summarizer call plus a post-fold cache refill for a sliver of
+ * headroom - on a small window the memory floor caps the band so the closed
+ * loop cannot deepen its way out, and only this gate stops the churn. Force,
+ * surge and the fit-guard bypass it (their occasion is not optional). The
+ * opportunity cost of a fold is ≈5-7% of the budget; 8% leaves margin.
+ * Set 0 to disable the gate.
+ */
+export const GOV_MIN_NET_SAVING_RATIO = 0.08
+
+/**
+ * The fold interval and thin-fold ratio, derived from the LEARNED summarizer
+ * latency instead of fixed values: a fold costs roughly one summary call, so
+ * a route whose summaries take minutes should fold on a minutes-scale cadence
+ * with a higher bar for "worth it", while a route that summarizes in seconds
+ * can fold often and cheaply. The 20-minute shipped interval and the 8% ratio
+ * are what these formulas produce at a ~5-minute summary — they are the
+ * cold-start prior when no latency has been learned yet, not independent
+ * decisions.
+ *
+ * Derivation (no new constants — both reference MIN_FOLD_INTERVAL_MS):
+ * - interval  = clamp(4 × EMA,  20min/4,  20min×3)   → [5min, 60min]
+ * - thin ratio = 0.08 × clamp(EMA / 2min, 1, 3)      → [0.08, 0.24]
+ */
+
+/** Latency at which the shipped 20-minute interval is the right cadence. */
+const FOLD_INTERVAL_REF_EMA_MS = 5 * 60_000
+/** Interval multiplier over the learned summary latency. */
+const FOLD_INTERVAL_EMA_MULT = 4
+
+/**
+ * The shipped minimum wall-clock gap between routine folds — the COLD-START
+ * value of {@link foldIntervalFor} (what a ~5-minute summary route converges
+ * to). Kept exported as the engine's fallback and for its force-cooldown
+ * bookkeeping.
+ */
+export const MIN_FOLD_INTERVAL_MS = 20 * 60_000
+
+/**
+ * The minimum wall-clock gap between routine folds, derived from the route's
+ * learned summarizer latency. A summary that takes minutes makes a fixed
+ * 20-minute gap simultaneously too long for a fast model and too short for a
+ * slow one; scaling it by the measured cost keeps the RHYTHM proportional to
+ * the actual price of a fold. Unknown latency → the shipped 20 minutes.
+ * @param learnedLatencyMs - the route's summarizer latency EMA, or `undefined`
+ *   before the first successful summary.
+ * @returns the minimum interval in ms, within [5min, 60min].
+ */
+export function foldIntervalFor(learnedLatencyMs: number | undefined): number {
+  if (learnedLatencyMs === undefined || !Number.isFinite(learnedLatencyMs) || learnedLatencyMs <= 0) {
+    return MIN_FOLD_INTERVAL_MS
+  }
+  const raw = learnedLatencyMs * FOLD_INTERVAL_EMA_MULT
+  return Math.min(
+    MIN_FOLD_INTERVAL_MS * 3,
+    Math.max(MIN_FOLD_INTERVAL_MS / 4, Math.floor(raw)),
+  )
+}
+
+/**
+ * The thin-fold ratio for a route, derived from its learned summarizer
+ * latency: on a route where a summary costs minutes, a given net saving buys
+ * less per second of waiting, so the bar rises (up to ×3); on a fast route
+ * the shipped ratio already clears. Unknown latency → the shipped ratio.
+ * @param learnedLatencyMs - the route's summarizer latency EMA, or `undefined`
+ *   before the first successful summary.
+ * @returns the minimum net-saving ratio for this route.
+ */
+/**
+ * The thin-fold ratio for a route, driven by COST (not latency): the bar
+ * exists because a summarizer call + post-fold cache refill costs money on
+ * paid routes. LOCAL routes are the operator's own hardware — the call is
+ * free, so the bar drops to zero and the dynamic fold interval (4x EMA) is
+ * the only churn guard. Paid routes keep the shipped 8%.
+ * @param isLocal - whether the summarizer route points at the operator's own
+ *   hardware (baseURL loopback/LAN — NOT window size; a 256k local model is
+ *   as local as a 24k one).
+ * @returns the minimum net-saving ratio for this route.
+ */
+export function thinFoldRatioFor(isLocal: boolean): number {
+  return isLocal ? 0 : GOV_MIN_NET_SAVING_RATIO
+}
+/**
+ * Minimum cosine(node text, task-state block) for a cut-boundary node to be
+ * kept verbatim regardless of its role. Conservative: only CLEARLY on-topic
+ * boundaries survive — the hash embedder prices unrelated texts near 0.
+ */
+export const GOV_IMPORTANCE_KEEP_COS = 0.35
+
+/* -------------------------------------------------------------------------- */
+/*  Closed-loop target band (landing-deviation feedback)                       */
+/*                                                                              */
+/*  Production telemetry (1M-window sessions, 2026-10) showed folds landing    */
+/*  systematically ABOVE the target band and drifting worse day over day: the  */
+/*  retained tail handed to the range selector is the plan's target, but the   */
+/*  summary's own tokens, the pinned head and the unfoldable leftovers are     */
+/*  added ON TOP of it, and nothing fed that shortfall back into the next      */
+/*  plan. The planner therefore keeps a per-session EMA of                     */
+/*  `landing − target` (same meter basis) and pre-compensates the next target  */
+/*  by it, so the LANDING — not the retain handed downstream — reaches the     */
+/*  nominal band.                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * EMA weight of the newest landing observation. Matches the growth EMA's 0.5
+ * convention (one-fold half-life), so a day-over-day overhead drift is tracked
+ * within a couple of cadences without thrashing on a single outlier fold.
+ */
+export const GOV_TARGET_DEVIATION_ALPHA = 0.5
+/**
+ * Cap on the learned correction, as a share of the basis. 0.12 keeps the
+ * pre-compensated retain at ≥ 0.43×basis on the normal 0.55 memory floor; the
+ * correction NEVER crosses the memory floor itself (0.55, or 0.35 under the
+ * deep probe — `Math.max(raw − corr, memoryFloor)`), so the feedback can only
+ * WIDEN the effective band down to the floor, never empty the memory. (The
+ * 0.25 {@link GOV_TARGET_FLOOR} hard floor is a lower bound of the envelope,
+ * not the landing bottom.)
+ */
+export const GOV_TARGET_DEVIATION_MAX = 0.12
+
+/**
+ * Fold the latest landing observation into the per-session deviation EMA.
+ *
+ * The delta is SIGNED (landing − planned target): a persistent overshoot grows
+ * the correction, and an over-correction (landing below target) shrinks it
+ * back, so the loop is a stable negative-feedback controller around zero
+ * residual error rather than a ratchet.
+ * @param previous - the previous EMA in tokens, `undefined` on first fold.
+ * @param landingDelta - `landing − target` of the fold that just committed.
+ * @param alpha - EMA weight of the newest observation (default
+ *   {@link GOV_TARGET_DEVIATION_ALPHA}).
+ * @returns the new EMA in tokens (non-finite input keeps the previous value).
+ */
+export function nextTargetDeviationEma(
+  previous: number | undefined,
+  landingDelta: number,
+  alpha: number = GOV_TARGET_DEVIATION_ALPHA,
+): number {
+  if (!Number.isFinite(landingDelta)) return previous === undefined ? 0 : previous
+  if (previous === undefined) return landingDelta
+  const a = Number.isFinite(alpha) ? Math.min(1, Math.max(0, alpha)) : GOV_TARGET_DEVIATION_ALPHA
+  return previous * (1 - a) + landingDelta * a
+}
+
+/**
+ * The bounded correction the planner applies to the target ratio: the learned
+ * deviation as a share of the basis, clamped to `[0, max]`.
+ *
+ * Clamping at 0 (never negative) means the loop can only widen the band — the
+ * nominal target stays the shallowest compression the planner will pick, so a
+ * stale negative EMA cannot make the planner lazier than its configured band.
+ * @param deviationTokens - the per-session deviation EMA in tokens.
+ * @param basisTokens - the lane's basis (fold pressure budget / window).
+ * @param max - cap as a share of the basis (default
+ *   {@link GOV_TARGET_DEVIATION_MAX}).
+ * @returns the correction ratio in `[0, max]` (0 for unknown input).
+ */
+export function targetDeviationCorrection(
+  deviationTokens: number | undefined,
+  basisTokens: number,
+  max: number = GOV_TARGET_DEVIATION_MAX,
+): number {
+  if (deviationTokens === undefined || !Number.isFinite(deviationTokens)) return 0
+  if (!Number.isFinite(basisTokens) || basisTokens <= 0) return 0
+  const cap = Number.isFinite(max) ? Math.max(0, max) : GOV_TARGET_DEVIATION_MAX
+  return clampRange(deviationTokens / basisTokens, 0, cap)
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Large-window deep probe (magnitude-driven floor relaxation)                */
+/*                                                                              */
+/*  On a big window the 0.55 memory floor costs hundreds of thousands of       */
+/*  tokens while the window itself is mostly empty: a 1M window whose fold     */
+/*  budget is capped by the completion reserve folds at ~35% WINDOW fill,      */
+/*  purely on cadence. When the content intent says the bulk is disposable     */
+/*  (magnitude ≥ 0.5, i.e. tool-heavy), the memory floor relaxes so the        */
+/*  magnitude signal can actually reach a deeper target and the cadence        */
+/*  lengthens. The constants below stay BOUNDARIES; the magnitude intent       */
+/*  stays the driver — no relaxation without it, none near overflow.           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Minimum window (tokens) that qualifies as "large". 512k is half of a 1M
+ * window: below it, the 0.55 floor's absolute cost is small enough that the
+ * extra depth is not worth the tail loss.
+ */
+export const GOV_DEEP_PROBE_MIN_WINDOW = 524_288
+/**
+ * Deep probe only while the measured quantity is below this share of the
+ * WINDOW (not the basis). A fold this early in the window is cadence/seam
+ * driven, not overflow driven — going deeper is safe exactly because the
+ * window has huge slack. At or above this fill the fold is pressure driven
+ * and the normal memory floor applies.
+ */
+export const GOV_DEEP_PROBE_MAX_WINDOW_FILL = 0.4
+/**
+ * Minimum content magnitude that may probe past the memory floor. 0.5 is the
+ * intelligence module's neutral point (pure-tool ≈ 0.95, half-tool ≈ 0.55),
+ * so only a genuinely tool-heavy context unlocks the deeper floor.
+ */
+export const GOV_DEEP_PROBE_MIN_MAGNITUDE = 0.5
+/**
+ * Relaxed memory floor for the deep probe. The landing bottoms out AT this
+ * floor: the deviation correction is clamped by `Math.max(raw − corr, floor)`,
+ * so it never lands below 0.35×basis even after the maximum 0.12 correction.
+ */
+export const GOV_DEEP_PROBE_MEMORY_FLOOR = 0.35
+/**
+ * Fill ratio (measured/basis) at which the fill-driven slide starts; the old
+ * dynamicCompactionRatio used 0.5. Kept as a constant so both lanes agree.
+ */
+export const GOV_FILL_START = 0.5
+/** Fill ratio span over which the fill-driven slide runs to the floor (0.4). */
+export const GOV_FILL_SPAN = 0.4
+
+/** Clamp to [0, 1]; non-finite input collapses to 0. */
+export function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.min(1, Math.max(0, value))
+}
+
+/** Clamp `value` into `[lo, hi]`; a non-finite value collapses to `lo`. */
+export function clampRange(value: number, lo: number, hi: number): number {
+  if (!Number.isFinite(value)) return lo
+  return Math.min(hi, Math.max(lo, value))
+}
+
+/**
+ * Map a fill ratio (measured / basis) onto the fill-pressure term in [0, 1].
+ * At or below {@link GOV_FILL_START} there is no fill pressure; the curve is
+ * fully applied once fill reaches `GOV_FILL_START + GOV_FILL_SPAN`.
+ * @param fillRatio - measured tokens divided by the basis (window or budget).
+ * @returns fill pressure in [0, 1].
+ */
+export function fillPressureOf(fillRatio: number): number {
+  return clamp01((fillRatio - GOV_FILL_START) / GOV_FILL_SPAN)
+}
+
+/** The three pressures that can pull the trigger down. */
+export interface TriggerCurveInput {
+  /** The configured (laziest) trigger ratio. */
+  readonly anchor: number
+  /** Hard lower bound the slide may reach. */
+  readonly floor: number
+  /** Hard upper bound; also the ceiling of the anchor itself. */
+  readonly ceiling: number
+  /** 0..1 pressure from how full the context already is. */
+  readonly fillPressure: number
+  /** 0..1 pressure from the measured per-step growth. */
+  readonly growthPressure: number
+  /** 0..1 pressure from session maturity (prior compressions). */
+  readonly stagePressure: number
+}
+
+/**
+ * The shared trigger curve: start at the anchor and slide toward the floor as
+ * the strongest of the three pressures rises. Monotonic and hard-bounded.
+ * @param input - anchor/floor/ceiling and the three pressures.
+ * @returns the effective trigger ratio in `[floor, anchor]`.
+ */
+export function compactionTriggerRatio(input: TriggerCurveInput): number {
+  const ceiling = Number.isFinite(input.ceiling) ? Math.max(0, input.ceiling) : 1
+  const floorRaw = clampRange(input.floor, 0, ceiling)
+  const anchor = clampRange(input.anchor, floorRaw, ceiling)
+  const floor = Math.min(anchor, floorRaw)
+  const pressure = Math.max(
+    clamp01(input.fillPressure),
+    clamp01(input.growthPressure),
+    clamp01(input.stagePressure),
+  )
+  return Math.max(floor, anchor - (anchor - floor) * pressure)
+}
+
+/** Resolved hard bounds for the unified water levels. */
+export interface WaterLevelBounds {
+  readonly triggerCeiling: number
+  readonly triggerFloor: number
+  readonly targetFloor: number
+  readonly minBand: number
+  readonly maxBand: number
+  readonly safetyMargin: number
+  readonly stageBand: number
+  /** Cap on the stage (maturity) pressure; omit for legacy behaviour. */
+  readonly stageTriggerCap?: number
+  readonly hotGrowth: number
+  readonly matureCompressions: number
+}
+
+/** Default bounds (the shipped safety envelope). */
+export const DEFAULT_WATER_LEVEL_BOUNDS: WaterLevelBounds = {
+  triggerCeiling: GOV_TRIGGER_CEILING,
+  triggerFloor: GOV_TRIGGER_FLOOR,
+  targetFloor: GOV_TARGET_FLOOR,
+  minBand: GOV_MIN_BAND,
+  maxBand: GOV_MAX_BAND,
+  safetyMargin: GOV_SAFETY_MARGIN,
+  stageBand: GOV_STAGE_BAND,
+  hotGrowth: GOV_HOT_GROWTH,
+  matureCompressions: GOV_MATURE_COMPRESSIONS,
+}
+
+/** Input for {@link compactionWaterLevels}. */
+export interface WaterLevelInput {
+  /** Configured trigger ratio (the LAZIEST point). */
+  readonly baseTriggerRatio: number
+  /** Configured target ratio (the SHALLOWEST compression). */
+  readonly baseTargetRatio: number
+  /** Effective basis (budget for fold, window for durable). */
+  readonly budgetTokens: number
+  /**
+   * Measured/basis fill ratio for the fill-driven term. Omit (or pass a
+   * non-finite value) when the curve is evaluated without a measurement; the
+   * fill term then contributes zero pressure, which makes the result identical
+   * to the fold lane's pre-governance dynamicHistoryLevels curve.
+   */
+  readonly fillRatio?: number
+  /** Smoothed per-step growth in tokens. */
+  readonly growthTokens: number
+  /** Rounds between two compressions (cadence the band must cover). */
+  readonly compressInterval: number
+  /** Successful compressions so far this session. */
+  readonly compressions: number
+  /** Tokens reserved for the plugin's own per-turn injection. */
+  readonly injectionBudget: number
+  /**
+   * LEARNED TEMPO: when true, the growth/fill/stage downslide is bypassed —
+   * the runway scheduler's failure servo owns trigger timing from observed
+   * cycles, and a fixed "busier = earlier" heuristic would fight it. The
+   * anchor still arrives as `baseTriggerRatio` (the learned value), clamped
+   * to the same hard band as always.
+   */
+  readonly tempoLearned?: boolean
+  /**
+   * Learned amplitude scale (recall-driven, clamped [0.5, 2] upstream):
+   * multiplies the configured band. Undefined = unscaled.
+   */
+  readonly bandScale?: number
+  /** Override the shipped hard bounds (legacy lanes keep their own values). */
+  readonly bounds?: Partial<WaterLevelBounds>
+}
+
+/** Bounded water levels for one check. */
+export interface WaterLevels {
+  readonly triggerRatio: number
+  readonly targetRatio: number
+  readonly triggerTokens: number
+  readonly targetTokens: number
+}
+
+/**
+ * The ONE water-level computation: a bounded trigger (fill + growth + stage)
+ * and a target whose band covers one full cadence of measured growth.
+ *
+ * Hard bounds are always applied. Non-finite inputs degrade to the most
+ * conservative level rather than producing NaN.
+ * @param input - anchors, basis, growth, interval, maturity, bounds.
+ * @returns the bounded ratios plus their token forms.
+ */
+export function compactionWaterLevels(input: WaterLevelInput): WaterLevels {
+  const b: WaterLevelBounds = { ...DEFAULT_WATER_LEVEL_BOUNDS, ...(input.bounds ?? {}) }
+  const budget = Number.isFinite(input.budgetTokens) && input.budgetTokens > 0 ? input.budgetTokens : 1
+
+  const minAnchor = b.targetFloor + b.minBand
+  const anchor = Math.min(
+    b.triggerCeiling,
+    Math.max(minAnchor, Number.isFinite(input.baseTriggerRatio) ? input.baseTriggerRatio : b.triggerFloor),
+  )
+  const floor = Math.min(anchor, b.triggerFloor)
+
+  const growthRatio = Math.min(0.5, Math.max(0,
+    Number.isFinite(input.growthTokens) ? input.growthTokens / budget : 0,
+  ))
+  const mature = Number.isFinite(b.matureCompressions) && b.matureCompressions > 0
+    ? b.matureCompressions
+    : GOV_MATURE_COMPRESSIONS
+  const stageCap = Number.isFinite(b.stageTriggerCap) ? clamp01(b.stageTriggerCap as number) : 1
+  const stage = Math.min(clamp01(input.compressions / mature), stageCap)
+  const hot = Number.isFinite(b.hotGrowth) && b.hotGrowth > 0 ? b.hotGrowth : GOV_HOT_GROWTH
+
+  // LEARNED TEMPO: the runway scheduler owns trigger timing — the downslide
+  // (busier = earlier) is bypassed entirely, because it is the mechanism the
+  // scheduler replaces: it fired folds EARLIER under fast growth, which is
+  // precisely the "too frequent" behavior the observed-cycle servo exists to
+  // unlearn. Anchor clamp + hard bounds below still apply unchanged.
+  const tempoLearned = input.tempoLearned === true
+
+  const triggerRatio = compactionTriggerRatio({
+    anchor,
+    floor,
+    ceiling: b.triggerCeiling,
+    fillPressure: tempoLearned || !Number.isFinite(input.fillRatio) ? 0 : fillPressureOf(input.fillRatio as number),
+    growthPressure: tempoLearned ? 0 : clamp01(growthRatio / hot),
+    stagePressure: tempoLearned ? 0 : stage,
+  })
+
+  const baseTarget = Math.min(
+    Math.max(b.targetFloor, Number.isFinite(input.baseTargetRatio) ? input.baseTargetRatio : b.targetFloor),
+    anchor - b.minBand,
+  )
+  const configuredBand = Math.max(b.minBand, anchor - baseTarget)
+  const interval = Number.isFinite(input.compressInterval) ? Math.max(1, input.compressInterval) : 1
+  // The growth-reserve term is part of the old heuristic (band widens under
+  // fast growth to cover `interval` rounds) — under learned tempo the servo
+  // owns cycle length, so only the configured band (amplitude-scaled) counts.
+  const reserve = tempoLearned
+    ? 0
+    : growthRatio * interval + b.safetyMargin + b.stageBand * stage
+  // The recall-driven amplitude scale arrives pre-clamped [0.5, 2] from the
+  // scheduler; the min/max band bounds below stay the law either way.
+  const bandScale = tempoLearned && Number.isFinite(input.bandScale)
+    ? (input.bandScale as number)
+    : 1
+  const band = Math.min(
+    b.maxBand,
+    Math.max(b.minBand, Math.max(configuredBand * bandScale, reserve)),
+  )
+  const maxTarget = Math.max(b.targetFloor, triggerRatio - b.minBand)
+  const targetRatio = Math.min(maxTarget, Math.max(b.targetFloor, triggerRatio - band))
+
+  const injection = Number.isFinite(input.injectionBudget) ? Math.max(0, input.injectionBudget as number) : 0
+  // Token-space floors: the per-turn injection (RAG + task-state) is
+  // subtracted from the ratio-space levels, and on a small window that
+  // subtraction annihilates them (trigger 1 / target 0 on a 4k window —
+  // fold-every-step with zero verbatim retention, voiding the floor's
+  // contract). The floors therefore hold in TOKEN space: the injection is
+  // capped to what can be spent beyond them. The trigger floor uses
+  // min(floor, ratio) so a deliberately low anchor stays respected.
+  const triggerFloorTokens = Math.floor(budget * Math.min(b.triggerFloor, triggerRatio))
+  const targetFloorTokens = Math.floor(budget * b.targetFloor)
+  const cappedInjection = Math.min(
+    injection,
+    Math.max(0, Math.floor(budget * triggerRatio) - triggerFloorTokens),
+  )
+  return {
+    triggerRatio,
+    targetRatio,
+    triggerTokens: Math.max(triggerFloorTokens, Math.floor(budget * triggerRatio) - cappedInjection),
+    targetTokens: Math.max(targetFloorTokens, Math.floor(budget * targetRatio) - cappedInjection),
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Surface snapshot                                                           */
+/*  One normalized per-step view of the request, built from the authoritative  */
+/*  token meter with an optional CONSERVATIVE correction from a CJK-aware      */
+/*  estimator. This is the basis the unified planner reads.                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Normalized one-step surface snapshot.
+ *
+ * `totalTokens` is request pressure (system/tools/envelope + surface);
+ * `surfaceTokens` is the surface-only sum the fold lane rewrites, and
+ * `fixedTokens = totalTokens - surfaceTokens` is the envelope the fold cannot
+ * reclaim. The fold lane compares its own `surfaceTokens` against the water
+ * levels directly (its basis IS the surface budget); `fixedTokens` is read by
+ * the fit-guard, which must see the whole request.
+ */
+export interface SurfaceSnapshot {
+  readonly totalTokens: number
+  readonly surfaceTokens: number
+  readonly fixedTokens: number
+  readonly window: number
+  readonly declaredWindow?: number
+}
+
+/** Input for {@link toSurfaceSnapshot}. */
+export interface SurfaceSnapshotInput {
+  /** Request pressure from the token meter (totalTokens). */
+  readonly totalTokens: number
+  /** Surface-only sum from the token meter (surfaceTokens). */
+  readonly surfaceTokens: number
+  /** Effective window for the routed model (narrowed ?? declared). */
+  readonly window: number
+  /** DSH-declared window, when known (to detect narrowed < declared). */
+  readonly declaredWindow?: number
+  /**
+   * Optional second surface estimate. DSH's fixed meter prices text at
+   * CHARS_PER_TOKEN=4 with no CJK special-case, so a Chinese-heavy surface can
+   * be UNDER-counted by the meter; the plugin's CJK-aware heuristic is passed
+   * here so the snapshot takes the CONSERVATIVE (larger) value. Neither
+   * estimator may understate the surface.
+   */
+  readonly alternateSurfaceTokens?: number
+}
+
+/**
+ * Build a normalized snapshot, guarding every field and taking the larger of
+ * the two surface estimates. `totalTokens` is lifted by the same amount the
+ * surface estimate is lifted, so `fixedTokens` (envelope) is preserved.
+ * @param input - meter values plus the optional CJK-aware correction.
+ * @returns a finite, internally consistent snapshot.
+ */
+export function toSurfaceSnapshot(input: SurfaceSnapshotInput): SurfaceSnapshot {
+  const window = Number.isFinite(input.window) && input.window > 0 ? input.window : 1
+  const meterTotal = Number.isFinite(input.totalTokens) && input.totalTokens > 0 ? input.totalTokens : 0
+  const meterSurface = Number.isFinite(input.surfaceTokens) && input.surfaceTokens > 0 ? input.surfaceTokens : 0
+  const alternate = Number.isFinite(input.alternateSurfaceTokens) && (input.alternateSurfaceTokens ?? 0) > 0
+    ? (input.alternateSurfaceTokens as number)
+    : 0
+  const surfaceTokens = Math.max(meterSurface, alternate)
+  const totalTokens = Math.max(meterTotal, meterSurface) + Math.max(0, surfaceTokens - meterSurface)
+  const declaredWindow = Number.isFinite(input.declaredWindow) && (input.declaredWindow ?? 0) > 0
+    ? (input.declaredWindow as number)
+    : undefined
+  return {
+    totalTokens,
+    surfaceTokens,
+    fixedTokens: Math.max(0, totalTokens - surfaceTokens),
+    window,
+    ...(declaredWindow === undefined ? {} : { declaredWindow }),
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Unified planner                                                            */
+/*  ONE policy function decides lane + water levels for a step. Each hook      */
+/*  calls it with its own capabilities, so the two executors can never use     */
+/*  different rules. (Status: the FOLD lane is fully wired through             */
+/*  planFoldCompaction; the durable lane still runs its legacy                 */
+/*  decidePressureCompaction curve — planCompaction's durable branches are     */
+/*  the wiring target, not yet the runtime.)                                   */
+/* -------------------------------------------------------------------------- */
+
+/** fit-guard reserve as a share of the window (replaces a fixed constant). */
+export const GOV_GUARD_RESERVE_RATIO = 0.08
+/** Absolute minimum fit-guard reserve. */
+export const GOV_GUARD_RESERVE_MIN = 1024
+
+/** Minimum share of the window the fold planner keeps for the prompt. */
+export const GOV_MIN_PROMPT_SHARE = 0.5
+/** Fold checks to wait after a configuration-class summarization error. */
+export const GOV_CONFIG_ERROR_COOLDOWN = 60
+
+export interface FoldBudgetInput {
+  readonly window: number
+  readonly reservedCompletion: number
+  readonly headroom: number
+  /** Override the minimum prompt share (default {@link GOV_MIN_PROMPT_SHARE}). */
+  readonly minPromptShare?: number
+}
+
+/**
+ * The fold lane's pressure budget, hardened against degenerate request caps.
+ *
+ * A request cap that reserves (almost) the whole window would otherwise
+ * collapse the budget to one token, which is not a plan: the fold trigger and
+ * target both become meaningless. Keep a minimum prompt share, clamp the
+ * completion reserve to what the window can actually spare, and never return
+ * less than one token. (The share is bounded by the caller's headroom: a
+ * headroom ≥ window − minBudget — a misconfiguration — can still push the
+ * result below the share; the caller owns that knob.)
+ * @param input - window, requested completion reserve and plugin headroom.
+ * @returns the usable prompt budget in tokens (>= 1).
+ */
+export function foldPressureBudget(input: FoldBudgetInput): number {
+  const window = Number.isFinite(input.window) && input.window > 0 ? input.window : 1
+  const headroom = Number.isFinite(input.headroom) ? Math.max(0, input.headroom) : 0
+  const share = Number.isFinite(input.minPromptShare)
+    ? Math.min(0.9, Math.max(0.1, input.minPromptShare as number))
+    : GOV_MIN_PROMPT_SHARE
+  const minBudget = Math.max(2048, Math.floor(window * share))
+  const maxReserve = Math.max(0, window - headroom - minBudget)
+  const requested = Number.isFinite(input.reservedCompletion)
+    ? Math.max(0, input.reservedCompletion)
+    : 0
+  const reserve = Math.min(requested, maxReserve)
+  return Math.max(1, Math.floor(window - reserve - headroom))
+}
+
+/**
+ * Completion reserve substituted for a PLACEHOLDER request cap.
+ *
+ * A `maxTokens` declared at (or above) the whole window is the "never
+ * truncate" setting, not a completion budget — it carries no usable
+ * information about how much room the next completion needs, yet honored raw
+ * it clamps to a quarter of the window and silently halves the fold budget
+ * (the 2026-11 Ubuntu low-water diagnosis: `maxTokens: 128000` on a 128000
+ * window folded at ~40% of the real context). 8192 covers a generous agent
+ * completion; `foldPressureBudget` still clamps it for windows too small to
+ * spare that much.
+ */
+export const GOV_PLACEHOLDER_COMPLETION_RESERVE = 8192
+
+/**
+ * The completion reserve a request cap contributes to the fold budget.
+ *
+ * A sane cap (0 < cap < window) passes through untouched — honest-aggressive
+ * caps included; the min-prompt-share clamp keeps its promised floor for
+ * them. Anything else (a cap at or above the window, an absent cap whose
+ * model default is unknown) degrades to
+ * {@link GOV_PLACEHOLDER_COMPLETION_RESERVE} and never to 0: a zero reserve
+ * levels the fold budget with the durable lane's, and the durable lane would
+ * then win every race.
+ */
+export function completionReserveOf(declaredMaxTokens: number, window: number): number {
+  if (Number.isFinite(declaredMaxTokens) && declaredMaxTokens > 0 && declaredMaxTokens < window) {
+    return declaredMaxTokens
+  }
+  return GOV_PLACEHOLDER_COMPLETION_RESERVE
+}
+
+/**
+ * Cooldown after a failed summarization, classified by error kind.
+ *
+ * A configuration error (unsupported reasoning effort, impossible completion
+ * reserve) will not heal by retrying every few rounds, so it backs off much
+ * longer than a transient failure; the planner still retries eventually.
+ * @param current - the session's existing cooldown.
+ * @param errorMessage - the failure message.
+ * @param transientCooldown - rounds to wait for a transient error.
+ * @returns the next cooldown (>= 1).
+ */
+/**
+ * Minimum shadowed tokens worth folding: a fold must be able to beat its own
+ * summary, so tiny 1–3 message folds are skipped instead of churning.
+ * @param budgetTokens - the fold pressure budget.
+ * @returns the minimum fold size in tokens.
+ */
+export function minimumFoldTokens(budgetTokens: number): number {
+  const budget = Number.isFinite(budgetTokens) && budgetTokens > 0 ? budgetTokens : 1
+  // Cap the floor: a 1M window must not demand 50k-token folds (a normal
+  // 75k fold would clear it, but a 30k fold is still worth doing).
+  return Math.min(16_384, Math.max(2048, Math.floor(budget * 0.1)))
+}
+
+/**
+ * The thin-fold gate: is this fold's NET saving (folded tokens minus the
+ * summarizer's own expected output) below its share of the budget?
+ *
+ * Complements {@link minimumFoldTokens}: that floor prices the fold against
+ * the SUMMARY mechanism, this one prices the fold against the BUDGET it is
+ * supposed to relieve. On a small window both floors bind and only a deep
+ * occasion (nudge, fit-guard) is worth the summarizer call.
+ * @param foldTokens - tokens the range selector would fold.
+ * @param expectedSummaryTokens - the summarizer's expected output for them.
+ * @param budgetTokens - the fold lane's pressure budget.
+ * @param minRatio - minimum net saving as a share of the budget
+ *   (default {@link GOV_MIN_NET_SAVING_RATIO}; 0 disables the gate).
+ * @returns true when the fold should be skipped as not worth its cost.
+ *   Non-finite input conservatively reads as thin (skip).
+ */
+export function isThinFold(
+  foldTokens: number,
+  expectedSummaryTokens: number,
+  budgetTokens: number,
+  minRatio: number = GOV_MIN_NET_SAVING_RATIO,
+): boolean {
+  // Unknown ANY input term means the saving cannot be priced: conservatively
+  // thin (skip) rather than fold blind.
+  if (!Number.isFinite(budgetTokens) || budgetTokens <= 0) return true
+  if (!Number.isFinite(foldTokens)) return true
+  if (!Number.isFinite(expectedSummaryTokens)) return true
+  const saving = Math.max(0, foldTokens) - Math.max(0, expectedSummaryTokens)
+  const ratio = Number.isFinite(minRatio) ? Math.max(0, minRatio) : GOV_MIN_NET_SAVING_RATIO
+  return saving < budgetTokens * ratio
+}
+
+/**
+ * Character budget for a summary that must stay below the folded content.
+ * Local models often over-produce; the commit is capped to the planned share.
+ * @param shadowedTokens - tokens in the folded region.
+ * @param share - expected summary share of the input (default 0.3).
+ * @returns the summary character budget (>= 1024).
+ */
+export function summaryCharBudget(shadowedTokens: number, share = 0.3): number {
+  const tokens = Number.isFinite(shadowedTokens) && shadowedTokens > 0 ? shadowedTokens : 0
+  const s = Number.isFinite(share) ? Math.min(0.9, Math.max(0.05, share)) : 0.3
+  return Math.max(1024, Math.floor(tokens * s) * 4)
+}
+
+/**
+ * Machine codes that mean "the provider refused this request BODY".
+ *
+ * Issue #2 (`安装插件后，dsh无法使用`): a gateway that maps an OpenAI-compatible
+ * body onto Anthropic's schema answered every summarization with
+ * `Invalid JSON data: Failed to deserialize the JSON body into the target type:
+ * thinking: missing field "budget_tokens" and code `INVALID_REQUEST`. The
+ * fold that sent it is not retryable as-is — the same body is rejected every
+ * time — so the planner must treat it as a configuration refusal, not as a
+ * transient error.
+ */
+export const REASONING_REJECTION_CODES: readonly string[] = [
+  'INVALID_REQUEST',
+  'UNSUPPORTED_REASONING_EFFORT',
+]
+
+/**
+ * Message shapes that name the reasoning / thinking parameter as the rejected
+ * part of the body, across the wordings seen in the wild:
+ * - serde: `thinking: missing field budget_tokens` (Anthropic-shaped relay
+ *   reached through an OpenAI-compatible dialect, which sends
+ *   `thinking: { type: 'enabled' }` with no budget);
+ * - DSH's own seam: `does not support reasoning effort "…"` /
+ *   `UNSUPPORTED_REASONING_EFFORT`;
+ * - providers that say the level itself is unknown or unsupported.
+ */
+const REASONING_REJECTION_MESSAGE =
+  /budget_tokens|missing field\s*[`'"]?thinking|thinking[^\n]{0,60}missing field|does not support reasoning(?:\s+effort)?|unsupported reasoning|UNSUPPORTED_REASONING_EFFORT|reasoning (?:effort|level)[^\n]{0,60}(?:not support|unsupported|invalid|unknown)/i
+
+/**
+ * Whether one failure is a refusal of the reasoning/thinking parameter rather
+ * than a transient provider fault. Pure, so the contract check can pin the
+ * exact issue-#2 wording.
+ * @param errorMessage - the failure message as the plugin sees it.
+ * @param code - the machine code beside it (`LlmError.code`, finish-chunk
+ *   `failure.code`), when one was reported.
+ * @returns true when resending the same reasoning-shaped body cannot succeed.
+ */
+export function isReasoningConfigRejection(errorMessage: string, code?: string): boolean {
+  const message = typeof errorMessage === 'string' ? errorMessage : ''
+  if (REASONING_REJECTION_MESSAGE.test(message)) return true
+  // `INVALID_REQUEST` alone covers every kind of rejected body (size caps,
+  // malformed tool schemas), so it only counts when the message points at
+  // thinking/reasoning.
+  return code !== undefined
+    && REASONING_REJECTION_CODES.includes(code)
+    && /\bthinking\b|reasoning/i.test(message)
+}
+
+export function failureCooldownFor(
+  current: number,
+  errorMessage: string,
+  transientCooldown = 3,
+  code?: string,
+): number {
+  const configError = /TargetPressureConfigError|no message budget|leaving no pressure budget/i
+    .test(errorMessage)
+    || isReasoningConfigRejection(errorMessage, code)
+  // Both branches take max(current, …): a transient error must not SHORTEN a
+  // longer cooldown already in force (a 60-round config backoff decaying via
+  // round-decrements must not snap to 3 because one network timeout followed).
+  const guardedCurrent = Number.isFinite(current) ? current : 0
+  if (configError) return Math.max(guardedCurrent, GOV_CONFIG_ERROR_COOLDOWN)
+  return Math.max(guardedCurrent, 1, Math.floor(transientCooldown))
+}
+/** Single-round growth (share of window) that bypasses the round rate limit. */
+export const GOV_SURGE_RATIO = 0.2
+
+/** Executor the plan recommends. */
+export type GovernanceLane = 'none' | 'fold' | 'durable'
+
+/** Why the plan recommends what it does. */
+export type GovernanceReason =
+  | 'below-trigger'
+  | 'nudge'
+  | 'surge'
+  | 'pressure'
+  | 'narrowed-window'
+  | 'overflow'
+  | 'fit-guard'
+  | 'cooldown'
+  | 'rate-limited'
+  | 'forced'
+
+/** Hard bounds for the planner (water-level bounds plus routing margins). */
+export interface GovernanceBounds extends WaterLevelBounds {
+  /** Minimum retained share of the budget (see {@link GOV_TARGET_MEMORY_FLOOR}). */
+  readonly memoryTargetFloor: number
+  readonly guardReserveRatio: number
+  readonly guardReserveMin: number
+  readonly surgeRatio: number
+  /** Cap on the learned landing-deviation correction (share of the basis). */
+  readonly targetDeviationMax: number
+  /** Minimum window (tokens) that qualifies for the deep probe. */
+  readonly deepProbeMinWindow: number
+  /** Maximum measured/window fill under which the deep probe may relax. */
+  readonly deepProbeMaxWindowFill: number
+  /** Minimum content magnitude that may probe past the memory floor. */
+  readonly deepProbeMinMagnitude: number
+  /** Relaxed memory floor used by the deep probe. */
+  readonly deepProbeMemoryFloor: number
+  /** Memory floor a clean seam may relax to (see {@link GOV_SEAM_MEMORY_FLOOR}). */
+  readonly seamMemoryFloor: number
+  /** Intent timing at/above which a step counts as a clean seam. */
+  readonly seamMinTiming: number
+}
+
+/** Shipped planner bounds. */
+export const DEFAULT_GOVERNANCE_BOUNDS: GovernanceBounds = {
+  ...DEFAULT_WATER_LEVEL_BOUNDS,
+  stageTriggerCap: GOV_STAGE_TRIGGER_CAP,
+  memoryTargetFloor: GOV_TARGET_MEMORY_FLOOR,
+  guardReserveRatio: GOV_GUARD_RESERVE_RATIO,
+  guardReserveMin: GOV_GUARD_RESERVE_MIN,
+  surgeRatio: GOV_SURGE_RATIO,
+  targetDeviationMax: GOV_TARGET_DEVIATION_MAX,
+  deepProbeMinWindow: GOV_DEEP_PROBE_MIN_WINDOW,
+  deepProbeMaxWindowFill: GOV_DEEP_PROBE_MAX_WINDOW_FILL,
+  deepProbeMinMagnitude: GOV_DEEP_PROBE_MIN_MAGNITUDE,
+  deepProbeMemoryFloor: GOV_DEEP_PROBE_MEMORY_FLOOR,
+  seamMemoryFloor: GOV_SEAM_MEMORY_FLOOR,
+  seamMinTiming: GOV_SEAM_MIN_TIMING,
+}
+
+/**
+ * Per-session state the planner reads. Mirrors the unified SessionCounter.
+ * `lastTokens` MUST be in the SAME basis as the caller's `measuredTokens`
+ * (fold: surface estimate; durable: whole-request pressure), or the surge
+ * comparison is meaningless.
+ */
+export interface GovernanceLedger {
+  readonly turn: number
+  readonly lastCompressedTurn?: number
+  readonly lastTokens?: number
+  readonly failureCooldown: number
+  readonly compressions: number
+  readonly growthTokens: number
+  /**
+   * Per-session EMA of `landing − target` in tokens (fold-lane learning). The
+   * planner pre-compensates the next target by it, bounded by
+   * `bounds.targetDeviationMax`; `undefined` (or a non-finite value) disables
+   * the closed loop, preserving the pre-feedback behaviour exactly.
+   */
+  readonly targetDeviationTokens?: number
+}
+
+/** What the calling hook is able to execute. */
+export interface GovernanceCapabilities {
+  /** The hook can fold the assembled request (agent/pre-step, post-next). */
+  readonly fold: boolean
+  /** The hook can run the durable-region compaction (compaction-basic path). */
+  readonly durable: boolean
+}
+
+/** Input for {@link planCompaction}. */
+export interface GovernanceInput {
+  readonly snapshot: SurfaceSnapshot
+  readonly ledger: GovernanceLedger
+  readonly capabilities: GovernanceCapabilities
+  /** Configured trigger anchor for the lane that owns this hook. */
+  readonly baseTriggerRatio: number
+  /** Configured target anchor (fold only). */
+  readonly baseTargetRatio: number
+  /** Rounds between two compressions. */
+  readonly compressInterval: number
+  /** Incoming base trigger: 'pressure' | 'context-overflow' | 'fold' | ... */
+  readonly incomingTrigger: string
+  /** Manual/tool force. */
+  readonly force: boolean
+  /** Whether the growth nudge is enabled. */
+  readonly nudge: boolean
+  /**
+   * Denominator for the water levels. The durable lane measures the whole
+   * request against the WINDOW; the fold lane measures the surface against its
+   * effective BUDGET (foldPressureBudget: window − completion reserve −
+   * headroom). Defaults to `snapshot.window`.
+   */
+  readonly basisTokens?: number
+  /**
+   * The quantity compared to the trigger, in the SAME basis as
+   * {@link basisTokens}. Durable passes the whole-request pressure; fold passes
+   * the surface-only estimate. Defaults to `snapshot.totalTokens`.
+   */
+  readonly measuredTokens?: number
+  /**
+   * Fill pressure override for the shared curve. The fold lane historically ran
+   * with NO fill term, so it passes 0; durable leaves it undefined and lets the
+   * planner derive it from measured/basis.
+   */
+  readonly fillRatio?: number
+  /** Tokens reserved for the plugin's own per-turn injection (fold lane). */
+  readonly injectionBudget?: number
+  /**
+   * LEARNED TEMPO (see {@link WaterLevelInput.tempoLearned}): bypasses the
+   * growth/fill/stage downslide; the anchor in `baseTriggerRatio` is then
+   * the runway scheduler's learned value, not the configured ratio.
+   */
+  readonly tempoLearned?: boolean
+  /** Learned amplitude scale for the band (see {@link WaterLevelInput.bandScale}). */
+  readonly bandScale?: number
+  /** Session-phase opportunity; omitted means neutral (score 0.5, mature). */
+  readonly opportunity?: CompactionOpportunity
+  /** Content/stage intent; when present it replaces the phase swing. */
+  readonly intent?: CompactionIntent
+  /**
+   * Per-session EMA of `landing − target` from committed folds, in tokens
+   * (same basis as {@link basisTokens}). The closed-loop band deepens the
+   * next target by the learned shortfall; undefined leaves it untouched.
+   */
+  readonly deviationEmaTokens?: number
+  readonly bounds?: Partial<GovernanceBounds>
+}
+
+/** One bounded plan for a step. */
+export interface CompactionPlan {
+  readonly lane: GovernanceLane
+  readonly reason: GovernanceReason
+  readonly triggerRatio: number
+  readonly targetRatio: number
+  /** Trigger in the CALLER's `measuredTokens` basis. */
+  readonly triggerTokens: number
+  /** Fold-executor alias of triggerTokens (its basis IS the surface). */
+  readonly surfaceTriggerTokens: number
+  /** Fold-executor alias of the target in the same basis. */
+  readonly targetSurfaceTokens: number
+  /** Observability: the three pressures and their max. */
+  readonly drivers: {
+    readonly fill: number
+    readonly growth: number
+    readonly stage: number
+    readonly urgency: number
+    /** Session-phase opportunity score (0..1). */
+    readonly opportunity: number
+    /** Session phase the score came from. */
+    readonly phase: string
+    /** Content/stage timing (0 = defer, 1 = clean seam); 0 when absent. */
+    readonly timing: number
+    /** Content/stage magnitude (0 = keep, 1 = fold deep); 0 when absent. */
+    readonly magnitude: number
+    /** Whether the last assistant/user message marks a milestone. */
+    readonly milestone: boolean
+  }
+}
+
+/**
+ * The ONE compaction policy. Decides whether to compact, which executor should
+ * run, and to what water level, inside hard bounds and the caller's
+ * capabilities.
+ *
+ * Priority (mirrors the legacy fold trigger): force > provider overflow >
+ * fit-guard > predicted nudge > below-trigger > cooldown > surge >
+ * interval-elapsed pressure (narrowed window → durable, else fold) >
+ * rate-limited. A lane the caller cannot execute is downgraded (durable → fold
+ * when possible) or suppressed.
+ * @param input - snapshot, ledger, capabilities, anchors and bounds.
+ * @returns the bounded plan (never throws, never NaN).
+ */
+export function planCompaction(input: GovernanceInput): CompactionPlan {
+  const b: GovernanceBounds = { ...DEFAULT_GOVERNANCE_BOUNDS, ...(input.bounds ?? {}) }
+  const { snapshot, ledger } = input
+  const window = Number.isFinite(snapshot.window) && snapshot.window > 0 ? snapshot.window : 1
+  const fixedTokens = Number.isFinite(snapshot.fixedTokens) ? Math.max(0, snapshot.fixedTokens) : 0
+  const basis = Number.isFinite(input.basisTokens) && (input.basisTokens ?? 0) > 0
+    ? (input.basisTokens as number)
+    : window
+  const measured = Number.isFinite(input.measuredTokens)
+    ? (input.measuredTokens as number)
+    : snapshot.totalTokens
+  const injection = Number.isFinite(input.injectionBudget) ? Math.max(0, input.injectionBudget ?? 0) : 0
+  const fillRatio = Number.isFinite(input.fillRatio)
+    ? (input.fillRatio as number)
+    : (basis > 0 ? measured / basis : 0)
+
+  const levels = compactionWaterLevels({
+    baseTriggerRatio: input.baseTriggerRatio,
+    baseTargetRatio: input.baseTargetRatio,
+    budgetTokens: basis,
+    fillRatio,
+    growthTokens: ledger.growthTokens,
+    compressInterval: input.compressInterval,
+    compressions: ledger.compressions,
+    injectionBudget: injection,
+    ...(input.tempoLearned === true ? { tempoLearned: true } : {}),
+    ...(input.bandScale === undefined ? {} : { bandScale: input.bandScale }),
+    bounds: b,
+  })
+
+  // In the caller's basis, 'trigger' and 'target' are exactly the water levels;
+  // the surface-basis fields are the same numbers for the fold lane (whose
+  // basis IS the surface budget) and are advisory for the durable lane.
+  // Opportunity modulation: a good seam lowers the trigger (compact now), a
+  // bad one raises it (defer), always inside the hard water-level bounds.
+  const opp = input.opportunity
+  const oppScore = opp === undefined ? 0.5 : clamp01(opp.score)
+  const maturity = opp === undefined ? 1 : clamp01(opp.maturity)
+  // Symmetric modulation around a neutral 0.5: a good seam lowers the
+  // trigger (compact now), a bad one raises it (defer), and no signal at all
+  // (legacy callers/tests) leaves the plan untouched. Hard bounds always win.
+  const intent = input.intent
+  const intentTiming = intent === undefined ? undefined : clamp01(intent.timing)
+  // The content/stage intent already encodes the phase; do not double-count it.
+  const swing = intent !== undefined || opp === undefined ? 0 : (0.5 - oppScore) * (OPP_BONUS_MAX * 2)
+  const earlyPenalty = opp === undefined ? 0 : (1 - maturity) * OPP_EARLY_PENALTY
+  const intentDelta = intentTiming === undefined ? 0 : (0.5 - intentTiming) * 0.10
+  const triggerRatio = clampRange(
+    levels.triggerRatio + swing + earlyPenalty + intentDelta,
+    b.triggerFloor,
+    b.triggerCeiling,
+  )
+  const intentMagnitude = intent === undefined ? undefined : clamp01(intent.magnitude)
+  // Deep probe: on a large, mostly-empty window whose bulk is disposable
+  // (the intent says tool-heavy), the 0.55 memory floor costs hundreds of
+  // thousands of tokens while the window sits idle — a 1M session folded on
+  // cadence alone at ~35% window fill. The floor relaxes so the magnitude
+  // signal can actually REACH a deeper target. Fill is measured against the
+  // WINDOW (not the budget): the probe is about the window's spare room, and
+  // the budget already subtracts the completion reserve.
+  const deepProbe = window >= b.deepProbeMinWindow
+    && snapshot.surfaceTokens / window < b.deepProbeMaxWindowFill
+    && intentMagnitude !== undefined
+    && intentMagnitude >= b.deepProbeMinMagnitude
+  const memoryTargetFloor = deepProbe ? b.deepProbeMemoryFloor : b.memoryTargetFloor
+  // SEAM-GATED DEEP FOLD (2026-11-26 water-level complaint): the memory floor
+  // is the tool-loop cold-start anchor, NOT a plate: with intent signals
+  // present the AI owns the depth ENTIRELY — floor and ceiling alike. The
+  // dial is the STRONGER of the two judgments: the seam timing/milestone
+  // ("this is the moment") and the content magnitude ("the material is
+  // disposable"). It interpolates the target LINE from the memory anchor all
+  // the way down to `seamMemoryFloor` (0: no policy floor), and the magnitude
+  // meters the DRAIN toward that line (0.5 when the content reads sensitive,
+  // 1.0 when disposable). What binds below the AI's choice is only
+  // structure — the retained tail, the summary and the pinned head cannot be
+  // folded — and above it stand the emergency lanes (fit-guard, provider
+  // overflow, forced). The learned recall servo brakes misjudgments; every
+  // fold stays reversible through the fl_ archive. Without intent signals
+  // (cold start) the legacy water levels apply unchanged.
+  const seamStrength = intentTiming === undefined || intentMagnitude === undefined
+    ? 0
+    : clamp01(Math.max(
+        (intentTiming - b.seamMinTiming) / Math.max(0.0001, 1 - b.seamMinTiming),
+        intent?.profile.milestone === true ? 1 : 0,
+      ))
+  const aiDial = intentMagnitude === undefined ? 0 : clamp01(Math.max(seamStrength, intentMagnitude))
+  const aiLine = Math.max(
+    b.seamMemoryFloor,
+    memoryTargetFloor + (b.seamMemoryFloor - memoryTargetFloor) * aiDial,
+  )
+  const aiDrain = intentMagnitude === undefined ? 0 : clamp01(0.5 + intentMagnitude / 2)
+  const aiTarget = intentMagnitude === undefined
+    ? undefined
+    : memoryTargetFloor + (aiLine - memoryTargetFloor) * aiDrain
+  const rawTargetRatio = clampRange(
+    aiTarget ?? (levels.targetRatio - (levels.triggerRatio - triggerRatio)),
+    aiTarget !== undefined ? b.seamMemoryFloor : b.targetFloor,
+    Math.max(b.targetFloor, triggerRatio - b.minBand),
+  )
+  // The retained tail is what the agent keeps verbatim. A mature session used
+  // to widen its band until the tail was almost gone, so keep a memory floor:
+  // when the AI owns the depth that floor IS the AI-chosen line (down to the
+  // seam bound — zero by default, structure binds past it); without intent
+  // signals it stays the tool-loop operating point.
+  const memoryFloor = clampRange(
+    aiTarget !== undefined ? aiLine : memoryTargetFloor,
+    b.seamMemoryFloor,
+    Math.max(b.targetFloor, triggerRatio - b.minBand),
+  )
+  // Closed-loop band: folds systematically landed ABOVE the planned target
+  // (the summary's own tokens, the pinned head and the unfoldable tail sit on
+  // top of the retained range), so the planner pre-compensates by the learned
+  // shortfall — bounded to targetDeviationMax of the basis and never below
+  // the memory floor. The correction is clamped >= 0 upstream: a stale
+  // overshoot cannot make the planner lazier than its configured band.
+  const deviationCorrection = targetDeviationCorrection(
+    input.deviationEmaTokens,
+    basis,
+    b.targetDeviationMax,
+  )
+  const targetRatio = Math.max(rawTargetRatio - deviationCorrection, memoryFloor)
+  // Token-space floors (see compactionWaterLevels): the per-turn injection
+  // must not spend the memory floor. The cap keeps trigger ≥ target ≥ floor
+  // ordering intact even when the injection exceeds everything else.
+  const memoryFloorTokens = Math.floor(basis * memoryFloor)
+  const cappedInjection = Math.min(
+    injection,
+    Math.max(0, Math.floor(basis * triggerRatio) - memoryFloorTokens),
+  )
+  const triggerTokens = Math.max(1, Math.floor(basis * triggerRatio) - cappedInjection)
+  const targetTokens = Math.max(memoryFloorTokens, Math.floor(basis * targetRatio) - cappedInjection)
+  const surfaceTriggerTokens = triggerTokens
+  const targetSurfaceTokens = targetTokens
+
+  const fillPressure = fillPressureOf(Number.isFinite(fillRatio) ? fillRatio : 0)
+  const growthPressure = clamp01((ledger.growthTokens / Math.max(1, basis)) / Math.max(0.0001, b.hotGrowth))
+  const stagePressure = clamp01(ledger.compressions / Math.max(1, b.matureCompressions))
+  const urgency = Math.max(fillPressure, growthPressure, stagePressure)
+
+  const recommend = (lane: GovernanceLane, reason: GovernanceReason): CompactionPlan => {
+    let effective = lane
+    if (effective === 'durable' && !input.capabilities.durable) {
+      effective = input.capabilities.fold ? 'fold' : 'none'
+    }
+    if (effective === 'fold' && !input.capabilities.fold) effective = 'none'
+    return {
+      lane: effective,
+      reason,
+      triggerRatio,
+      targetRatio,
+      triggerTokens,
+      surfaceTriggerTokens,
+      targetSurfaceTokens,
+      drivers: {
+        fill: fillPressure,
+        growth: growthPressure,
+        stage: stagePressure,
+        urgency,
+        opportunity: oppScore,
+        phase: opp?.phase ?? 'unspecified',
+        timing: intentTiming ?? 0,
+        magnitude: intentMagnitude ?? 0,
+        milestone: intent?.profile.milestone ?? false,
+      },
+    }
+  }
+
+  if (input.force) return recommend('fold', 'forced')
+  if (input.incomingTrigger === 'context-overflow') return recommend('durable', 'overflow')
+
+  // Fit-guard: the request is about to run out of window. Bypasses every gate.
+  const reserve = Math.max(b.guardReserveMin, Math.floor(window * b.guardReserveRatio))
+  if (snapshot.totalTokens >= window - reserve) return recommend('durable', 'fit-guard')
+
+  const turn = Number.isFinite(ledger.turn) ? ledger.turn : 0
+  const lastTurn = ledger.lastCompressedTurn
+  const roundsSince = lastTurn === undefined ? Number.POSITIVE_INFINITY : turn - lastTurn
+  // NaN guard: Math.max(1, NaN) is NaN, and every `>= interval` comparison
+  // against NaN is false — a fresh, nearly-full session would plan
+  // `rate-limited` forever (the same input IS guarded in
+  // compactionWaterLevels; mirror it here).
+  const interval = Number.isFinite(input.compressInterval) ? Math.max(1, input.compressInterval) : 1
+  const delta = ledger.lastTokens === undefined
+    ? Number.NEGATIVE_INFINITY
+    : measured - ledger.lastTokens
+  // Surge is a share of the WINDOW (legacy semantic), independent of the basis.
+  const surgeThreshold = Math.max(1, Math.floor(window * b.surgeRatio))
+  const surge = delta >= surgeThreshold
+
+  // Nudge: below the line but predicted to cross it. Pre-empts the gates the
+  // same way shouldNudgeCompaction did (positive growth, no cooldown, interval
+  // elapsed).
+  if (
+    input.nudge
+    && oppScore >= OPP_NUDGE_MIN
+    && ledger.growthTokens > 0
+    && measured < triggerTokens
+    && measured + ledger.growthTokens >= triggerTokens
+    && ledger.failureCooldown <= 0
+    && roundsSince >= interval
+  ) return recommend('fold', 'nudge')
+
+  // Legacy order: below-trigger is decided BEFORE the cooldown. A non-finite
+  // measurement degrades to below-trigger (the conservative exit) — a naive
+  // `measured <= trigger` is false for NaN and would plan a positive fold
+  // from garbage.
+  if (!Number.isFinite(measured) || measured <= triggerTokens) {
+    return recommend('none', 'below-trigger')
+  }
+  if (ledger.failureCooldown > 0) return recommend('none', 'cooldown')
+  if (surge) return recommend(input.incomingTrigger === 'pressure' ? 'durable' : 'fold', 'surge')
+  // Clean-seam crossings skip the turn-based pacing: deferring a fold whose
+  // seam is HERE reliably LOSES it — the next step re-enters a tool-loop, the
+  // trigger swings up, and the level rides high instead (2026-11-26 ledger:
+  // `plan:none:rate-limited` at turn-end with the surface already over the
+  // trigger, then `below-trigger` forever after). Cooldown, surge and bounds
+  // above still apply; only the round interval yields.
+  if (
+    roundsSince >= interval
+    || (intentTiming !== undefined && intentTiming >= b.seamMinTiming)
+    || intent?.profile.milestone === true
+  ) {
+    const narrowedShort = snapshot.declaredWindow !== undefined && window < snapshot.declaredWindow
+    if (narrowedShort) return recommend('durable', 'narrowed-window')
+    return recommend(input.incomingTrigger === 'pressure' ? 'durable' : 'fold', 'pressure')
+  }
+  return recommend('none', 'rate-limited')
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Wiring helpers (pure)                                                      */
+/*  Extracted so the engine's fold wiring and ledger view are testable        */
+/*  without a Cordis context.                                                  */
+/* -------------------------------------------------------------------------- */
+
+/** Structural view of one session's persisted ledger entry. */
+export interface SessionLedgerEntry {
+  readonly turn: number
+  readonly lastCompressedTurn?: number
+  readonly lastTokens?: number
+  readonly failureCooldown: number
+  readonly compressions?: number
+  readonly growthEma?: number
+  readonly lastSizeTokens?: number
+}
+
+/**
+ * Build the planner's ledger view from a persisted entry.
+ *
+ * `turn` is the UPCOMING turn (entry.turn + 1), because the executor increments
+ * it via touchSession before it acts; without the +1 the planner's rate-limit
+ * boundary would be one round off. The growth EMA is recomputed from the
+ * current surface exactly like the executor does, so the planner never reads a
+ * stale value.
+ * @param entry - the persisted per-session entry.
+ * @param surfaceTokens - current surface estimate (omitted = keep the stored EMA).
+ * @returns the planner's ledger input.
+ */
+export function ledgerView(entry: SessionLedgerEntry, surfaceTokens?: number): GovernanceLedger {
+  const measured = Number.isFinite(surfaceTokens) ? (surfaceTokens as number) : undefined
+  let grown: number
+  if (measured === undefined) {
+    grown = entry.growthEma ?? 0
+  } else {
+    // Mirrors nextGrowthEma in compaction-policy (kept inline to avoid a cycle).
+    const delta = entry.lastSizeTokens === undefined ? 0 : measured - entry.lastSizeTokens
+    grown = entry.growthEma === undefined ? Math.max(0, delta) : Math.max(0, entry.growthEma * 0.5 + delta * 0.5)
+  }
+  return {
+    turn: entry.turn + 1,
+    ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
+    ...(entry.lastTokens === undefined ? {} : { lastTokens: entry.lastTokens }),
+    failureCooldown: entry.failureCooldown,
+    compressions: entry.compressions ?? 0,
+    growthTokens: grown,
+  }
+}
+
+/** Input for {@link planFoldCompaction}. */
+export interface FoldPlanInput {
+  /** Surface-only estimate on the executor's CJK-aware basis. */
+  readonly surfaceTokens: number
+  /** Envelope (system/tools/injection) the fold cannot reclaim. */
+  readonly fixedTokens: number
+  /** Effective model window (for fit-guard and narrowed checks). */
+  readonly window: number
+  readonly ledger: GovernanceLedger
+  /**
+   * Trigger anchor for the lane that owns this hook. Under LEARNED TEMPO
+   * (`tempoLearned`) this is the runway scheduler's learned anchor — one
+   * servo-scaled delivered runway above the last landing — not the
+   * configured ratio.
+   */
+  readonly baseTriggerRatio: number
+  readonly baseTargetRatio: number
+  readonly compressInterval: number
+  /** Fold basis: the effective budget = window − completion reserve − headroom. */
+  readonly budgetTokens: number
+  readonly injectionBudget: number
+  readonly nudge: boolean
+  /** Manual/forced fold: bypass the trigger and rate-limit gates. */
+  readonly force?: boolean
+  /** Session-phase opportunity, forwarded to the planner. */
+  readonly opportunity?: CompactionOpportunity
+  /** Content/stage intent, forwarded to the planner. */
+  readonly intent?: CompactionIntent
+  /** Learned landing-deviation EMA, forwarded to the planner. */
+  readonly deviationEmaTokens?: number
+  /**
+   * LEARNED TEMPO (see {@link GovernanceInput.tempoLearned}): set by the
+   * executor when the runway scheduler owns trigger timing for this session.
+   */
+  readonly tempoLearned?: boolean
+  /** Learned amplitude scale (see {@link GovernanceInput.bandScale}). */
+  readonly bandScale?: number
+  readonly declaredWindow?: number
+  readonly bounds?: Partial<GovernanceBounds>
+}
+
+/**
+ * Build the fold lane's plan: snapshot on the executor's own (CJK-aware) basis,
+ * effective-budget denominator, surface-only measured quantity, and no fill term
+ * (matching the fold lane's pre-governance behaviour). The envelope still comes
+ * from the authoritative meter so the fit-guard sees the real request size.
+ * @param input - fold-lane wiring inputs.
+ * @returns the bounded plan (capabilities: fold only).
+ */
+export function planFoldCompaction(input: FoldPlanInput): CompactionPlan {
+  const surface = Number.isFinite(input.surfaceTokens) && input.surfaceTokens > 0 ? input.surfaceTokens : 0
+  const fixed = Number.isFinite(input.fixedTokens) && input.fixedTokens > 0 ? input.fixedTokens : 0
+  const snapshot = toSurfaceSnapshot({
+    totalTokens: surface + fixed,
+    surfaceTokens: surface,
+    window: input.window,
+    ...(input.declaredWindow === undefined ? {} : { declaredWindow: input.declaredWindow }),
+  })
+  return planCompaction({
+    snapshot,
+    ledger: input.ledger,
+    capabilities: { fold: true, durable: false },
+    baseTriggerRatio: input.baseTriggerRatio,
+    baseTargetRatio: input.baseTargetRatio,
+    compressInterval: input.compressInterval,
+    incomingTrigger: 'fold',
+    force: input.force === true,
+    nudge: input.nudge,
+    basisTokens: input.budgetTokens,
+    measuredTokens: surface,
+    fillRatio: 0,
+    injectionBudget: input.injectionBudget,
+    ...(input.tempoLearned === true ? { tempoLearned: true } : {}),
+    ...(input.bandScale === undefined ? {} : { bandScale: input.bandScale }),
+    ...(input.opportunity === undefined ? {} : { opportunity: input.opportunity }),
+    ...(input.intent === undefined ? {} : { intent: input.intent }),
+    ...(input.deviationEmaTokens === undefined ? {} : { deviationEmaTokens: input.deviationEmaTokens }),
+    ...(input.bounds === undefined ? {} : { bounds: input.bounds }),
+  })
+}

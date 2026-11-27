@@ -1,0 +1,300 @@
+# dsh-infinite-context — example composition
+#
+# Load these three entries into a DeepSeek Harness composition. They assume the
+# base harness services are present (llm, tokenMeter, sessions, tools), which a
+# normal `dsh` profile already provides.
+#
+# Use relative paths here because this file sits next to the plugin source; in
+# your own deployment, point `name` at the plugin location (or an installed
+# package name).
+#
+# `memory-context` must load before `memory-compaction` (the compaction engine
+# injects it). Ordering in the file does not matter — Cordis orders by the
+# `inject` dependency.
+
+# 0) Bare package-root entry: activates this package's dsh.client browser half
+# (the styled /compact-force menu row). Browser composition only recognizes
+# rows mounted at the package root (see bundle.patch.yml comment #0); the root
+# module's host face is a no-op, all behavior lives in the entries below.
+- id: infinite-context-root
+  name: ./src/index.ts
+
+# 1) The persistent multi-tier memory store + embedder + index + budget.
+- id: memory-context
+  name: ./src/memory-context.ts
+  config:
+    # SQLite file for persisted memories. Use ':memory:' to disable persistence.
+    # A RELATIVE path resolves below <DSH_HOME>/storages — deliberately not the
+    # process cwd, which is only wherever `dsh` happened to be launched.
+    storePath: dsh-infinite-context.db
+    # The model's total context window (local 94k deployment).
+    contextWindow: 94000
+    # Fraction reserved for system prompt + tools + current input + output.
+    headroomRatio: 0.25
+    # Embedder: 'lightweight' (built-in, no deps) or 'transformers'
+    # (all-MiniLM-L6-v2 via @huggingface/transformers).
+    embedder:
+      kind: lightweight
+      dimension: 256
+    # Per-tier token budgets (short + mid + long + retrieved must fit the window).
+    budget:
+      short: 10000
+      mid: 20000
+      long: 5000
+      retrieved: 15000
+    # Forgetting policy.
+    forgetting:
+      halfLifeDays: 30
+      importanceWeight: 0.6
+      recencyWeight: 0.4
+      minScore: 0.25
+      maxMemories: 500
+    # Pyramid consolidation (merge N mid memories into one long memory).
+    pyramid:
+      mergeThreshold: 4
+      mergeBatch: 3
+      maxLong: 20
+    retrievalMinScore: 0.2
+    retrievalTopK: 5
+    # Live model-context probing for LOCAL servers. baseURL left empty so the
+    # probe targets whatever local server the session routes to (resolved from
+    # the provider's llm-pi-ai baseURL) — zero per-deployment config. Online
+    # models are never probed; declare their real window in settings.yaml or
+    # pin it via modelWindows below.
+    modelProbe:
+      enabled: true
+      kind: openai
+      baseURL: ''
+    # Authoritative per-model context windows for online models whose declared
+    # window is missing/wrong in a deployment's settings.yaml. Local qwen3
+    # models are intentionally NOT listed: their real window comes from the
+    # live probe (llama.cpp n_ctx), and a stale pin would block the probe.
+    modelWindows:
+      - model: glm-5.3-flash
+        contextWindow: 1000000
+      - model: mimo-v2.5-pro
+        contextWindow: 1000000
+
+# 2) The compaction engine that persists summaries, rebalances the pyramid,
+#    and injects retrieved memories into the context.
+- id: memory-compaction
+  name: ./src/memory-compaction.ts
+  config:
+    # --- basic compaction policy (delegated to compaction-basic) ---
+    auto: true
+    # Compaction trigger ratio: lowered from 0.8 to 0.7 so LOCAL models compact
+    # earlier — long-context local inference TPS collapses before the window is
+    # full, so compacting at ~70% of the real window (qwen3 167936 → ~117K)
+    # keeps the model in its fast zone. The dynamic floor below still pulls the
+    # trigger earlier as the window fills.
+    thresholdRatio: 0.7
+    # Recent-tail retention: 0.3 keeps ~30% of the window verbatim and compacts
+    # the older head more aggressively than 0.4 (verified 2026-09-04 on local
+    # qwen3: 137K-token session compacted to ~95K at 0.4; 0.3 would compact to
+    # ~60K). Compensate with a higher summarizer cap below so the bigger
+    # shadowed span still yields a detail-preserving summary.
+    retainRatio: 0.3
+    # Required for LLM summarization (mid-term + pyramid consolidation).
+    # Summarization target is deliberately EMPTY: provider/model is resolved
+    # from the session's routed model at call time (compaction-basic's
+    # `configured ?? latest` + this plugin's resolveSummarizationTarget), so a
+    # fresh install works with zero config. Pinning a hard-coded provider here
+    # would override the session route and silently break compaction when that
+    # endpoint is unavailable/out of balance.
+    summarizationProvider: ''
+    summarizationModel: ''
+    # Summarizer output cap: raised from 8192 to 10000 so the larger shadowed
+    # span (retainRatio 0.3) still fits a complete, detail-rich checkpoint.
+    maxTokens: 10000
+    # --- retrieval injection ---
+    retrieval:
+      enabled: true              # splice top-K memories in on each new turn
+      topK: 3
+      minScore: 0.2
+    # --- history compression (Strategy 1) ---
+    compress_round_interval: 7   # compress old history every N rounds
+    # History-compression trigger: lowered from 0.85 to 0.75 so the plugin's own
+    # per-step history compression also fires earlier — again keeping
+    # short-context local models out of the slow long-context zone.
+    # NOTE: writing either ratio PINS the fold tempo — fold_learning's
+    # self-learning stands down as long as an anchor is hand-set, so this
+    # shipped config runs its fold rhythm UNLEARNED. Delete both lines to let
+    # the plugin learn its own tempo; `fold_learning: true` alone does not
+    # unpin a hand-set ratio.
+    compress_trigger_ratio: 0.75
+    compress_target_ratio: 0.6   # progressive: only the oldest overflow is summarized
+    # Fold DEPTH is AI-owned since 0.9.26: the intent dial (the stronger of
+    # the seam timing/milestone judgment and the content magnitude) picks the
+    # target line between the 0.55 tool-loop anchor and THIS ratio — default
+    # 0, no policy floor; only the retained tail, the summary and the pinned
+    # head bind past it. Set a positive value only to overrule the AI with a
+    # shallower line.
+    # fold_seam_floor: 0
+    # Seam gate: intent timing at/above which a step counts as a clean seam —
+    # its fold skips BOTH pacings (turn interval + learned interval) so a
+    # turn-end crossing is never lost to the next tool-loop (mid tool-loop
+    # ≈ 0.05, turn end ≈ 0.8–0.9).
+    # fold_seam_min_timing: 0.7
+    # DEPRECATED (no-op since 0.8.6): true, false or dropping the key all behave
+    # the same — the unified planner steers inside the hard bounds
+    # unconditionally, and the actual tempo/amplitude come from fold_learning.
+    # Hard bounds still hold either way: trigger <= 0.92 (never overflow) and
+    # >= 0.65; band 0.08..0.45. Target >= 0.25 for the legacy/no-intent path;
+    # with intent signals present the AI-owned depth may drain past it to the
+    # seam line (default 0 — structure binds first). Key kept for compatibility
+    # only.
+    compress_dynamic_levels: true
+    # DEPRECATED (no-op since 0.8.6): the lane takeover is unconditional — with
+    # the plugin installed the fold lane owns routine pressure compaction and
+    # the base durable lane stands down (fit-guard and provider-overflow
+    # recovery remain as emergency doors). There is no legacy per-lane mode to
+    # switch back to. Key kept for compatibility only.
+    compaction_governance: true
+    # Hard timeout (ms) for ONE summarizer LLM call during a compaction. Each
+    # attempt gets a fresh timer; after one retry the fold degrades to a
+    # deterministic extractive summary instead of being abandoned (production
+    # saw the call hang to the provider's 300s stream-idle limit while the
+    # fold waited). Default is ROUTE-AWARE: 240s when the summarizer points at
+    # a local server (27B-class models need minutes, not seconds), 90s for
+    # cloud. 0 disables the wrapper; explicit values clamp to [15000, 300000].
+    summarization_timeout_ms: 90000
+    # Chunked fold summarization: a region at least 2x fold_chunk_tokens wide
+    # is split at tool-pair-safe seams; each segment gets its own summary call
+    # (own deadline, own extractive fallback) and the section structures are
+    # merged mechanically under a budget. Small models summarize small spans
+    # well — this is what stops a 40k one-shot summary from restating bulk
+    # and landing over target. Default true; fold_chunk_tokens is only the
+    # cold-start split prior (live behavior follows the region's own size).
+    fold_chunking: true
+    fold_chunk_tokens: 6000
+    # Fold evidence audit: after the summary lands, the region's load-bearing
+    # anchors (file paths, archive refs, error/signal lines) are checked
+    # mechanically against everything the fold lands, and the few MISSING
+    # ones are re-attached verbatim under `## Folded Evidence`. Zero LLM cost,
+    # append-only, capped at 25% of the summary budget. Ledger:
+    # evidence:missing=n. Default true.
+    fold_evidence_check: true
+    fold_implicit_recall: true
+    sleep_consolidate: true
+    sleep_idle_ms: 900000
+    degenerate_retry: true
+    # Per-turn TASK-STATE working-memory block: a small carried snapshot of the
+    # primary request / pending jobs / next step / critical context, rebuilt
+    # from every fold's structured checkpoint and injected BEFORE the RAG
+    # background every turn. Exists because similarity retrieval misses
+    # open-loop state and the model never calls memory_search unprompted.
+    # Costs ≈400 tokens/turn out of the RAG injection budget. Default true.
+    task_state_enabled: true
+    # SPECULATIVE fold summaries: when the surface approaches the fold trigger
+    # (>= 80% of it) without a clean seam, the summary LLM call - the slow part
+    # of a fold, up to minutes on a local model - runs in the BACKGROUND; the
+    # committing fold consumes it when the region fingerprint still matches,
+    # otherwise falls back to the live summarizer. Costs at most one extra
+    # summarizer call per ~3 minutes per session near the trigger.
+    speculative_fold: true
+    # Dynamic compaction threshold: when the routed model's REAL window (live
+    # probe / modelWindows) is smaller than DSH declares, force compaction from
+    # a threshold derived from the REAL window instead of waiting for a
+    # declared-window threshold the model can never reach before overflowing.
+    compaction_dynamic_threshold: true
+    # Dynamic trigger ratio floor: as the real window fills past ~50%, the
+    # effective trigger ratio slides from thresholdRatio (0.7) toward this
+    # floor (0.5), so compaction fires around ~60% of the window — early enough
+    # for slow local models to stay in their fast zone while leaving enough
+    # remaining context to run the summarization pass itself.
+    compaction_dynamic_floor: 0.5
+    # Mid-thinking context guard: wraps the agent's LLM stream and, when
+    # input + output-so-far approaches the CURRENT model's real window, injects
+    # a CONTEXT_WINDOW_EXCEEDED finish so the engine compacts durably and the
+    # request retries with room — the plugin intervenes even while the model is
+    # deep-thinking, and a takeover whose input is already over the line is
+    # compacted BEFORE any generation. The trigger line is DYNAMIC:
+    # window − (system/tools + estimated summary + margin), so the model's
+    # REMAINING context is always enough to run the plugin's own compaction.
+    # ratio is the CEILING (0.9 default).
+    thinking_guard_enabled: true
+    thinking_guard_ratio: 0.9
+    retain_recent_messages: 4    # keep the most recent N messages uncompressed
+    # --- output sanitization (Strategy 3) ---
+    sanitize_max_chars: 2000     # max chars for generic JSON string fields
+    # --- vector retrieval / RAG (Strategy 4) ---
+    # 0.9.27 context-burden defaults: checkpoints never inject; scores damp
+    # by staleness; one memory ≤40% of the budget (longer ones clip with a
+    # memory_expand pointer); unchanged task-state re-anchors every 6 turns.
+    rag_top_k: 2                 # Top-K similar memories to inject
+    rag_min_score: 0.35          # minimum cosine similarity (stale entries damp below this and drop)
+    rag_token_budget: 2000       # max tokens for injected RAG context
+    # rag_staleness_half_life_days: 14  # injection score halves per 14d of age (short tier; mid 2×, long never; 0 = off)
+    rag_chunk_size: 500          # semantic chunk size in characters
+    # --- RAG ingestion guards (dedup + high-value filtering) ---
+    rag_dedupe_exact: true       # skip chunks whose exact text already exists
+    rag_dedupe_min_score: 0.92   # skip chunks near-duplicate to an existing memory (0 disables)
+    # --- retrieval de-dup against the ACTIVE context (Strategy 4b) ---
+    # A hit whose text is still on the surface (an ingested tool result that has
+    # not been compacted away yet) is not injected again. Suppression is
+    # state-dependent: once compaction moves the text off the surface, the
+    # memory is eligible again.
+    rag_surface_dedupe: true
+    # --- local-model conciseness mode (Strategy 5) ---
+    # On a LOCAL route (loopback/private-LAN baseURL), inject one short runtime
+    # directive forbidding inter-tool narration and requiring batched calls.
+    # At most one copy per surface; re-injected after compaction drops it.
+    concise_local_mode: true
+    # concise_local_directive: '自定义指令正文'
+    # --- tool-result archive (CCR) ---
+    # An oversized tool result keeps its full text in the store under a ref and
+    # leaves a head+ref+tail stub on the surface, so the built-in lossy pruner
+    # never has to drop it: memory_expand reads it back. Only nodes appended
+    # since the previous pass are rewritten (a rebuilt prefix is a cache miss).
+    tool_archive: true
+    tool_archive_threshold_chars: 6000   # below the built-in pruner's 8192
+    tool_archive_head_chars: 2048
+    tool_archive_tail_chars: 1024
+    tool_archive_max_entries: 2000       # expiry ages small results too; a lower cap would dangle their refs
+    tool_archive_retention_days: 30
+    # When a fold commits, tool results that have aged out of the working-set
+    # tail become stubs at ANY size (full text still memory_expand-able). The
+    # fold rebuilds the request prefix anyway, so the pass is free; it shrinks
+    # the fold's summarizer input, which lowers the landing and its overshoot.
+    tool_expiry_on_fold: true
+    # --- immediate distillation (absorb), complementary to the archive ---
+    # The oversized result is reduced to its signal lines (errors, exit codes, test
+    # counts, diff stats, paths + head/tail) and that digest becomes the stub body;
+    # the exact text stays in the archive for memory_expand. min_chars is below the
+    # archive threshold on purpose (small but noisy results are worth distilling).
+    tool_absorb: true
+    tool_absorb_min_chars: 4000
+    tool_absorb_max_digest_chars: 1200
+    # --- compression scheduling nudge ---
+    # The growth EMA predicts whether the NEXT request crosses the trigger and
+    # compresses one step early when it would; this costs a slightly earlier (and
+    # slightly more frequent) compression instead of one oversized request.
+    compress_nudge: true
+    # --- context accounting ledger ---
+    # Records injections, surface skips, archived/absorbed chars, nudges, compaction
+    # savings and the provider's disjoint input/output/cacheRead/cacheWrite (stored
+    # per field: pre-summing them would erase the cache hit rate). memory_status
+    # prints the last 7 days.
+    usage_ledger: true
+    usage_retention_days: 30
+    # --- reverse compaction (folded-range archive) ---
+    # Before a compression folds a range into a summary, the exact messages are
+    # archived so memory_expand ref=fl_… can read them back (upstream decompress
+    # equivalent). Turning this off makes compaction lossy.
+    fold_ranges: true
+    fold_range_retention_days: 30
+    fold_range_max_entries: 300
+    rag_ingest_importance: 0.3   # importance for tool-result memories (forgetting retires them first)
+    # Low-value tools excluded from ingestion (memory_*, todo_*, meta tools).
+    # Uncomment to customize; defaults live in src/config.ts (DEFAULT_INGEST_DENYLIST).
+    # rag_ingest_denylist: []
+
+# 3) Manual tools — 12, all registered by ./src/tools.ts (memory_search,
+#    memory_status, memory_model_probe, memory_index, memory_maintain,
+#    memory_write, memory_forget, memory_consolidate, memory_reset,
+#    memory_ingest, memory_force_compress, memory_expand).
+- id: memory-tools
+  name: ./src/tools.ts
+
+- id: command-compact-force
+  name: ./src/command-compact-force.ts

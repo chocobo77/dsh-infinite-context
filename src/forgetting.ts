@@ -1,0 +1,99 @@
+/**
+ * The forgetting policy: score memories by importance and recency, and select
+ * the low-value ones to drop so the store stays bounded and relevant.
+ *
+ * @module dsh-infinite-context/forgetting
+ */
+
+import type { ForgettingConfig, MemoryDoc } from './types.ts'
+
+const MS_PER_DAY = 86_400_000
+
+/**
+ * Recency factor in `[0, 1]`: 1 for a fresh memory, halving every
+ * `halfLifeDays`. A non-positive half-life disables decay (always 1).
+ * @param ageMs - the memory's age in milliseconds.
+ * @param halfLifeDays - the recency half-life in days.
+ * @returns the recency factor.
+ */
+export function recencyFactor(ageMs: number, halfLifeDays: number): number {
+  if (halfLifeDays <= 0) return 1
+  if (ageMs <= 0) return 1
+  return Math.pow(0.5, ageMs / (halfLifeDays * MS_PER_DAY))
+}
+
+/**
+ * Score a memory in `[0, 1]` as a weighted blend of its importance and its
+ * recency. Weights are used as given; normalize them if you want the score to
+ * stay within `[0, 1]` exactly. A memory's KIND may override the half-life:
+ * checkpoint digests are naturally short-lived (each fold supersedes the
+ * previous one), user-instruction extracts are long-lived.
+ * @param doc - the memory to score.
+ * @param now - the reference time (epoch ms).
+ * @param config - the forgetting configuration.
+ * @returns the combined score.
+ */
+export function scoreMemory(doc: MemoryDoc, now: number, config: ForgettingConfig): number {
+  const age = now - doc.createdAt
+  const policy = doc.kind === undefined ? undefined : config.kindPolicies?.[doc.kind]
+  const recency = recencyFactor(age, policy?.halfLifeDays ?? config.halfLifeDays)
+  return config.importanceWeight * doc.importance + config.recencyWeight * recency
+}
+
+/** Select which memories to forget, honoring the score floor and the cap. */
+export class ForgettingPolicy {
+  readonly config: ForgettingConfig
+
+  /**
+   * @param config - the forgetting configuration.
+   */
+  constructor(config: ForgettingConfig) {
+    this.config = config
+  }
+
+  /**
+   * The combined score for a memory at a reference time.
+   * @param doc - the memory.
+   * @param now - the reference time (epoch ms).
+   * @returns the score.
+   */
+  score(doc: MemoryDoc, now: number): number {
+    return scoreMemory(doc, now, this.config)
+  }
+
+  /**
+   * Choose the memories to drop: every memory below its score floor (per-kind
+   * floors override the global one), plus the lowest-scoring extras needed to
+   * bring the total within the cap. Memories on a PROTECTED tier (default:
+   * `long`) are never selected — Letta's core-memory idea: a small tier that
+   * survives every forgetting pass.
+   * @param docs - the candidate memories.
+   * @param now - the reference time (epoch ms).
+   * @returns the memories to forget (a subset of `docs`).
+   */
+  selectToForget(docs: readonly MemoryDoc[], now: number): MemoryDoc[] {
+    const protectedTiers = this.config.protectedTiers ?? ['long']
+    const scored = docs
+      .map(doc => ({ doc, score: this.score(doc, now) }))
+      // Worst first; ties drop the OLDER memory first (the store lists
+      // newest-first, so a naive tie order would retire the freshest
+      // memories — e.g. halfLifeDays: 0 makes every score tie).
+      .sort((a, b) => (a.score - b.score) || (a.doc.createdAt - b.doc.createdAt))
+    const toDrop = new Set<string>()
+    for (const { doc, score } of scored) {
+      if (protectedTiers.includes(doc.tier)) continue
+      const policy = doc.kind === undefined ? undefined : this.config.kindPolicies?.[doc.kind]
+      if (score < (policy?.minScore ?? this.config.minScore)) toDrop.add(doc.id)
+    }
+    let retained = docs.length - toDrop.size
+    for (const { doc } of scored) {
+      if (retained <= this.config.maxMemories) break
+      if (protectedTiers.includes(doc.tier)) continue
+      if (!toDrop.has(doc.id)) {
+        toDrop.add(doc.id)
+        retained--
+      }
+    }
+    return docs.filter(doc => toDrop.has(doc.id))
+  }
+}

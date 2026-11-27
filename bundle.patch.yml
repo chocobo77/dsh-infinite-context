@@ -1,0 +1,280 @@
+# dsh-infinite-context bundle patch layer
+# Applied when installed via: dsh plugin --profile web add .
+
+# Disable the built-in compaction-basic (replaced by memory-compaction).
+- id: compaction-basic
+  disabled: true
+
+# Insert the plugin entries.
+- insert:
+    # 0) Bare package entry — REQUIRED for the browser half. The web "/" menu
+    # style row (强制压缩) ships as this package's dsh.client module, and
+    # dsh-client-modules only composes `window.__DSH_BOOT__` rows for packages
+    # mounted under their EXACT package name: subpath rows (`…/memory-context`)
+    # are host-only by construction (exactPackageSpecifier → undefined). Without
+    # this row the client half is silently never served while the host half
+    # still hides the raw row — the menu then shows NO compact-force at all
+    # (2026-11-19 incident). The root module's host face is a no-op fiber;
+    # all real host behavior stays in the subpath entries below.
+    - id: infinite-context-root
+      name: dsh-infinite-context
+
+    # 1) Persistent multi-tier memory store + embedder + index + budget.
+    # Bare subpath specifiers resolve through node_modules against the
+    # installed package's exports map. RELATIVE paths resolve against the
+    # PROFILE directory and break bundle installs (verified 2026-08-30).
+    - id: memory-context
+      name: dsh-infinite-context/memory-context
+      config:
+        # Relative resolves below <DSH_HOME>/storages (NOT the process cwd, which
+        # is just wherever `dsh` was launched). Absolute paths and `~` also work.
+        storePath: dsh-infinite-context.db
+        contextWindow: 94000
+        headroomRatio: 0.25
+        # Live model-context probing for LOCAL servers (e.g. qwen3.8-27b at
+        # 127.0.0.1:1234). DSH's catalog may declare a much larger window than
+        # the server actually runs; the probe reads the REAL runtime context
+        # (llama.cpp meta.n_ctx / LM Studio /api/v0/models) and the plugin caps
+        # at min(declared, probed) so compression triggers before the real limit
+        # overflows.
+        # baseURL is LEFT EMPTY so the probe targets whatever LOCAL server the
+        # session routes to (resolved from the provider's llm-pi-ai baseURL) —
+        # zero per-deployment config.
+        # Locality gate: only models whose provider baseURL points at a
+        # loopback / private-LAN host are probed. Online providers (glm / mimo /
+        # ark ...) are NEVER probed — they are trusted at the window declared in
+        # settings.yaml (or pinned via modelWindows below).
+        modelProbe:
+          enabled: true
+          kind: openai
+          baseURL: ''
+        # Explicit per-model context windows (authoritative per-model truth).
+        # These feed the per-model registry that the dynamic compaction
+        # threshold and per-session budgets read; a successful live probe can
+        # still narrow them further. LOCAL qwen3 models are NOT listed here on
+        # purpose — their real window comes from the live probe (llama.cpp
+        # n_ctx) and a stale pin would block the probe from raising it (the
+        # probe only ever narrows). Adjust/remove to match the models you run:
+        #   - glm-5.3-flash / mimo-v2.5-pro: online models declared in
+        #     settings.yaml (1M). Listed here so the dynamic threshold knows
+        #     the real window even if a deployment omits the settings entry.
+        #   - ark deepseek-v4-*: NOT pinned — their window is left to the
+        #     deployment's settings.yaml (DSH default 262144) because an
+        #     unverified pin would shrink a live session's budget and truncate
+        #     it (2026-09-03 incident).
+        modelWindows:
+          - model: glm-5.3-flash
+            contextWindow: 1000000
+          - model: mimo-v2.5-pro
+            contextWindow: 1000000
+        embedder:
+          kind: lightweight
+          dimension: 256
+        budget:
+          short: 10000
+          mid: 20000
+          long: 5000
+          retrieved: 15000
+        forgetting:
+          halfLifeDays: 30
+          importanceWeight: 0.6
+          recencyWeight: 0.4
+          minScore: 0.25
+          maxMemories: 500
+        pyramid:
+          mergeThreshold: 4
+          mergeBatch: 3
+          maxLong: 20
+        retrievalMinScore: 0.2
+        retrievalTopK: 5
+
+    # 2) Compaction engine with progressive compression + RAG injection.
+    - id: memory-compaction
+      name: dsh-infinite-context/memory-compaction
+      config:
+        auto: true
+        # Compaction trigger ratio: lowered from 0.8 to 0.7 so LOCAL models
+        # compact earlier — long-context local inference TPS collapses well
+        # before the window is full, so compacting at ~70% of the real window
+        # (qwen3 167936 → ~117K) keeps the model in its fast zone. The dynamic
+        # floor below still pulls the trigger earlier as the window fills.
+        thresholdRatio: 0.7
+        # Recent-tail retention: 0.3 keeps ~30% of the window verbatim and
+        # compacts the older head more aggressively than 0.4 (verified 2026-09-04
+        # on local qwen3: 137K-token session compacted to ~95K at 0.4; 0.3 would
+        # compact to ~60K). Compensate with a higher summarizer cap below so the
+        # bigger shadowed span still yields a detail-preserving summary.
+        retainRatio: 0.3
+        # Summarization target is deliberately EMPTY: the compaction backend
+        # (compaction-basic) and this plugin resolve the provider/model from the
+        # SESSION's routed model (`configured ?? latest`), so a local-model
+        # session summarizes with the local model and a cloud session with the
+        # cloud model — no per-profile patch needed. Pinning a hard-coded
+        # provider here (e.g. deepseek-official) overrides the session route and
+        # silently breaks every compaction when that endpoint is down or the
+        # account is out of balance (Insufficient Balance). Set BOTH keys to a
+        # concrete pair only to force a specific summarization model.
+        summarizationProvider: ''
+        summarizationModel: ''
+        # Summarizer output cap: raised from 8192 to 10000 so the larger
+        # shadowed span (retainRatio 0.3) still fits a complete, detail-rich
+        # checkpoint instead of being cut off at the token cap.
+        maxTokens: 10000
+        compactionRetries: 1
+        maxOverflowRetries: 1
+        retrieval:
+          enabled: true
+          topK: 3
+          minScore: 0.2
+        compress_round_interval: 7
+        # History-compression trigger: lowered from 0.85 to 0.75 so the
+        # plugin's own per-step history compression also fires earlier — again
+        # keeping short-context local models out of the slow long-context zone.
+        compress_trigger_ratio: 0.75
+        # Chunked fold summarization (segment → per-segment note → mechanical
+        # merge). Split prior is cold-start only; the split itself follows the
+        # region's observed size. Default on.
+        fold_chunking: true
+        fold_chunk_tokens: 6000
+        # Fold evidence audit: the summary's lost anchors (paths, archive refs,
+        # error lines) are re-attached verbatim after each fold. Zero LLM cost.
+        fold_evidence_check: true
+        fold_implicit_recall: true
+        sleep_consolidate: true
+        sleep_idle_ms: 900000
+        degenerate_retry: true
+        compress_target_ratio: 0.6
+        # NOTE: both ratios above are hand-written, which PINS the fold tempo —
+        # fold_learning's self-learning stands down while an anchor is set.
+        # Delete the two ratio lines to let the plugin learn its own rhythm.
+        # DEPRECATED (no-op since 0.8.6): the unified planner steers inside the
+        # hard bounds unconditionally (trigger <= 0.92 / >= 0.65; target >=
+        # 0.25; band 0.08..0.45), and tempo/amplitude come from fold_learning.
+        compress_dynamic_levels: true
+        # DEPRECATED (no-op since 0.8.6): lane takeover is unconditional — the
+        # fold lane owns routine compaction, and there is no legacy per-lane
+        # mode to switch back to. Key kept for compatibility only.
+        compaction_governance: true
+        # Track the routed model's REAL context window (probe / modelWindows):
+        # when it is smaller than the declared window, force durable-history
+        # compaction at a threshold derived from the REAL window instead of
+        # waiting for a declared-window threshold the model can never reach.
+        # This is what makes short-context local models "refill" (续杯) in time,
+        # including after one very long thinking turn.
+        compaction_dynamic_threshold: true
+        # Dynamic trigger ratio floor: as the REAL window fills past ~50%, the
+        # effective trigger ratio slides from thresholdRatio (0.7) toward this
+        # floor (0.5), so compaction fires around ~60% of the window — early
+        # enough for slow local models to stay in their fast zone while leaving
+        # enough remaining context to run the summarization pass itself.
+        compaction_dynamic_floor: 0.5
+        # Mid-thinking context guard: wraps the agent's LLM stream and, when
+        # input + output-so-far approaches the CURRENT model's real window,
+        # injects a CONTEXT_WINDOW_EXCEEDED finish so the engine compacts
+        # durably and the request retries with room — the plugin intervenes
+        # even while the model is deep-thinking, and a takeover whose input is
+        # already over the line is compacted BEFORE any generation. The trigger
+        # line is DYNAMIC: window − (system/tools + estimated summary + margin),
+        # so the model's REMAINING context is always enough to run the plugin's
+        # own compaction. ratio is the CEILING (0.9 default).
+        thinking_guard_enabled: true
+        thinking_guard_ratio: 0.9
+        retain_recent_messages: 4
+        sanitize_max_chars: 2000
+        rag_top_k: 3
+        rag_min_score: 0.3
+        rag_token_budget: 3000
+        rag_chunk_size: 500
+        rag_dedupe_exact: true
+        rag_dedupe_min_score: 0.92
+        # Surface-aware retrieval de-dup: a memory whose text is ALREADY on the
+        # active context (typically a tool result ingested a few steps ago but
+        # not yet compressed away) is not re-injected — it would spend tokens on
+        # text the model can already read. Suppression is state-dependent, never
+        # permanent: once compaction removes the text from the surface, the
+        # memory becomes eligible again.
+        rag_surface_dedupe: true
+        # Local-model conciseness mode: when the session is routed to a LOCAL
+        # (loopback / private-LAN baseURL) provider, inject one short runtime
+        # directive that forbids inter-tool narration, requires independent
+        # calls to be batched in one step, and pushes all explanation into the
+        # final answer. Narration written by a local model is re-sent as input
+        # on every later request (and re-paid after each cache expiry), so the
+        # directive pays for itself within a turn. Injected at most once per
+        # surface (re-injected only after compaction drops the previous copy).
+        concise_local_mode: true
+        # Tool-result archive (CCR): a tool result larger than the threshold is
+        # stored verbatim under a content-addressed ref (tr_<sha256[0..12)>) and
+        # the surface node becomes a head+ref+tail stub, so the built-in
+        # tool-result-pruner (which drops the middle beyond recovery, and only
+        # when a compaction fires) never has to destroy anything: memory_expand
+        # can hand the full text back. The threshold sits below the pruner's
+        # 8192 so our stub wins. Rewrites only touch nodes appended since the
+        # previous pass (a rebuilt prefix is a provider cache miss); the one
+        # exception is compaction, which rebuilds the prefix anyway.
+        tool_archive: true
+        tool_archive_threshold_chars: 6000
+        tool_archive_head_chars: 2048
+        tool_archive_tail_chars: 1024
+        tool_archive_max_entries: 2000
+        tool_archive_retention_days: 30
+        # Fold-time expiry: aged-out tool results become stubs at any size when
+        # a fold commits (prefix rebuild is owed anyway). Default on.
+        tool_expiry_on_fold: true
+        # Immediate distillation: an oversized result is reduced to signal lines
+        # (errors/counts/diff stats/paths + head/tail) and that digest IS the stub.
+        # min_chars sits below the archive threshold on purpose: a result can be too
+        # small to archive and still worth distilling. The digest is also ingested as
+        # a memory, so "what error did that command report" survives compaction.
+        tool_absorb: true
+        tool_absorb_min_chars: 4000
+        tool_absorb_max_digest_chars: 1200
+        # Predictive compression: a surface-growth EMA fires the compression one step
+        # early when the NEXT request would cross the trigger anyway.
+        compress_nudge: true
+        # Context accounting: injections/skips/archive/absorb/nudge/savings plus the
+        # provider's disjoint input/output/cacheRead/cacheWrite, summarised in
+        # memory_status. Never pre-summed (that would erase the cache hit rate).
+        usage_ledger: true
+        usage_retention_days: 30
+        # Reverse compaction: before a compression folds a range into a summary,
+        # the exact messages are archived (folded_ranges) so memory_expand can
+        # read them back — the engine-layer equivalent of upstream decompress.
+        fold_ranges: true
+        fold_range_retention_days: 30
+        fold_range_max_entries: 300
+        rag_ingest_importance: 0.3
+        rag_ingest_denylist:
+          - memory_search
+          - memory_status
+          - memory_index
+          - memory_maintain
+          - memory_model_probe
+          - memory_forget
+          - memory_consolidate
+          - memory_reset
+          - memory_ingest
+          - memory_force_compress
+          - memory_expand
+          - todo_write
+          - ask_user_question
+          - interrupt_agent
+          - job_list
+          - job_output
+          - job_kill
+          - list_agents
+          - send_message
+          - subagent
+          - subagent_fork
+          - workflow
+          - ralph
+          - skill
+
+    # 3) Manual tools (memory_search, memory_status, etc.).
+    - id: memory-tools
+      name: dsh-infinite-context/tools
+
+    # 4) /compact-force command — manual compaction through the plugin
+    # pipeline (segmented; works at 100% of the window).
+    - id: command-compact-force
+      name: dsh-infinite-context/command-compact-force

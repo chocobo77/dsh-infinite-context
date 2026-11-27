@@ -1,0 +1,96 @@
+{
+  "name": "dsh-infinite-context",
+  "version": "0.9.27",
+  "description": "DSH 上下文治理插件：长会话不爆窗、不失忆——1.04 亿 token 实测，19 次折叠全部可逆、51 万 token 净省，摘要机械核对（锚点缺失 1.1% vs 无核对 71.2%），参数随用随学。/ Context governance for DeepSeek Harness: long sessions stay in-window without amnesia — 104M tokens, 19 reversible folds, 511k saved, summaries mechanically audited (1.1% vs 71.2% anchor loss), knobs learned from use.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chocobo77/dsh-infinite-context.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "context-window",
+    "context-management",
+    "compaction",
+    "rag",
+    "llm"
+  ],
+  "files": [
+    "dist",
+    "client",
+    "bundle.patch.yml",
+    "cordis.yml"
+  ],
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./memory-context": {
+      "types": "./dist/memory-context.d.ts",
+      "default": "./dist/memory-context.js"
+    },
+    "./memory-compaction": {
+      "types": "./dist/memory-compaction.d.ts",
+      "default": "./dist/memory-compaction.js"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.ts",
+      "default": "./dist/tools.js"
+    },
+    "./command-compact-force": {
+      "types": "./dist/command-compact-force.d.ts",
+      "default": "./dist/command-compact-force.js"
+    },
+    "./client": "./client/compact-force.js",
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "default": "./dist/core.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-commands"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "node -e \"const fs=require('fs');process.exit(fs.existsSync('dist/index.js')?0:1)\" || npm run build",
+    "prepack": "npm run verify",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:contract": "node --test scripts/contract-check.mjs",
+    "verify": "npm run typecheck && npm run build && npm run test:contract"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-agent": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction-basic": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-token-meter": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-0 <0.3.0-0",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

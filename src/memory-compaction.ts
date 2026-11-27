@@ -1,0 +1,5502 @@
+/**
+ * The `memory-compaction` Cordis entry: a compaction backend that also feeds
+ * the persistent multi-tier memory system.
+ *
+ * Extends {@link BasicCompactionEngine} to reuse the battle-tested surface
+ * replacement, token-pressure metering, and LLM summarization, and adds:
+ *   1. Every compaction summary is persisted as a `mid` memory.
+ *   2. After persisting, the memory pyramid is consolidated and low-value
+ *      memories are forgotten (via `ctx.memoryContext`).
+ *   3. On each new turn, the most relevant memories are retrieved for the
+ *      latest user message and spliced into the request as background.
+ *   4. Surface folding: a due fold rewrites the session surface through
+ *      compaction-basic's `compactRegion` (never the pre-step message delta).
+ *   5. Output sanitization: tool results are cleaned before entering the
+ *      vector memory (the live tool result still reaches the current turn's
+ *      context as-is — tools/result is a post-hoc event and cannot rewrite it).
+ *   6. Fallback truncation: if still over budget, oldest messages are dropped.
+ *
+ * @module dsh-infinite-context/memory-compaction
+ */
+
+import { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
+import type { BasicCompactionConfig, ResolvedConfig } from '@deepseek-ai/dsh-compaction-basic'
+import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
+import { BlockAssembler, LlmError, ReasoningEffortId, contentHasImage, createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import type {
+  ContentBlock,
+  FinishReason,
+  GenerateOptions,
+  Message,
+  StreamChunk,
+  TokenUsage,
+  ToolSchema,
+  UserMessage,
+} from '@deepseek-ai/dsh-llm'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionId, type Session, type SessionSeq } from '@deepseek-ai/dsh-session'
+import type { ForcedFoldOutcome } from './memory-context.ts'
+import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
+import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
+// Type-only: brings the `ctx.tokenMeter` service declaration into scope.
+import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
+import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+
+/**
+ * compaction-basic 0.2.0 起对 BasicCompactionConfig 做「拒绝未知键」的严格校验
+ * （validateKeys），而插件自有键经 rest-spread 全量进入 basicConfig，新加插件键
+ * （如 fold_ranges）会直接导致插件加载失败。构造引擎前按 0.2.0 的公开键集做
+ * 白名单转发：插件键静默留在插件侧，运行时不认识的键也不会再炸。
+ */
+const BASIC_COMPACT_PUBLIC_KEYS: ReadonlySet<string> = new Set([
+  'thresholdRatio',
+  'headroomTokens',
+  'retainRatio',
+  'retainTokens',
+  'summarizationProvider',
+  'summarizationModel',
+  'maxTokens',
+  'compactionRetries',
+  'maxOverflowRetries',
+  'modelPolicies',
+  'auto',
+])
+
+function pickBasicCompactionKeys(raw: Record<string, unknown>): BasicCompactionConfig {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (BASIC_COMPACT_PUBLIC_KEYS.has(key)) out[key] = value
+  }
+  return out as BasicCompactionConfig
+}
+
+import {
+  DEFAULT_INGEST_DENYLIST,
+  LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS,
+  MAX_SUMMARIZATION_TIMEOUT_MS,
+  MemoryCompactionConfigSchema,
+  MIN_SUMMARIZATION_TIMEOUT_MS,
+  resolveAbsorbOptions,
+  resolveDegenerateRetry,
+  resolveFoldOptions,
+  resolveImplicitRecall,
+  resolveRetrievalOptions,
+  resolveSleepConsolidate,
+  resolveSummarizationTimeoutMs,
+  resolveSpeculativeFold,
+  resolveTaskStateEnabled,
+  isSummarizationTimeoutExplicit,
+  deadlineFrom,
+  scaleSummarizationTimeoutMs,
+  resolveToolArchiveOptions,
+  resolveToolExpiryOnFold,
+  resolveUsageOptions,
+  type MemoryCompactionConfig,
+  type ResolvedRetrievalOptions,
+} from './config.ts'
+import { extractiveSummary, stripExtractiveHeader, summarizeWithResilience } from './extractive-summary.ts'
+import { applySectionBudget, mergeSegmentNotes, splitRegionIntoSegments } from './fold-chunking.ts'
+import {
+  anchorsPoolCapped,
+  auditEvidence,
+  evidenceSectionCeiling,
+  extractAnchors,
+  fitEvidenceOptions,
+  renderEvidenceSection,
+} from './fold-evidence.ts'
+import {
+  learnedAnchorRatio,
+  learnedBandScale,
+  learnedMinIntervalMs,
+  nextGrowthRate,
+  parseFoldPrior,
+  serializeFoldPrior,
+  speculationDue,
+  updateFoldLearning,
+  type FoldCycleReport,
+  type FoldLearningState,
+} from './fold-scheduler.ts'
+import { cosineSimilarity, fnv1a } from './embedder.ts'
+import { buildTaskStateBlock } from './task-state.ts'
+import { ToolResultArchive, textOfBlocks } from './tool-archive.ts'
+import { foldedRangeHeader, type FoldOptions } from './fold-archive.ts'
+import type { FoldAttachmentInsert } from './memory-store.ts'
+import { DEGENERATE_RETRY_MAX_STREAK, degenerateRetryNudge, isDegenerateAssistantContent } from './degenerate-turn.ts'
+import { USAGE_KIND, UsageLedger, usageAttribution } from './usage-ledger.ts'
+import { clipToTokens, estimateContentTokens, estimateTokens } from './token-budget.ts'
+import { registerThinkingGuard } from './thinking-guard.ts'
+import { redactCredentials } from './redact.ts'
+import { isToolResultError } from './event-shapes.ts'
+import {
+  GOV_GUARD_RESERVE_MIN,
+  GOV_MIN_NET_SAVING_RATIO,
+  GOV_GUARD_RESERVE_RATIO,
+  GOV_TRIGGER_CEILING,
+  completionReserveOf,
+  failureCooldownFor,
+  foldIntervalFor,
+  foldPressureBudget,
+  GOV_IMPORTANCE_KEEP_COS,
+  GOV_SEAM_MIN_TIMING,
+  isThinFold,
+  ledgerView,
+  minimumFoldTokens,
+  nextTargetDeviationEma,
+  summaryCharBudget,
+  isReasoningConfigRejection,
+  planFoldCompaction,
+  thinFoldRatioFor,
+  toSurfaceSnapshot,
+  type CompactionPlan,
+  type GovernanceLedger,
+  type SurfaceSnapshot,
+} from './compaction-governance.ts'
+import {
+  analyzeContext,
+  type CompactionIntent,
+  type SurfaceSignal,
+} from './compaction-intelligence.ts'
+import {
+  COMPRESS_FAILURE_COOLDOWN,
+  SUMMARY_OUTPUT_SHARE,
+  decidePressureCompaction,
+  firstFoldableIndex,
+  retainedTailStart,
+  nextGrowthEma,
+} from './compaction-policy.ts'
+import { sanitizeToolResult, type SanitizerConfig } from './OutputSanitizer.ts'
+import { VectorRetriever, type VectorRetrieverConfig } from './VectorRetriever.ts'
+import {
+  evaluateOpportunity,
+  type CompactionOpportunity,
+} from './compaction-opportunity.ts'
+import {
+  DEFAULT_CONCISE_DIRECTIVE,
+  createConciseMessage,
+  hasConciseDirective,
+} from './conciseness-mode.ts'
+import {
+  resolveSummarizationTarget,
+  routedTargetOf,
+  type SummarizationTarget,
+} from './summarization-target.ts'
+
+/* -------------------------------------------------------------------------- */
+/*  Summarization types (structural mirrors from dsh-compaction-basic)        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The branded seq type {@link Session.eventAt} accepts. The runtime-installed
+ * dsh-session package does not export the `SessionSeq` brander, so this is
+ * derived from the API surface itself — at runtime it is a plain number.
+ */
+type SessionSeqOf = Parameters<Session['eventAt']>[0]
+
+interface SummarizationInput {
+  readonly system?: string
+  readonly tools?: readonly ToolSchema[]
+  readonly messages: readonly Message[]
+}
+type SummaryResult = {
+  readonly summary: ContentBlock[]
+  readonly provider: string
+  readonly model: string
+  readonly maxTokens?: number
+  readonly usage?: TokenUsage
+}
+/**
+ * A spread copy of a SummaryResult (readonly modifiers stripped), which the
+ * commit lifecycle rewrites in place: budget clip, fl_ prefix insertion,
+ * evidence block append. Callers pass `{ ...result }` — the mutation stays
+ * visible to the caller that returns the copy.
+ */
+type MutableSummaryResult = Omit<SummaryResult, 'summary'> & { summary: ContentBlock[] }
+
+/** The plugin label stamped on synthesized messages for provenance. */
+const PLUGIN = 'dsh-infinite-context'
+
+/**
+ * Minimum delay between two FORCED narrowed-window pressure compactions of the
+ * same session. Prevents a summary that barely shrank the surface from
+ * triggering a summarization storm on the following steps; the next force is
+ * simply deferred, and provider overflow recovery remains the backstop.
+ */
+const FORCED_PRESSURE_COOLDOWN_MS = 10_000
+/**
+ * After this many consecutive fold attempts that found nothing safe to fold
+ * (or failed outright), the fit-guard/force doors stand down for
+ * {@link FORCED_FOLD_STALL_BACKOFF_MS} and let the probe path re-verify the
+ * narrowed window — a dead summarizer on a full window must not turn every
+ * step into a failing summarizer attempt.
+ */
+const FORCED_FOLD_STALL_MAX = 2
+const FORCED_FOLD_STALL_BACKOFF_MS = 5 * 60_000
+/**
+ * The speculative background call has the same failure-loop shape as the
+ * fit-guard doors (a hung route re-fires a full-price summarizer call every
+ * pre-step while the surface sits above the ahead-ratio), so it gets the
+ * same medicine: after {@link SPECULATIVE_STALL_MAX} consecutive failed
+ * launches/merges, speculation stands down for
+ * {@link SPECULATIVE_STALL_BACKOFF_MS}. Cleared by any prepared/refreshed
+ * checkpoint.
+ */
+const SPECULATIVE_STALL_MAX = 2
+const SPECULATIVE_STALL_BACKOFF_MS = 10 * 60_000
+
+/**
+ * Share of the session's model window the per-turn RAG injection may occupy.
+ * The configured `rag_token_budget` stays the ceiling; on short-window local
+ * models the injection is additionally capped at this share so retrieved
+ * memories cannot crowd out the conversation itself ("续杯" headroom).
+ */
+const RAG_WINDOW_SHARE = 0.08
+
+/**
+ * Re-anchor cadence for BOTH per-turn injections (turn count): task-state
+ * re-sent when unchanged, RAG exclusion set reset for a full re-anchor.
+ * Content CHANGES (fold commits) always inject immediately regardless of
+ * this cadence — the anchor only bounds how long an unchanged turn goes
+ * without its reminder.
+ */
+const INJECTION_REANCHOR_TURNS = 6
+
+/* -------------------------------------------------------------------------- */
+/*  Message / text helpers                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** Concatenate the text blocks of a message. */
+function messageText(message: { role: string; content: unknown }): string {
+  const content = message.content
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+  }
+  return ''
+}
+
+/**
+ * The folded messages proper: a SummarizationInput leads with the summarizer's
+ * own system prompt, which is NOT part of the archived range. Both the
+ * degradation fallback and the post-processing digest strip it, and they must
+ * agree — a change to the system-message convention happens here once.
+ */
+function shadowedMessages(input: SummarizationInput): readonly Message[] {
+  return input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
+}
+
+/**
+ * Whether a message is the USER'S OWN WORDS (vs an injected artifact): the
+ * session surface carries many role='user' messages that are NOT the user —
+ * plugin checkpoints, the task-state block, RAG background, runtime-context
+ * and time-context splices, compaction checkpoints, and every tool result
+ * (DSH tool messages are user-role with source kind 'tool'). Quoting them in
+ * the 'user instructions verbatim' digest made the digest carry the
+ * checkpoint HEADER instead of the user (production 11-08: 22 of 29 folded
+ * digests led with 'This is an automatically generated checkpoint…'). The
+ * source attribution is the discriminator: real user messages carry
+ * `source.kind === 'user'` (dsh-session types); legacy messages without any
+ * source are kept.
+ */
+export function isUserAuthored(message: { source?: { kind?: string } | null }): boolean {
+  const source = message.source as { kind?: string } | undefined
+  const kind = source?.kind
+  return kind === undefined || kind === 'user'
+}
+
+/** Whether an unknown entry is a content block carrying text. */
+function isTextBlock(block: unknown): block is { type: 'text'; text: string } {
+  return typeof block === 'object' && block !== null
+    && (block as { type?: unknown }).type === 'text'
+    && typeof (block as { text?: unknown }).text === 'string'
+}
+
+/**
+ * Render a sanitized payload to the text stored in memory: strings as-is,
+ * content-block arrays as their joined text (no JSON structure noise),
+ * anything else as JSON.
+ */
+function sanitizedPayloadText(sanitized: unknown): string {
+  if (typeof sanitized === 'string') return sanitized
+  if (Array.isArray(sanitized)) {
+    return sanitized.filter(isTextBlock).map(block => block.text).join('\n').trim()
+  }
+  return JSON.stringify(sanitized)
+}
+
+/**
+ * Fixed token cost charged per image block by the heuristic meter. The real
+ * cost varies with resolution; this conservative constant keeps image-heavy
+ * sessions from being systematically under-measured (which used to delay
+ * compression until compaction-basic's overflow recovery had to step in).
+ * The definition lives in `token-budget.ts` (IMAGE_BLOCK_TOKEN_COST /
+ * estimateContentTokens) and is shared with the thinking guard.
+ */
+
+/** Map a terminal summarization finish to a fail-closed error. */
+function finishError(finish: FinishReason): Error | undefined {
+  switch (finish.kind) {
+    case 'error':
+    case 'aborted': {
+      const error = new Error(finish.failure.message) as Error & { code?: string }
+      error.code = finish.failure.code
+      return error
+    }
+    case 'max-tokens':
+      return new Error('memory consolidation truncated at the token cap (incomplete summary)')
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Collect the non-text blocks of a folded range: their durable host
+ * attachment references are serializable JSON, and the text-only `original`
+ * rendering would otherwise drop them — the fold's irreversible loss. The
+ * attachment service owns the bytes; the archive stores only the refs.
+ */
+export function extractFoldAttachments(messages: readonly Message[]): FoldAttachmentInsert[] {
+  const out: FoldAttachmentInsert[] = []
+  for (const [msgIdx, message] of messages.entries()) {
+    if (!Array.isArray(message.content)) continue
+    for (const [blockIdx, block] of message.content.entries()) {
+      if (block.type !== 'image' && block.type !== 'file') continue
+      const attachment = (block as { readonly attachment?: unknown }).attachment
+      if (attachment === undefined || attachment === null) continue
+      out.push({
+        msgIdx,
+        blockIdx,
+        kind: block.type,
+        payload: JSON.stringify(attachment),
+      })
+    }
+  }
+  return out
+}
+
+/** Serialize messages to readable text for the summarization prompt. */
+function serializeMessagesForSummary(messages: readonly { role: string; content: unknown }[]): string {
+  const MAX_CHARS_PER_MESSAGE = 16_000
+  return messages.map((msg, i) => {
+    const text = messageText(msg)
+    const hasImage = Array.isArray(msg.content)
+      && msg.content.some(block => block.type === 'image')
+    const marker = hasImage ? ' (contains image)' : ''
+    const body = text.length > MAX_CHARS_PER_MESSAGE
+      ? `${text.slice(0, MAX_CHARS_PER_MESSAGE)}\n…[truncated: ${text.length - MAX_CHARS_PER_MESSAGE} more chars]`
+      : text
+    return `[${i}] ${msg.role}${marker}: ${body}`
+  }).join('\n')
+}
+
+/**
+ * Compute a target output-token budget for a summarization prompt.
+ *
+ * The model is told to aim for roughly 30% of the input size (dense
+ * compression), clamped to a safety margin below `maxTokens` so the
+ * summary is never cut off mid-record by the output cap.
+ */
+function summarizationTargetTokens(config: ResolvedConfig, inputTokens: number): number {
+  const cap = Math.max(400, Math.floor((config.maxTokens ?? 4096) * 0.7))
+  return Math.min(cap, Math.max(300, Math.floor(inputTokens * SUMMARY_OUTPUT_SHARE)))
+}
+
+/** Summarize several memories into one higher-level memory via the LLM. */
+async function summarizeMemoriesWithLlm(
+  ctx: Context,
+  config: ResolvedConfig,
+  texts: readonly string[],
+  purpose: string,
+  target?: SummarizationTarget,
+  signal?: AbortSignal,
+): Promise<string> {
+  const resolved = target ?? resolveSummarizationTarget(config)
+  if (resolved === undefined) {
+    throw new Error(
+      'memory pyramid consolidation requires summarizationProvider/Model configured '
+      + 'or a session-routed model',
+    )
+  }
+  const { provider, model } = resolved
+  // INPUT BUDGET: the merge must be physically completable inside the output
+  // cap. targetTokens = min(floor(config.maxTokens × 0.7), 0.3 × input) — so
+  // once the raw input exceeds (0.7 × maxTokens) ÷ 0.3 tokens, the 30% share
+  // is pinned at the cap and the model CANNOT finish: production 2026-11-18
+  // produced three consecutive `sleep:failed=…token cap` rows merging eight
+  // large checkpoints (~120k CJK tokens of input against a 7000-token cap).
+  // Clip each text to its proportional share of the affordable input, then
+  // re-meter. The clipped-away detail stays in the original checkpoint rows —
+  // the merge narrows its scope, it does not delete anything.
+  const outputCap = Math.floor((config.maxTokens ?? 4096) * 0.7)
+  const inputBudgetTokens = Math.max(1024, Math.floor(outputCap / SUMMARY_OUTPUT_SHARE))
+  const rawTokens = texts.reduce((sum, text) => sum + estimateTokens(text), 0)
+  if (rawTokens > inputBudgetTokens) {
+    const scale = inputBudgetTokens / rawTokens
+    texts = texts.map(text => {
+      const share = Math.floor(estimateTokens(text) * scale)
+      return share < 64 ? '' : clipToTokens(text, share)
+    }).filter(text => text.length > 0)
+  }
+  const textsJoined = texts.join('\n')
+  const inputTokens = estimateTokens(textsJoined)
+  const targetTokens = summarizationTargetTokens(config, inputTokens)
+  const instruction = [
+    purpose,
+    '',
+    'Rules:',
+    '- PRESERVE verbatim: code snippets, file paths, function names, config values, decisions, goals, and open questions',
+    '- DROP stale or redundant detail that is no longer actionable',
+    '- De-duplicate facts that appear in multiple memories',
+    '- PRESERVE the original language of each memory — do NOT translate',
+    '- NEVER invent facts that are not present in the memories',
+    '- Keep the summary self-contained: it must make sense without the source memories',
+    '',
+    `Output budget: the input is ~${inputTokens} tokens. Aim for ~${targetTokens} tokens of`,
+    'output (a dense ~30% compression). Stay well under this; do not pad or repeat.',
+    '',
+    ...texts.map((text, index) => `--- Memory ${index + 1} ---\n${text}`),
+  ].join('\n')
+  const assembler = new BlockAssembler()
+  const messages: Message[] = [
+    createUserMessage({
+      content: [{ type: 'text', text: instruction }],
+      source: { kind: 'plugin:' + PLUGIN } as any,
+    }),
+  ]
+  const options: GenerateOptions = {
+    provider,
+    model,
+    messages,
+    maxTokens: config.maxTokens,
+    purpose: 'compaction',
+    ...(signal === undefined ? {} : { signal }),
+  }
+  for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
+  const error = finishError(assembler.finish)
+  if (error !== undefined) throw error
+  if (contentHasImage(assembler.blocks())) {
+    throw new LlmError('memory consolidation cannot contain image output', 'UNSUPPORTED_CONTENT')
+  }
+  const text = assembler.blocks()
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+    .trim()
+  if (text.length === 0) throw new Error('memory consolidation produced no text content')
+  return text
+}
+
+/* -------------------------------------------------------------------------- */
+/*  HistoryCompressor                                                          */
+/*  Strategy 1: per-session turn counter + LLM-based summarization            */
+/*  Recursion lock prevents summarization from re-triggering governance.       */
+/* -------------------------------------------------------------------------- */
+
+/** Per-session turn counter entry. */
+interface SessionCounter {
+  turn: number
+  lastActive: number
+  /** Turn number of the last successful compression (undefined = never). */
+  lastCompressedTurn?: number
+  /** Estimated tokens observed at the previous check (for surge detection). */
+  lastTokens?: number
+  /** Smoothed per-step surface growth (tokens), for the early-compression nudge. */
+  growthEma?: number
+  /** Estimated tokens of the surface at the previous check (growth baseline). */
+  lastSizeTokens?: number
+  /** Successful history compressions so far (stage signal for dynamic levels). */
+  compressions?: number
+  /**
+   * Epoch ms of the last FORCED narrowed-window pressure compaction. Lives in
+   * the session ledger (not a separate map) so it is persisted and garbage-
+   * collected with the rest of the session state.
+   */
+  lastForceAt?: number
+  /** Epoch ms of the last successful fold (frequency gate). */
+  lastCompressedAt?: number
+  /**
+   * Signed EMA of `post-fold landing − planned target`, in tokens. Feeds the
+   * closed-loop target band: folds land above the plan (summary overhead +
+   * unfoldable tail), and the learned shortfall widens the next band. Lives in
+   * the session ledger so it is persisted and garbage-collected with it.
+   */
+  targetDeviationEma?: number
+  /**
+   * The working-memory task-state block carried from the last fold (bounded
+   * by TASK_STATE_MAX_CHARS). Injected fresh every turn via the pre-step
+   * splice; learned state that cannot be re-derived from the surface once the
+   * folded range is gone, so it persists with the session ledger.
+   */
+  taskState?: string
+  /** Remaining rounds to wait after a failed (non-shrinking) compression. */
+  failureCooldown: number
+  /**
+   * RUNWAY SCHEDULER state (learned, persisted, NOT re-derivable — the same
+   * rationale as targetDeviationEma): the EMAs below feed the learned
+   * trigger anchor, amplitude and pacing (src/fold-scheduler.ts). The
+   * runway is stored as a share of the budget so route priors port across
+   * sessions.
+   */
+  /** EMA of delivered runway (surfAtFold − previous landing) / budget. */
+  cycleRunwayRatioEma?: number
+  /** EMA of cycle duration in ms. */
+  cycleTimeEmaMs?: number
+  /** EMA of agent requests per cycle. */
+  cycleRequestsEma?: number
+  /** EMA of the cycle's cache hit ratio ([0, 1]). */
+  cycleCacheHitEma?: number
+  /** SLOW EMA of cycle cache hits — the route's own utility baseline. */
+  cacheHitBaselineEma?: number
+  /** EMA of the per-cycle recall indicator (1 = folded range read back). */
+  recallEma?: number
+  /** The failure servo's runway factor (cold start 1.0). */
+  runwayFactor?: number
+  /** Surface tokens this session last LANDED at (runway's reference point). */
+  lastLandedTokens?: number
+  /** Learned surface growth rate (tokens/ms) — predictive launch predictor. */
+  growthRateEma?: number
+  /** Epoch ms of the last fold check (growth-rate delta reference). */
+  lastCheckAtMs?: number
+  // --- in-cycle accumulators (in-memory; persisted with the cycle report) ---
+  /** Cache-read tokens seen since the last fold (usage telemetry). */
+  cycleCacheRead?: number
+  /** Uncached input tokens seen since the last fold. */
+  cycleCacheInput?: number
+  /** Cache-write tokens seen since the last fold. */
+  cycleCacheWrite?: number
+  /** Agent requests served since the last fold. */
+  cycleRequestsCount?: number
+  /** An agent-lane overflow / guard takeover happened this cycle. */
+  cycleHadFailure?: boolean
+  /**
+   * KV-cache dip on the FIRST request after the cycle's opening fold:
+   * 1 − cacheRead/(cacheRead+input+write), in [0, 1]. The fold invalidates
+   * the cached prefix; this measures what the break actually cost. Measured
+   * once per cycle, reported in the fold_cycle ledger row (dip=), never
+   * learned from — the utility judgment stays with cacheUtilityVote.
+   */
+  cycleCacheDip?: number | undefined
+  /**
+   * Whether ANY request this cycle reported a cache-read figure. Without it,
+   * a cycle from an adapter that omits cache fields would report a
+   * FABRICATED cache-hit ratio of 0 (0 measured reads over a nonzero total),
+   * and cacheUtilityVote would treat it as evidence of "folds too frequent"
+   * every cycle — the runway servo inflating from data that does not exist
+   * (the follow-up review's F2).
+   */
+  cacheMeasured?: boolean | undefined
+}
+
+/** Persistent KV interface (backed by the SQLite plugin_kv table). */
+export interface PersistentKV {
+  get(key: string): string | undefined
+  set(key: string, value: string): void
+  delete(key: string): void
+  /**
+   * Delete prefixed keys whose last write is older than `cutoffMs`.
+   * Optional so lightweight test doubles need not implement retention.
+   */
+  deleteOlderThan?(prefix: string, cutoffMs: number): number
+}
+
+/**
+ * HistoryCompressor: proactively compresses old conversation history every N
+ * rounds (configurable) by summarizing via the LLM.
+ *
+ * Key safety features:
+ *   - Turn counter persisted per session (in-memory Map; survives within a
+ *     process but resets on restart — acceptable since compression is
+ *     idempotent and will simply re-trigger on the next interval).
+ *
+ * @module HistoryCompressor
+ */
+/**
+ * Choose the oldest SURFACE span to fold.
+ *
+ * The fold runs as a surface rewrite (compaction-basic's `compactRegion`), not
+ * as a pre-step message rewrite: `agent/pre-step` only carries the step's inbox
+ * delta, so a fold there could never see history (and would drop the step's real
+ * messages). The range mirrors compaction-basic's own selector and adds the two
+ * billion-context pins: never fold the system head, never fold the first user
+ * message (#2733 — the summary must not precede it).
+ * @param session - session whose surface is folded.
+ * @param measurement - current meter reading (nodes must match the surface).
+ * @param retainTokens - tail budget kept verbatim.
+ * @returns the inclusive seq range, or null when nothing safe is foldable.
+ * @throws when the meter's node list no longer matches the session surface.
+ */
+export function selectFoldRange(
+  session: Session,
+  measurement: TokenMeasurement,
+  retainTokens: number,
+  importanceKeep?: ReadonlySet<SessionSeq>,
+  minimumTokens = 0,
+): { start: SessionSeq; end: SessionSeq } | null {
+  const priced = measurement.nodes
+  if (priced.length === 0) return null
+  const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== priced.length
+    || surfaceNodes.some((seq, index) => seq !== priced[index]?.seq)) {
+    throw new Error('fold: token-meter surface does not match the current session surface')
+  }
+  const types = surfaceNodes.map(seq => session.eventAt(seq)?.type ?? '')
+  const firstIdx = firstFoldableIndex(types)
+  // CUT balance at surface POSITION keepFromIdx — exactly the boundary
+  // compaction-basic validates: `end`'s cut must be balanced AFTER the end
+  // node (validateSurfaceRegion), which equals balanced-BEFORE the node at
+  // the cut. Past the tail there is no such node: the final cut still has a
+  // balance, and a surface ending inside an abandoned step (tool-call whose
+  // result never arrived — an aborted or 400'd run leaves one) makes it
+  // UNBALANCED. Treating the off-end position as trivially balanced is what
+  // made forced folds throw `end seq N is not a balanced boundary (… or the
+  // step is still open)` (2026-11-19).
+  const cutBalancedAt = (index: number): boolean => {
+    if (index < surfaceNodes.length) {
+      const seq = surfaceNodes[index]
+      return seq !== undefined && toolPairingBalancedBefore(session, seq)
+    }
+    const last = surfaceNodes[index - 1]
+    return last !== undefined && toolPairingBalancedAfter(session, last)
+  }
+  let keepFromIdx = retainedTailStart(priced.map(node => node.tokens), retainTokens)
+  if (keepFromIdx <= firstIdx) return null
+  while (keepFromIdx > firstIdx && !cutBalancedAt(keepFromIdx)) keepFromIdx -= 1
+  // High-value cut boundary: a user message immediately BEFORE the cut would
+  // be folded while the model's response to it stays verbatim — context
+  // inversion. Extend the kept tail over trailing user messages, and over
+  // nodes the goal-conditioned importance pass marked on-topic
+  // (`importanceKeep`), bounded (≤3 messages, ≤15% of the retained budget)
+  // so the target cannot balloon; the digest preserves their words, this
+  // preserves their ADJACENCY.
+  const boundaryBudget = Math.floor(retainTokens * 0.15)
+  let walked = 0
+  let walkedTokens = 0
+  while (keepFromIdx > firstIdx && walked < 3) {
+    const node = priced[keepFromIdx - 1]
+    if (node === undefined) break
+    const isUser = types[keepFromIdx - 1] === 'user/message'
+    const boundarySeq = surfaceNodes[keepFromIdx - 1]
+    const isImportant = boundarySeq !== undefined && importanceKeep?.has(boundarySeq) === true
+    if (!isUser && !isImportant) break
+    if (walkedTokens + node.tokens > boundaryBudget) break
+    walkedTokens += node.tokens
+    walked += 1
+    keepFromIdx -= 1
+  }
+  // The boundary walk steps over importance-kept nodes whose content carries
+  // tool-calls or results (delta ≠ 0), which can drag the cut off balance —
+  // user messages never do, so only the importance tier can need this.
+  // Correctness beats adjacency: retract to the nearest balanced cut.
+  while (keepFromIdx > firstIdx && !cutBalancedAt(keepFromIdx)) keepFromIdx -= 1
+  if (keepFromIdx <= firstIdx) return null
+  // ESCALATION: the range above the retained tail cannot net its own summary —
+  // usually one huge tail node overshooting `retain`, or a speculation frozen
+  // at an older surface. Under pressure the caller passes minimumTokens; move
+  // the cut toward the tail node-by-node until the range clears it. Bounded:
+  // stops at the FIRST crossing, never folds the newest nodes, only cuts at
+  // tool-pairing-balanced points; the system-head and first-user pins are
+  // upstream and untouched. Importance-kept nodes DO get folded by an
+  // escalation (unlike the boundary walk above): leaving them out would pin
+  // the escalation to a no-op exactly when progress is mandatory — the digest
+  // preserves their words instead of their adjacency. Callers without
+  // pressure pass 0 and behavior is byte-identical to the unescalated
+  // selection.
+  let sum = 0
+  for (let i = firstIdx; i < keepFromIdx; i += 1) sum += priced[i]?.tokens ?? 0
+  while (sum < minimumTokens && keepFromIdx < surfaceNodes.length - 1) {
+    if (!cutBalancedAt(keepFromIdx + 1)) break
+    sum += priced[keepFromIdx]?.tokens ?? 0
+    keepFromIdx += 1
+  }
+  if (keepFromIdx <= firstIdx) return null
+  const start = surfaceNodes[firstIdx]
+  const end = surfaceNodes[keepFromIdx - 1]
+  return start === undefined || end === undefined ? null : { start, end }
+}
+
+/**
+ * Whether the durable log leaves a turn open (a `turn/start` with no later
+ * `turn/end`). The host's compaction transaction keys its mode on exactly
+ * this (`inspectCompactionEntryState` in compaction-basic): `compactRegion`
+ * is the AUTOMATIC mode and requires an open turn, an idle session admits
+ * only standalone manual transactions. Routine/emergency folds fire at step
+ * boundaries (open turn); `/compact-force` may run while idle. The scan is
+ * bounded: it stops at the first lifecycle marker, which is recent in every
+ * state. The `SessionSeq` brander is not exported by the installed
+ * dsh-session package (see {@link SessionSeqOf}), hence the numeric cast.
+ * @param session - durable session to scan backwards from its tail.
+ */
+function sessionHasOpenTurn(session: Session): boolean {
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq as SessionSeq)
+    if (event === undefined) continue
+    if (event.type === 'turn/start') return true
+    if (event.type === 'turn/end') return false
+  }
+  return false
+}
+
+/** Persisted queue marker for a forced fold requested while the session is idle. */
+const FORCED_FOLD_PENDING_PREFIX = 'dsh-infinite-context/forced-fold-pending:'
+
+/** In-memory session counters idle this long are evicted (RAM only). */
+/** Speculation launches when the surface is at least this share of the trigger. */
+const SPECULATIVE_AHEAD_RATIO = 0.8
+const SESSION_COUNTER_IDLE_MS = 3600_000
+/** Persisted session counters are retained this long across idle gaps. */
+const SESSION_COUNTER_RETENTION_MS = 30 * 24 * 3600_000
+/** Persisted-retention sweep is throttled to this cadence. */
+const SESSION_KV_PRUNE_INTERVAL_MS = 3600_000
+
+// --- Implicit fold recall (semantic scan, feeds the EXISTING recall loop) ---
+
+/** Semantic-overlap threshold for an implicit recall (cold-start prior; the loop tunes nothing here — the signal feeds recallEma downstream). */
+const GOV_IMPLICIT_RECALL_COS = 0.82
+/** Recent folds the scan matches the step's user-authored delta against. */
+const IMPLICIT_RECALL_SCAN_RECENT = 8
+/** Turns a matched ref stays counted — one signal per ref per window. */
+const IMPLICIT_RECALL_COOLDOWN_TURNS = 50
+/** Safety bound on the cooldown map (cleared wholesale when exceeded). */
+const IMPLICIT_RECALL_COOLDOWN_MAX = 512
+/** Characters of fold text embedded at archive time (hashing embedder is cheap; clip anyway). */
+const IMPLICIT_RECALL_EMBED_CHARS = 8_000
+
+// --- Sleep-time consolidation (Letta's idle-compute pattern) ---
+
+/** Minimum superseded checkpoints before idle consolidation is worth an LLM call (cold-start prior). */
+const GOV_SLEEP_CONSOLIDATE_MIN = 3
+/** How many newest superseded checkpoint texts feed one consolidation. */
+const GOV_SLEEP_CONSOLIDATE_INPUTS = 8
+/** Minimum ms between two consolidations of the SAME session (cold-start prior). */
+const GOV_SLEEP_RERUN_MS = 6 * 3600_000
+
+// --- Degenerate-turn invisible retry (upstream billion-context #821, engine-layer equivalent) ---
+// The streak cap itself lives in degenerate-turn.ts (DEGENERATE_RETRY_MAX_STREAK):
+// a single degenerate turn is a fluke the nudge fixes; a streak means the model
+// is wedged and a fourth retry would burn tokens on the same collapse.
+
+/**
+ * Max LLM merge rounds over the mechanical segment notes: a region segmented
+ * into dozens of pieces leaves a notes pile too long to feed back as one
+ * request — each round groups them under the merge input budget and merges
+ * every group into one higher-level note until the notes fit a single
+ * request. A safety bound, not an operating point: three rounds shrink any
+ * realistic note pile by orders of magnitude.
+ */
+const EMERGENCY_MERGE_ROUNDS_MAX = 3
+
+export class HistoryCompressor {
+  // Persisted to the SQLite KV table (via `kv`) so the turn counters survive
+  // process restarts — without persistence a DSH restart reset the counters to
+  // zero and triggered an immediate, unnecessary compression on the next turn.
+  private readonly turnCounters = new Map<string, SessionCounter>()
+
+  /** Optional persistent KV backing (survives restarts); null disables persistence. */
+  /** When the persisted-counter retention sweep last ran (epoch ms). */
+  private lastKvPruneAt = 0
+  private readonly kv: PersistentKV | null
+
+  private readonly ctx: Context
+  private readonly config: ResolvedConfig
+
+  /** Interval (in rounds) between compressions. */
+  readonly compressInterval: number
+  /** Maximum messages to keep uncompressed (the "recent tail"). */
+  readonly retainRecent: number
+  /** Trigger when context exceeds this fraction of the token budget. */
+  readonly triggerRatio: number
+  /** Target water level (fraction of budget) after compression. */
+  readonly targetRatio: number
+  /**
+   * Reserved tokens for the plugin's own per-turn context footprint (the RAG
+   * injection spliced in AFTER the compression check). Subtracted from the
+   * trigger/target water levels so compression fires before the REAL request
+   * — conversation + plugin overhead — overflows the model window.
+   */
+  readonly injectionBudget: number
+  /**
+   * Whether the compressor may fire EARLY — before the trigger is crossed —
+   * when the smoothed surface growth says the next step would cross it anyway.
+   */
+  readonly nudge: boolean
+
+  constructor(
+    ctx: Context,
+    config: ResolvedConfig,
+    compressInterval: number,
+    retainRecent: number,
+    triggerRatio = 0.85,
+    targetRatio = 0.6,
+    injectionBudget = 0,
+    kv: PersistentKV | null = null,
+    nudge = false,
+  ) {
+    this.ctx = ctx
+    this.config = config
+    this.compressInterval = compressInterval
+    this.retainRecent = retainRecent
+    this.triggerRatio = triggerRatio
+    this.targetRatio = targetRatio
+    this.injectionBudget = injectionBudget
+    this.kv = kv
+    this.nudge = nudge
+    this.loadPersistedCounters()
+  }
+
+  /** KV prefix shared by every per-session compression counter. */
+  private static readonly KV_PREFIX = 'compression:'
+
+  /** KV key under which a session's counter is persisted. */
+  private static kvKey(sessionId: string): string {
+    return HistoryCompressor.KV_PREFIX + sessionId
+  }
+
+  /** Restore persisted counters for all sessions after a restart. */
+  private loadPersistedCounters(): void {
+    if (this.kv === null) return
+    // Enumerate by prefix is not supported by the flat KV API; the entries are
+    // loaded lazily per session on first touch instead (see touchSession).
+  }
+
+  /**
+   * Persist one session's counter. Best-effort: a KV failure must never break
+   * the agent loop, so it is swallowed here (the in-memory copy still works).
+   */
+  private persistCounter(sessionId: string): void {
+    if (this.kv === null) return
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      this.kv.delete(HistoryCompressor.kvKey(sessionId))
+      return
+    }
+    try {
+      this.kv.set(HistoryCompressor.kvKey(sessionId), JSON.stringify(entry))
+    } catch {
+      // best-effort persistence; the in-memory map remains authoritative
+    }
+  }
+
+  /**
+   * The effective token budget: context window minus headroom.
+   * @param windowOverride - the session's effective model window when the
+   *   caller resolved one for the routed model; defaults to the globally
+   *   adopted window (which may belong to a different model).
+   */
+  tokenBudget(windowOverride?: number): number {
+    const window = windowOverride ?? this.ctx.memoryContext.contextWindow
+    const headroom = this.ctx.memoryContext.headroomRatio ?? 0.25
+    return Math.floor(window * (1 - headroom))
+  }
+
+  /**
+   * Check if summarization config is available.
+   */
+  available(): boolean {
+    return this.config.summarizationProvider.length > 0
+      && this.config.summarizationModel.length > 0
+  }
+
+  /**
+   * Increment the turn counter for a session and return the entry.
+   * Initializes to 0 if the session has never been seen. Restores a
+   * persisted counter across restarts so the round interval survives.
+   */
+  private touchSession(sessionId: string): SessionCounter {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    entry.turn++
+    entry.lastActive = Date.now()
+    this.persistCounter(sessionId)
+    return entry
+  }
+
+  /** Restore a session's persisted counter (or create a fresh one). */
+  private restoreCounter(sessionId: string): SessionCounter {
+    if (this.kv !== null) {
+      try {
+        const raw = this.kv.get(HistoryCompressor.kvKey(sessionId))
+        if (raw !== undefined) {
+          const parsed = JSON.parse(raw) as Partial<SessionCounter> | null
+          if (parsed !== null && typeof parsed === 'object' && typeof parsed.turn === 'number') {
+            const restored: SessionCounter = {
+              turn: parsed.turn,
+              lastActive: Date.now(),
+              ...(typeof parsed.lastCompressedTurn === 'number'
+                ? { lastCompressedTurn: parsed.lastCompressedTurn } : {}),
+              ...(typeof parsed.lastTokens === 'number' ? { lastTokens: parsed.lastTokens } : {}),
+              ...(typeof parsed.compressions === 'number' ? { compressions: parsed.compressions } : {}),
+              ...(typeof parsed.lastForceAt === 'number' ? { lastForceAt: parsed.lastForceAt } : {}),
+              ...(typeof parsed.lastCompressedAt === 'number' ? { lastCompressedAt: parsed.lastCompressedAt } : {}),
+              // Learned state that CANNOT be re-derived from the surface
+              // (unlike growthEma/lastSizeTokens, which are deliberately
+              // re-seeded from live measurement): dropping it here would
+              // restart the closed-loop band from zero on every restart or
+              // idle eviction.
+              ...(typeof parsed.targetDeviationEma === 'number'
+                ? { targetDeviationEma: parsed.targetDeviationEma } : {}),
+              // Same rationale as the EMA: learned/carried state that cannot
+              // be re-derived from the surface after the fold is gone.
+              ...(typeof parsed.taskState === 'string' ? { taskState: parsed.taskState } : {}),
+              // Runway scheduler state (see SessionCounter): learned cycle
+              // EMAs and the servo factor — dropping any of these would
+              // restart the learned tempo from cold start on every restart.
+              ...(typeof parsed.cycleRunwayRatioEma === 'number' ? { cycleRunwayRatioEma: parsed.cycleRunwayRatioEma } : {}),
+              ...(typeof parsed.cycleTimeEmaMs === 'number' ? { cycleTimeEmaMs: parsed.cycleTimeEmaMs } : {}),
+              ...(typeof parsed.cycleRequestsEma === 'number' ? { cycleRequestsEma: parsed.cycleRequestsEma } : {}),
+              ...(typeof parsed.cycleCacheHitEma === 'number' ? { cycleCacheHitEma: parsed.cycleCacheHitEma } : {}),
+              ...(typeof parsed.recallEma === 'number' ? { recallEma: parsed.recallEma } : {}),
+              ...(typeof parsed.runwayFactor === 'number' ? { runwayFactor: parsed.runwayFactor } : {}),
+              ...(typeof parsed.lastLandedTokens === 'number' ? { lastLandedTokens: parsed.lastLandedTokens } : {}),
+              ...(typeof parsed.growthRateEma === 'number' ? { growthRateEma: parsed.growthRateEma } : {}),
+              ...(typeof parsed.cacheHitBaselineEma === 'number' ? { cacheHitBaselineEma: parsed.cacheHitBaselineEma } : {}),
+              failureCooldown: typeof parsed.failureCooldown === 'number' ? parsed.failureCooldown : 0,
+            }
+            return restored
+          }
+        }
+      } catch {
+        // corrupt entry — fall through to a fresh counter
+      }
+    }
+    return { turn: 0, lastActive: Date.now(), failureCooldown: 0 }
+  }
+
+  /**
+   * Estimate total tokens across a message array using the CJK-aware heuristic.
+   * Public so the engine can build the unified SurfaceSnapshot on the SAME
+   * basis the fold executor uses (before/after must not mix meters).
+   */
+  estimateMessageTokens(messages: readonly { role: string; content: unknown }[]): number {
+    let total = 0
+    for (const msg of messages) {
+      total += estimateContentTokens(msg.content)
+    }
+    return total
+  }
+
+  /**
+   * Read-only ledger view for the unified planner. `turn` is the UPCOMING turn
+   * (this step) that the fold planner evaluates; beginFoldCheck() advances it.
+   * @param sessionId - the session to read.
+   * @param surfaceTokens - current surface estimate; omit to keep the stored EMA.
+   * @returns the planner's per-session state (never throws).
+   */
+  ledgerOf(sessionId: string, surfaceTokens?: number): GovernanceLedger {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return ledgerView(entry, surfaceTokens)
+  }
+
+  /**
+   * Advance the fold-lane turn for one session and return the planner's view.
+   *
+   * The fold lane no longer runs `compress()`, so this is what keeps the
+   * rate-limit/stage/growth state moving: it increments the turn, folds the
+   * current surface into the growth EMA, and persists the entry. Without it the
+   * planner would see a frozen turn and re-fold on every step.
+   * @param sessionId - the session being checked.
+   * @param surfaceTokens - current surface estimate (meter basis).
+   * @returns the planner's ledger for THIS turn.
+   */
+  beginFoldCheck(sessionId: string, surfaceTokens: number): GovernanceLedger {
+    const entry = this.touchSession(sessionId)
+    // Count the cooldown down on every fold check so a transient failure
+    // cannot disable the lane for the rest of the session.
+    if (entry.failureCooldown > 0) entry.failureCooldown -= 1
+    const now = Date.now()
+    const delta = entry.lastSizeTokens === undefined ? 0 : surfaceTokens - entry.lastSizeTokens
+    entry.growthEma = nextGrowthEma(entry.growthEma, delta)
+    // Surface growth RATE (tokens/ms) — the predictive speculative-launch
+    // predictor. Needs a previous check to measure a delta over.
+    if (entry.lastCheckAtMs !== undefined && entry.lastSizeTokens !== undefined) {
+      const rate = nextGrowthRate(
+        entry.growthRateEma,
+        Math.max(0, surfaceTokens - entry.lastSizeTokens),
+        now - entry.lastCheckAtMs,
+      )
+      if (rate !== undefined) entry.growthRateEma = rate
+    }
+    entry.lastCheckAtMs = now
+    entry.lastSizeTokens = surfaceTokens
+    this.persistCounter(sessionId)
+    return {
+      turn: entry.turn,
+      ...(entry.lastCompressedTurn === undefined ? {} : { lastCompressedTurn: entry.lastCompressedTurn }),
+      ...(entry.lastTokens === undefined ? {} : { lastTokens: entry.lastTokens }),
+      failureCooldown: entry.failureCooldown,
+      compressions: entry.compressions ?? 0,
+      growthTokens: entry.growthEma ?? 0,
+    }
+  }
+
+  /** The learned surface growth rate (tokens/ms) for predictive timing. */
+  growthRateOf(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.growthRateEma
+  }
+
+  /**
+   * Record a successful fold: stamp lastCompressedTurn/lastTokens, reset the
+   * growth delta and failure cooldown, and bump the maturity counter.
+   * @param sessionId - the folded session.
+   * @param beforeTokens - surface size before the fold.
+   */
+  /**
+   * Epoch ms of the session's last successful fold.
+   * @param sessionId - the session to query.
+   * @returns the timestamp, or undefined when the session never folded.
+   */
+  lastFoldAt(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.lastCompressedAt
+  }
+
+  recordFold(sessionId: string, beforeTokens: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.lastCompressedTurn = entry.turn
+    entry.lastTokens = beforeTokens
+    entry.lastSizeTokens = beforeTokens
+    entry.growthEma = 0
+    entry.compressions = (entry.compressions ?? 0) + 1
+    entry.lastCompressedAt = Date.now()
+    entry.failureCooldown = 0
+    this.persistCounter(sessionId)
+  }
+
+  /**
+   * Record a failed fold so the planner backs off instead of retrying every step.
+   * @param sessionId - the session whose fold failed.
+   */
+  recordFoldFailure(sessionId: string, error?: unknown): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    // The machine code rides along: a reasoning-parameter refusal (issue #2)
+    // reads as a plain INVALID_REQUEST message, and only the code plus the
+    // thinking wording separates "this body can never be accepted" from a
+    // transient 400 the next round might survive.
+    const code = (error as { code?: string } | undefined)?.code
+    entry.failureCooldown = failureCooldownFor(entry.failureCooldown, message, COMPRESS_FAILURE_COOLDOWN, code)
+    this.persistCounter(sessionId)
+  }
+
+  /**
+   * The session's learned landing-deviation EMA, in tokens. `undefined` means
+   * no fold has landed yet, so no closed-loop correction applies. Restores the
+   * persisted counter lazily (same as {@link ledgerOf}) so a restart or idle
+   * eviction does not read as "never folded".
+   * @param sessionId - the session to query.
+   */
+  targetDeviationOf(sessionId: string): number | undefined {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return entry.targetDeviationEma
+  }
+
+  /**
+   * The session's carried task-state block (see src/task-state.ts), or
+   * `undefined` when no fold has committed one yet. Restores the persisted
+   * counter lazily so a restart or idle eviction does not read as "never".
+   * @param sessionId - the session to query.
+   */
+  taskStateOf(sessionId: string): string | undefined {
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    return entry.taskState
+  }
+
+  /**
+   * Store the task-state block built from a committed fold, persisting it
+   * with the rest of the session state.
+   * @param sessionId - the session that just committed a fold.
+   * @param block - the new block (bounded by TASK_STATE_MAX_CHARS).
+   */
+  recordTaskState(sessionId: string, block: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.taskState = block
+    this.persistCounter(sessionId)
+  }
+
+  /**
+   * Fold one landing observation into the per-session deviation EMA (signed:
+   * `landing − target`), persisting it with the rest of the session state.
+   * @param sessionId - the session that just committed a fold.
+   * @param landingDelta - `post-fold landing − planned target`, in tokens on
+   * the meter's surface basis.
+   * @returns the updated EMA (for diagnostics; 0 for an unknown session).
+   */
+  recordFoldLanding(sessionId: string, landingDelta: number): number {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return 0
+    entry.targetDeviationEma = nextTargetDeviationEma(entry.targetDeviationEma, landingDelta)
+    this.persistCounter(sessionId)
+    return entry.targetDeviationEma
+  }
+
+  /** KV key of one summarizer route's cross-session deviation prior. */
+  private static deviationPriorKey(route: string): string {
+    return HistoryCompressor.KV_PREFIX + 'deviation-prior:' + route
+  }
+
+  /**
+   * The converged deviation EMA of this summarizer route's most recent
+   * session — the warm-start prior for a fresh session's first folds.
+   * @param route - the summarizer route (`provider/model`).
+   */
+  deviationPriorOf(route: string): number | undefined {
+    if (this.kv === null) return undefined
+    try {
+      const raw = this.kv.get(HistoryCompressor.deviationPriorKey(route))
+      if (raw === undefined) return undefined
+      const parsed = JSON.parse(raw) as { ema?: unknown }
+      return typeof parsed.ema === 'number' && Number.isFinite(parsed.ema) ? parsed.ema : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Publish the route's deviation prior after a routine landing. Degraded
+   * (extractive) folds skip: their overhead shape differs and would poison
+   * the warm start.
+   * @param route - the summarizer route (`provider/model`).
+   * @param ema - the session's current EMA.
+   */
+  recordDeviationPrior(route: string, ema: number): void {
+    if (this.kv === null || !Number.isFinite(ema)) return
+    try {
+      this.kv.set(HistoryCompressor.deviationPriorKey(route), JSON.stringify({ ema: Math.round(ema) }))
+    } catch {
+      // best-effort persistence; the in-memory session EMA remains authoritative
+    }
+  }
+
+  /**
+   * Warm-start a never-folded session's deviation EMA from the route prior.
+   * Without it, every new session re-runs the systematic shortfall for two
+   * folds while its EMA re-converges. Only fires when the session has no EMA
+   * at all (never folded, or restored from a pre-prior entry).
+   * @param sessionId - the session to seed.
+   * @param value - the route prior (finite).
+   */
+  seedDeviationEma(sessionId: string, value: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined || !Number.isFinite(value)) return
+    if (entry.targetDeviationEma !== undefined) return
+    entry.targetDeviationEma = value
+    this.persistCounter(sessionId)
+  }
+
+  // --- Runway scheduler state (src/fold-scheduler.ts) -----------------------
+
+  /** Assemble the controller state this session currently holds. */
+  cycleLearningOf(sessionId: string): FoldLearningState {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return {}
+    return {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+  }
+
+  /** The surface tokens this session last LANDED at (runway reference). */
+  lastLandedTokensOf(sessionId: string): number | undefined {
+    return this.turnCounters.get(sessionId)?.lastLandedTokens
+  }
+
+  /**
+   * Record one agent request's usage into the CURRENT cycle's accumulators.
+   * In-memory only: the totals fold into the learning EMAs at the cycle's
+   * commit (persisting per request would multiply write volume).
+   */
+  noteCycleUsage(sessionId: string, inputTokens: number, cacheRead: number | undefined, cacheWrite: number): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    // The FIRST request of a fresh cycle is the one that pays for the
+    // opening fold's cache invalidation: capture its dip once, before the
+    // request counter increments. Sessions that never folded have no break
+    // to measure (lastCompressedAt undefined), and an adapter that omits
+    // cache fields leaves the dip UNMEASURED — a fabricated 1.00 would read
+    // as a total cache miss (the lifecycle review's P2-3).
+    if (cacheRead !== undefined && Number.isFinite(cacheRead)) entry.cacheMeasured = true
+    if ((entry.cycleRequestsCount ?? 0) === 0 && entry.lastCompressedAt !== undefined
+      && cacheRead !== undefined && Number.isFinite(cacheRead)) {
+      const total = cacheRead + (Number.isFinite(inputTokens) ? inputTokens : 0)
+        + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
+      if (total > 0) entry.cycleCacheDip = Math.min(1, Math.max(0, 1 - cacheRead / total))
+    }
+    entry.cycleCacheRead = (entry.cycleCacheRead ?? 0) + (cacheRead !== undefined && Number.isFinite(cacheRead) ? cacheRead : 0)
+    entry.cycleCacheInput = (entry.cycleCacheInput ?? 0) + (Number.isFinite(inputTokens) ? inputTokens : 0)
+    entry.cycleCacheWrite = (entry.cycleCacheWrite ?? 0) + (Number.isFinite(cacheWrite) ? cacheWrite : 0)
+    entry.cycleRequestsCount = (entry.cycleRequestsCount ?? 0) + 1
+  }
+
+  /** An agent-lane overflow / guard takeover happened this cycle. */
+  markCycleFailure(sessionId: string): void {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return
+    entry.cycleHadFailure = true
+  }
+
+  /**
+   * The raw inputs of the OPEN cycle (before its closing fold commits): the
+   * engine builds the FoldCycleReport from these at commit time.
+   */
+  cycleReportInputsOf(sessionId: string): {
+    lastLandedTokens?: number
+    lastCompressedAt?: number
+    cycleRequests: number
+    cacheRead: number
+    cacheInput: number
+    cacheWrite: number
+    hadFailure: boolean
+    cacheDip?: number
+    cacheMeasured: boolean
+  } {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      return { cycleRequests: 0, cacheRead: 0, cacheInput: 0, cacheWrite: 0, hadFailure: false, cacheMeasured: false }
+    }
+    return {
+      ...(entry.lastLandedTokens === undefined ? {} : { lastLandedTokens: entry.lastLandedTokens }),
+      ...(entry.lastCompressedAt === undefined ? {} : { lastCompressedAt: entry.lastCompressedAt }),
+      cycleRequests: entry.cycleRequestsCount ?? 0,
+      cacheRead: entry.cycleCacheRead ?? 0,
+      cacheInput: entry.cycleCacheInput ?? 0,
+      cacheWrite: entry.cycleCacheWrite ?? 0,
+      hadFailure: entry.cycleHadFailure === true,
+      ...(entry.cycleCacheDip === undefined ? {} : { cacheDip: entry.cycleCacheDip }),
+      cacheMeasured: entry.cacheMeasured === true,
+    }
+  }
+
+  /**
+   * Close one fold cycle: fold the report into the learning EMAs, stamp the
+   * landing reference for the next runway measurement, reset the
+   * accumulators, persist.
+   * @param landedTokens - this fold's post-commit surface tokens.
+   */
+  applyFoldCycle(
+    sessionId: string,
+    report: FoldCycleReport,
+    budgetTokens: number,
+    landedTokens: number,
+    teach = true,
+  ): FoldLearningState {
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) return {}
+    const budget = Number.isFinite(budgetTokens) && (budgetTokens as number) > 0 ? (budgetTokens as number) : 1
+    const previous: FoldLearningState = {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+    // observe-without-teach (the deviation-loop semantics): forced/degraded
+    // folds still close the cycle (landing reference, accumulator reset, k
+    // servo) but their atypical shapes must not bend the time/requests EMAs.
+    // NaN fields are skipped by the scheduler's own guards.
+    const teachingReport = teach
+      ? report
+      : { ...report, cycleTimeMs: Number.NaN, cycleRequests: Number.NaN }
+    const next = updateFoldLearning(previous, teachingReport, budget)
+    if (next.runwayRatioEma !== undefined) entry.cycleRunwayRatioEma = next.runwayRatioEma
+    if (next.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = next.cycleTimeEmaMs
+    if (next.cycleRequestsEma !== undefined) entry.cycleRequestsEma = next.cycleRequestsEma
+    if (next.cycleCacheHitEma !== undefined) entry.cycleCacheHitEma = next.cycleCacheHitEma
+    // The slow route baseline MUST round-trip like the fast EMA: updateFoldLearning
+    // produces it every cycle, and skipping this write-back (the 2026-11-13 bug)
+    // froze the baseline at its seed so cacheUtilityVote permanently fell through
+    // to the absolute floor — the relative-to-baseline judgment never engaged.
+    if (next.cacheHitBaselineEma !== undefined) entry.cacheHitBaselineEma = next.cacheHitBaselineEma
+    if (next.recallEma !== undefined) entry.recallEma = next.recallEma
+    if (next.runwayFactor !== undefined) entry.runwayFactor = next.runwayFactor
+    if (Number.isFinite(landedTokens)) entry.lastLandedTokens = landedTokens
+    entry.cycleCacheRead = 0
+    entry.cycleCacheInput = 0
+    entry.cycleCacheWrite = 0
+    entry.cycleRequestsCount = 0
+    entry.cycleHadFailure = false
+    entry.cycleCacheDip = undefined
+    entry.cacheMeasured = undefined
+    this.persistCounter(sessionId)
+    return {
+      ...(entry.cycleRunwayRatioEma === undefined ? {} : { runwayRatioEma: entry.cycleRunwayRatioEma }),
+      ...(entry.cycleTimeEmaMs === undefined ? {} : { cycleTimeEmaMs: entry.cycleTimeEmaMs }),
+      ...(entry.cycleRequestsEma === undefined ? {} : { cycleRequestsEma: entry.cycleRequestsEma }),
+      ...(entry.cycleCacheHitEma === undefined ? {} : { cycleCacheHitEma: entry.cycleCacheHitEma }),
+      ...(entry.cacheHitBaselineEma === undefined ? {} : { cacheHitBaselineEma: entry.cacheHitBaselineEma }),
+      ...(entry.recallEma === undefined ? {} : { recallEma: entry.recallEma }),
+      ...(entry.runwayFactor === undefined ? {} : { runwayFactor: entry.runwayFactor }),
+    }
+  }
+
+  static foldCyclePriorKey(route: string): string {
+    return HistoryCompressor.KV_PREFIX + 'fold-cycle:prior:' + route
+  }
+
+  /** Publish the route-level prior so fresh sessions warm-start the tempo. */
+  publishFoldCyclePrior(route: string, state: FoldLearningState): void {
+    if (this.kv === null) return
+    try {
+      this.kv.set(HistoryCompressor.foldCyclePriorKey(route), serializeFoldPrior(state))
+    } catch {
+      // best-effort persistence; the in-memory session state remains authoritative
+    }
+  }
+
+  /**
+   * Warm-start a never-folded session's runway state from the route prior.
+   * Only fires when the session holds no runway learning at all.
+   */
+  seedCycleLearning(sessionId: string, route: string): void {
+    if (this.kv === null) return
+    const entry = this.turnCounters.get(sessionId)
+    if (entry === undefined || entry.cycleRunwayRatioEma !== undefined) return
+    try {
+      const prior = parseFoldPrior(this.kv.get(HistoryCompressor.foldCyclePriorKey(route)))
+      // Every prior key seeds: a partial seed (the pre-0.9.7 shape seeded only
+      // four) leaves the freshly-warmed session with unlearned fields whose
+      // consumers silently fall back — e.g. cacheUtilityVote to the absolute floor.
+      if (prior.runwayRatioEma !== undefined) entry.cycleRunwayRatioEma = prior.runwayRatioEma
+      if (prior.runwayFactor !== undefined) entry.runwayFactor = prior.runwayFactor
+      if (prior.recallEma !== undefined) entry.recallEma = prior.recallEma
+      if (prior.cycleTimeEmaMs !== undefined) entry.cycleTimeEmaMs = prior.cycleTimeEmaMs
+      if (prior.cycleRequestsEma !== undefined) entry.cycleRequestsEma = prior.cycleRequestsEma
+      if (prior.cycleCacheHitEma !== undefined) entry.cycleCacheHitEma = prior.cycleCacheHitEma
+      if (prior.cacheHitBaselineEma !== undefined) entry.cacheHitBaselineEma = prior.cacheHitBaselineEma
+      this.persistCounter(sessionId)
+    } catch {
+      // Prior seeding is best-effort.
+    }
+  }
+
+  /**
+   * Record (or reject) a FORCED narrowed-window pressure compaction for one
+   * session, honouring the cooldown. Keeps the mark in the same ledger entry
+   * as the turn/growth state so it survives restarts and is cleaned with it.
+   * @param sessionId - the session requesting the force.
+   * @param cooldownMs - minimum ms between two forced compactions.
+   * @returns true when the force may proceed (and the mark was recorded).
+   */
+  markForce(sessionId: string, cooldownMs: number): boolean {
+    const now = Date.now()
+    let entry = this.turnCounters.get(sessionId)
+    if (entry === undefined) {
+      entry = this.restoreCounter(sessionId)
+      this.turnCounters.set(sessionId, entry)
+    }
+    if (entry.lastForceAt !== undefined && now - entry.lastForceAt < cooldownMs) return false
+    entry.lastForceAt = now
+    entry.lastActive = now
+    this.persistCounter(sessionId)
+    return true
+  }
+
+  /**
+   * Periodic cleanup: evict idle session counters from MEMORY and, far less
+   * often, prune PERSISTED counters past their long retention.
+   *
+   * The two lifetimes are deliberately different. Eviction only bounds RAM
+   * after an hour of idleness, but it used to delete the persisted entry too —
+   * so a long session with a multi-hour gap lost its lastCompressedTurn,
+   * compressions, growth EMA and failure cooldown and recompressed the moment
+   * it resumed. Persisted state is now retained for
+   * {@link SESSION_COUNTER_RETENTION_MS} and restored lazily by
+   * {@link restoreCounter}. Call from the pre-step hook.
+   */
+  cleanupStale(): readonly string[] {
+    const now = Date.now()
+    const staleSessions: string[] = []
+    for (const [sessionId, entry] of this.turnCounters) {
+      if (now - entry.lastActive > SESSION_COUNTER_IDLE_MS) {
+        this.turnCounters.delete(sessionId)
+        staleSessions.push(sessionId)
+      }
+    }
+    if (this.kv?.deleteOlderThan === undefined) return staleSessions
+    if (now - this.lastKvPruneAt < SESSION_KV_PRUNE_INTERVAL_MS) return staleSessions
+    this.lastKvPruneAt = now
+    try {
+      const removed = this.kv.deleteOlderThan(
+        HistoryCompressor.KV_PREFIX,
+        now - SESSION_COUNTER_RETENTION_MS,
+      )
+      if (removed > 0) {
+        this.ctx.logger.info(`[ContextGovernor] Pruned ${removed} stale session counter(s)`)
+      }
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Session-counter retention sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+    return staleSessions
+  }
+
+  /**
+   * Archive the exact messages a compression is about to fold into a summary,
+   * and return the header that introduces that summary on the surface.
+   *
+   * Reversibility is the point (upstream `decompress`): the summary costs
+   * tokens, the archive costs only disk, and `memory_expand ref=fl_…` brings
+   * the literal text back when the model needs the detail. Best-effort — an
+   * archive failure degrades to the plain header, it never blocks compaction.
+   *
+   * @param sessionId - the session whose history is being folded.
+   * @param messages - the messages being replaced by the summary.
+   * @param summaryText - the summary that will replace them.
+   * @returns the header line for the summary message.
+   */
+  archiveFoldedRange(
+    sessionId: string,
+    messages: readonly Message[],
+    summaryText: string,
+  ): string {
+    const options = resolveFoldOptions(this.config)
+    if (!options.enabled) return foldedRangeHeader(messages.length, 0, null)
+    try {
+      const original = serializeMessagesForSummary(messages)
+      // Code points, not UTF-16 units: memory_expand reports code points and
+      // the two headers must agree for astral text (the 0.9.8 review F18a).
+      const chars = Array.from(original).length
+      const attachments = extractFoldAttachments(messages)
+      const ref = this.ctx.memoryContext.archiveFoldedRange({
+        messages: messages.length,
+        chars,
+        tokens: this.estimateMessageTokens(messages),
+        summary: summaryText,
+        original,
+        sessionId,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      })
+      this.enforceFoldRetention(options)
+      // The summary embedding is BACK-FILLED after the archive row exists:
+      // awaiting the embedder here sat on the fold commit path, and a
+      // TransformersEmbedder inits/downloads its ONNX model on first use —
+      // minutes of latency blocking the pending model call (the lifecycle
+      // review's P2-7). Fire-and-forget; a failed embed leaves the fold
+      // invisible to the implicit-recall scan, nothing more.
+      if (ref !== null && resolveImplicitRecall(this.config) && summaryText.length > 0) {
+        const embeddedText = summaryText.length > IMPLICIT_RECALL_EMBED_CHARS
+          ? summaryText.slice(0, IMPLICIT_RECALL_EMBED_CHARS)
+          : summaryText
+        void this.ctx.memoryContext.embedText(embeddedText)
+          .then(embedding => {
+            if (embedding !== undefined) this.ctx.memoryContext.patchFoldEmbedding(ref, embedding)
+          })
+          .catch(() => { /* the fold stays scan-invisible; nothing else is lost */ })
+      }
+      return foldedRangeHeader(messages.length, chars, ref)
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Folded-range archive failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return foldedRangeHeader(messages.length, 0, null)
+    }
+  }
+
+  /**
+   * Drop folded ranges past retention, then past the entry cap.
+   * @param options - the resolved folded-range policy.
+   */
+  private enforceFoldRetention(options: FoldOptions): void {
+    try {
+      if (options.retentionDays > 0) {
+        const dayMs = 24 * 60 * 60 * 1000
+        this.ctx.memoryContext.pruneFoldedRanges(Date.now() - options.retentionDays * dayMs)
+      }
+      if (options.maxEntries > 0) this.ctx.memoryContext.trimFoldedRanges(options.maxEntries)
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Folded-range retention sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Fallback Truncation                                                        */
+/*  Strategy: if context is still over budget after compression + retrieval,   */
+/*  drop messages in priority order: RAG → summaries → tool defs → oldest.    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fallback truncation: ensure total messages stay within the token budget.
+ *
+ * Drop priority (first to last):
+ *   1. RAG-injected context messages (contain '<retrieved_context>' marker)
+ *   2. History compression summaries (contain '[Compressed history —')
+ *   3. Oldest conversation messages (preserving the newest `retainRecent`)
+ *
+ * This function does NOT throw — it silently reduces the array.
+ * If even dropping everything except the last user message exceeds the budget,
+ * the caller should abort the request with an explicit error.
+ *
+ * @param messages    - the message array to trim (not mutated; a copy is returned).
+ * @param tokenBudget - maximum allowed estimated tokens.
+ * @param retainRecent - minimum number of newest messages to preserve (default 4).
+ */
+export function fallbackTruncate(
+  messages: Message[],
+  tokenBudget: number,
+  retainRecent = 4,
+): Message[] {
+  const estimate = (msgs: readonly Message[]): number => {
+    // Meter content the same way the compressor does (estimateContentTokens):
+    // image blocks get a fixed cost and non-text blocks count their text
+    // payload, so the fallback truncation and the token-pressure trigger
+    // cannot disagree on image-heavy sessions.
+    let total = 0
+    for (const msg of msgs) total += estimateContentTokens(msg.content)
+    return total
+  }
+
+  // Deep copy here to avoid side effects
+  let result: Message[] = messages.map(m => ({ ...m }))
+  let tokens = estimate(result)
+
+  if (tokens <= tokenBudget) return result
+
+  // Phase 1: remove RAG-injected messages (highest priority to drop)
+  result = result.filter(m => {
+    const text = messageText(m)
+    return !text.includes('<retrieved_context>')
+  })
+  tokens = estimate(result)
+  if (tokens <= tokenBudget) return result
+
+  // Phase 2: remove history compression summaries
+  result = result.filter(m => {
+    const text = messageText(m)
+    return !text.includes('[Compressed history —')
+  })
+  tokens = estimate(result)
+  if (tokens <= tokenBudget) return result
+
+  // Phase 3: drop oldest messages one by one (preserve the newest retainRecent).
+  // Two pins beyond the count:
+  //   - the LATEST user message — a tail of tool results (parallel calls) can
+  //     push it outside a count-only window, and the request would keep the
+  //     answers while losing the question they reply to;
+  //   - tool-call/tool-result carrying messages — shifting one side of a pair
+  //     orphans the other and 400s on strict providers. When the shift
+  //     candidate is pinned, the text-trim last resort below takes over.
+  const lastUserIndex = (msgs: readonly Message[]): number => {
+    // The USER's own words, not an injected user-role splice: pinning a
+    // time-context/runtime artifact while the real question gets dropped is
+    // exactly the failure isUserAuthored exists for.
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      if (msgs[i]!.role === 'user' && isUserAuthored(msgs[i]!)) return i
+    }
+    return -1
+  }
+  const hasToolBlocks = (msg: Message): boolean =>
+    Array.isArray(msg.content)
+      && msg.content.some(block => (block as { type?: unknown }).type === 'tool-call'
+        || (block as { type?: unknown }).type === 'tool-result')
+  while (result.length > retainRecent && tokens > tokenBudget) {
+    if (lastUserIndex(result) === 0) break // shifting would drop the last user message
+    const head = result[0]!
+    if (hasToolBlocks(head)) break // would orphan a tool-call/result pair
+    result.shift()
+    tokens = estimate(result)
+  }
+
+  if (tokens > tokenBudget) {
+    // Last resort: trim the oldest remaining message's TEXT payload. Only text
+    // blocks are rewritten (preserving images and every other block so the
+    // message keeps its modality and the DSH ContentBlock[] contract), and the
+    // message object is rebuilt instead of mutating readonly fields. The same
+    // two pins apply: the last user message's text is the question itself.
+    const oldest = result[0]
+    if (oldest !== undefined && result.length > 1 && lastUserIndex(result) !== 0
+      && !hasToolBlocks(oldest) && Array.isArray(oldest.content)) {
+      const overBy = tokens - tokenBudget
+      const charsToDrop = overBy * 4 // rough reverse estimate
+      if (charsToDrop > 0) {
+        let remaining = charsToDrop
+        const content = oldest.content.map(block => {
+          if (remaining <= 0 || !isTextBlock(block) || block.text.length <= remaining) return block
+          const kept = block.text.slice(remaining)
+          remaining = 0
+          return { ...block, text: kept }
+        })
+        if (remaining === 0) result[0] = { ...oldest, content }
+      }
+    }
+  }
+
+  return result
+}
+
+/* -------------------------------------------------------------------------- */
+/*  MemoryCompactionEngine — the Cordis entry point                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A speculative fold summary awaiting a committing fold. The fingerprint keys
+ * the EXACT SummarizationInput the compaction-basic engine will rebuild from
+ * the range's seqs; a match at commit time lets the summarizer call be
+ * skipped entirely.
+ */
+interface SpeculativeSummary {
+  /** Full-input fingerprint (roles+texts+tool names) — layer-1 range check. */
+  readonly fingerprint: number
+  /**
+   * STRICT region fingerprint (roles+texts of everything) — first-choice
+   * consume contract. The full-input hash compares the BASE engine's
+   * rebuilt input against the plugin's own builder; any preamble or tool
+   * churn between prepare and consume breaks it (production: 0 hits in 11
+   * launches, every fold paying a blocking live call). The summary stays
+   * valid exactly while the region MESSAGES are verbatim — that, and only
+   * that, is what the consume must verify.
+   */
+  readonly regionFingerprint: number
+  /**
+   * STABLE region fingerprint (conversational texts + tool callIds) — the
+   * drift-tolerant tier. Tool-result text is rewritten in place by archive
+   * stubbing / memory_expand / absorb digests while the information stays
+   * recoverable, so a strict mismatch with only tool-text differences must
+   * not waste the prepared summary (production: 7 of 9 prepared summaries
+   * died this way in session 7ed44333).
+   */
+  readonly stableFingerprint: number
+  readonly summary: ContentBlock[]
+  readonly start: SessionSeq
+  readonly end: SessionSeq
+  /**
+   * Tool callIds of the anchor nodes when they are tool messages (absent for
+   * conversational anchors). Stub/absorb replaces retire the anchor SEQ while
+   * keeping the callId, so these are the anchor's identity across rewrites —
+   * the rebasing helper follows them instead of dropping the checkpoint.
+   */
+  readonly startCallId?: string
+  readonly endCallId?: string
+}
+
+/**
+ * Fingerprint one SummarizationInput: the roles + TEXT of every message plus
+ * the tool-schema names. Two inputs with the same fingerprint get the same
+ * summary, which is the whole contract of the speculative precompute. Text
+ * only — non-text blocks (images) are not what the summarizer reads.
+ * Exported for tests.
+ */
+export function summarizationFingerprint(input: SummarizationInput): number {
+  return fnv1a(JSON.stringify({
+    tools: input.tools === undefined ? null : input.tools.map(tool => tool.name),
+    messages: input.messages.map(message => [message.role, messageText(message)]),
+  }))
+}
+
+/**
+ * Fingerprint of the folded messages PROPER: role+text projection, no tool
+ * names, no leading system preamble. This is the STRICT tier of the
+ * speculation consume contract: a prepared summary stays valid exactly while
+ * these messages are verbatim. The base engine rebuilds the input with its
+ * own preamble (own system prompt) under the request's CURRENT header — any
+ * preamble or tool-churn difference between prepare and consume breaks the
+ * full-input hash without invalidating a single folded word, so the consume
+ * verifies the region projection instead.
+ */
+export function regionMessagesFingerprint(messages: readonly Message[]): number {
+  return fnv1a(JSON.stringify(messages.map(message => [message.role, messageText(message)])))
+}
+
+/**
+ * The STABLE tier: role+text for conversational messages, role+callId for
+ * tool messages. Tool-result TEXT is the volatile layer of a frozen region —
+ * archive stubbing rewrites it to a ref+digest, `memory_expand` restores it
+ * to the full payload, and both preserve the callId and the recoverable
+ * information (the full text lives in the tool_results archive regardless of
+ * what the surface carries). A summary prepared over the RICHER pre-stub
+ * text stays a valid replacement for the post-stub region, so this tier —
+ * and only this tier — tolerates tool-text drift while still catching
+ * conversational edits, inserted/removed messages, and wholesale tool-message
+ * replacement (callId change). Production evidence for the tier: session
+ * 7ed44333 kept a checkpoint alive through 7 other-region calls yet lost 7
+ * of 9 prepared summaries to layer-1 strict mismatches before their fold.
+ */
+export function regionStableFingerprint(messages: readonly Message[]): number {
+  return fnv1a(JSON.stringify(messages.map(message => {
+    const source = (message as { source?: { kind?: string; callId?: unknown } }).source
+    if (source?.kind === 'tool') return ['tool', source.callId]
+    return [message.role, messageText(message)]
+  })))
+}
+
+/**
+ * Whether BOTH anchor seqs of a speculative range still exist in the live
+ * surface. Absorb/archive rewrites replace surface ranges and retire their
+ * seqs; {@link buildRegionInput} silently SKIPS missing seqs, so a refresh
+ * can fingerprint the surviving subrange and re-arm a dead anchor as a
+ * plausible-looking entry — which then commits a range whose start is gone
+ * and hard-fails compactRegion every step (the 2026-11-04 fold-lane lockout:
+ * 'start seq 918 not found in surface' ×5 over 20 minutes). The fingerprint
+ * contract alone cannot catch this: the hash is computed over whatever the
+ * projection still yields. The anchors must exist verbatim.
+ */
+export function speculationAnchorsAlive(
+  surfaceNodes: readonly SessionSeq[],
+  start: SessionSeq,
+  end: SessionSeq,
+): boolean {
+  let startAlive = false
+  let endAlive = false
+  for (const seq of surfaceNodes) {
+    if (seq === start) startAlive = true
+    if (seq === end) endAlive = true
+  }
+  return startAlive && endAlive
+}
+
+/**
+ * Rebase ONE anchor across a stub replace. Tool-archive stubbing writes its
+ * replacement with `surfaceOp: replace` — the old seq is retired and a NEW
+ * seq takes its position, carrying the SAME callId. A retired anchor whose
+ * callId still lives on the surface is therefore the SAME node under a new
+ * number, and the checkpoint must follow it instead of dying (production
+ * 2026-11-08: every prepared checkpoint died silently at the next stub
+ * write inside its range — prepared 20 vs consume-visible 14). A retired
+ * anchor with NO callId (a conversational anchor, or the node was folded
+ * away) is genuinely dead: {@link speculationAnchorsAlive} semantics.
+ * @param callIdAt - resolves the tool callId of a live surface seq, or
+ *   `undefined` when the node is not a tool message.
+ * @returns the rebased seq, or `null` when the anchor is genuinely dead.
+ */
+export function rebaseAnchorSeq(
+  surfaceNodes: readonly SessionSeq[],
+  seq: SessionSeq,
+  callId: string | undefined,
+  callIdAt: (node: SessionSeq) => string | undefined,
+): SessionSeq | null {
+  let found = false
+  for (const node of surfaceNodes) {
+    if (node === seq) found = true
+  }
+  if (found) return seq
+  if (callId === undefined) return null
+  for (const node of surfaceNodes) {
+    if (callIdAt(node) === callId) return node
+  }
+  return null
+}
+
+/**
+ * Redact credential-shaped secrets from a summary's text blocks. The
+ * checkpoint is re-injected into model context on every later turn and
+ * persisted into the memory store — the amplification point for anything the
+ * user or a tool result carried. Applied at the summarize() exits so the
+ * live, speculative-consumed and extractive paths all share one choke point.
+ */
+function redactedSummary(result: SummaryResult): SummaryResult {
+  return {
+    ...result,
+    summary: result.summary.map(block => isTextBlock(block)
+      ? { ...block, text: redactCredentials(block.text) }
+      : block),
+  }
+}
+
+/**
+ * The LLM seam's own "no thinking" level.
+ *
+ * DSH maps `off` to omitting the reasoning option, which renders as
+ * `thinking: { type: 'disabled' }` — or no field at all — instead of
+ * `thinking: { type: 'enabled' }`, the shape an Anthropic-schema gateway
+ * refuses for want of `budget_tokens` (issue #2). Used only for compaction
+ * calls on a route that already refused the reasoning parameter.
+ */
+const REASONING_OFF_EFFORT = ReasoningEffortId('off')
+
+/** The multi-tier memory compaction backend. */
+export class MemoryCompactionEngine extends BasicCompactionEngine {
+  // Inject list MUST be a superset of the parent's: BasicCompactionEngine's
+  // constructor reads ctx.sessionProjections (the answered-route projection),
+  // and overriding inject REPLACES the inherited list rather than extending
+  // it — the missing 4th entry made the engine fail to construct with
+  // `cannot get property "sessionProjections" without inject`, which unloaded
+  // the whole plugin silently (production 2026-11-18→19: a session ran 17h
+  // unguarded, overflowed, and /compact 400'd on a 262k merge request).
+  static override inject = ['llm', 'tokenMeter', 'sessions', 'memoryContext', 'sessionProjections']
+
+  static override Config: z<MemoryCompactionConfig> = MemoryCompactionConfigSchema
+
+  private readonly retrieval: ResolvedRetrievalOptions
+  private readonly lastInjectedTurn = new WeakMap<Session, number>()
+  /**
+   * Last Agent seen for each session. The manual `memory_force_compress` tool
+   * only receives a session id, but the surface-rewrite API needs an Agent.
+   */
+  private readonly lastAgentBySession = new Map<string, Agent>()
+  /** Last time a fold-check diagnostic was sampled per session (epoch ms). */
+  private readonly lastFoldCheckAt = new Map<string, number>()
+  /**
+   * Routes (`provider/model`) whose endpoint refused the reasoning/thinking
+   * parameter of a compaction body (issue #2). Their later compaction calls
+   * request the route's own off level instead of the session's thinking level.
+   */
+  private readonly reasoningRejectedRoutes = new Set<string>()
+  /** Routes already reported once in the log (one warning, not one per fold). */
+  private readonly reasoningRejectionNoticed = new Set<string>()
+  /**
+   * Per-session set of memory ids injected in the most recent turn. Used to
+   * avoid re-injecting the same memories every turn (cross-turn de-dup),
+   * which would bloat the context and accumulate contradictions. STICKY
+   * since 0.9.27: an empty retrieval no longer clears it (that re-injected
+   * the same memories turn after turn); full re-anchor happens on the
+   * {@link INJECTION_REANCHOR_TURNS} cadence instead.
+   */
+  private readonly lastInjectedIds = new WeakMap<Session, ReadonlySet<string>>()
+  /** Per-session turn of the last FULL retrieval re-anchor (sticky-exclusion reset). */
+  private readonly lastRagAnchorTurn = new WeakMap<Session, number>()
+  /**
+   * Per-session last injected task-state text + turn. The block is re-sent
+   * on CHANGE (every fold rebuilds it) and re-anchored every
+   * {@link INJECTION_REANCHOR_TURNS} turns — byte-identical copies every
+   * turn were pure per-request weight the model had already read.
+   */
+  private readonly lastTaskState = new WeakMap<Session, { text: string; turn: number }>()
+  /**
+   * Speculative fold summaries keyed by session. Launched when the surface is
+   * close to the fold trigger but the step is not a clean seam: the summary
+   * LLM call (the slow part of a fold) runs in the BACKGROUND, and the
+   * committing fold consumes it when the region fingerprint still matches —
+   * converting fold latency from blocking to hidden. One entry per session;
+   * a newer speculation supersedes an older one.
+   */
+  private readonly speculative = new Map<string, SpeculativeSummary>()
+  /** Sessions with a speculative summarization currently running. */
+  private readonly speculativeInFlight = new Set<string>()
+  /** Consecutive failed speculative calls per session (stand-down ledger). */
+  private readonly speculativeStalls = new Map<string, { count: number; lastAt: number }>()
+
+  /** Whether speculation may launch for this session now (stall backoff). */
+  private speculationStalled(sessionId: string): boolean {
+    const stall = this.speculativeStalls.get(sessionId)
+    return stall !== undefined && stall.count >= SPECULATIVE_STALL_MAX
+      && Date.now() - stall.lastAt < SPECULATIVE_STALL_BACKOFF_MS
+  }
+  /** fl_ recall count observed at each session's last fold (quality delta). */
+  private readonly lastRecallAtFold = new Map<string, number>()
+  /** Per `sessionId:ref` turn stamp of the last implicit-recall count. */
+  private readonly implicitRecallCooldown = new Map<string, number>()
+  /** Pending idle-maintenance timers per session (cancelled on wake). */
+  private readonly sleepTimers = new Map<string, NodeJS.Timeout>()
+  /** Last idle-consolidation run per session (rate limit). */
+  private readonly sleepLastRun = new Map<string, number>()
+  /** Consolidations currently executing (prevents concurrent double-merge). */
+  private readonly sleepInFlight = new Set<string>()
+  /** Consecutive degenerate turns per session (zero visible output; reset on any real output). */
+  private readonly degenerateStreaks = new Map<string, number>()
+  /**
+   * Evict idle sessions from the engine's per-session RAM maps, matching the
+   * compressor's counter eviction (same idle clock, returned by
+   * {@link HistoryCompressor.cleanupStale}). Without this the engine pins
+   * every idle session's Agent (→ Session → full event log) for the life of
+   * the process, and small per-session counters accumulate forever. A manual
+   * force-compress on an evicted session reports so; the next step
+   * re-populates the entry.
+   */
+  private evictIdleSessions(stale: readonly string[]): void {
+    for (const sessionId of stale) {
+      this.lastAgentBySession.delete(sessionId)
+      this.lastFoldCheckAt.delete(sessionId)
+      this.lastRecallAtFold.delete(sessionId)
+      this.speculative.delete(sessionId)
+      this.speculativeStalls.delete(sessionId)
+      // Same per-session RAM lifecycle as the maps above — without these
+      // three, a long-lived process accumulates one stale entry per retired
+      // session (the 0.9.8 review's F13).
+      for (const key of this.implicitRecallCooldown.keys()) {
+        if (key.startsWith(sessionId + ':')) this.implicitRecallCooldown.delete(key)
+      }
+      this.sleepLastRun.delete(sessionId)
+      this.degenerateStreaks.delete(sessionId)
+      this.cancelIdleMaintenance(sessionId)
+    }
+    this.ctx.memoryContext.evictFlRecalls(stale)
+    // Route-keyed overflow strikes age out on the counter retention clock.
+    const now = Date.now()
+    for (const [route, strike] of this.overflowStrikes) {
+      if (now - strike.lastAt > SESSION_COUNTER_RETENTION_MS) this.overflowStrikes.delete(route)
+    }
+    for (const sessionId of stale) this.forcedFoldsStalled.delete(sessionId)
+  }
+
+  /**
+   * Repeated summarizer "exceeds context" 400s per route. A transient
+   * busy-server 400 must not adopt a window bound on first sight (the
+   * 2026-11-03 storm: a garbage "available context size (32)" answer got
+   * estimated-input adopted as the model's window, and the fit-guard then
+   * compacted every step against it). Cleared on a successful summary.
+   */
+  private readonly overflowStrikes = new Map<string, { count: number; lastAt: number }>()
+  /**
+   * Consecutive fold attempts per session that failed outright or found
+   * nothing safe to fold. After {@link FORCED_FOLD_STALL_MAX}, the
+   * fit-guard/force doors stand down for {@link FORCED_FOLD_STALL_BACKOFF_MS}
+   * (they bypass the failure cooldown by design, so without this a dead
+   * summarizer on a full window is re-asked every step). Cleared by any
+   * committed fold; swept with the idle-session maps.
+   */
+  private readonly forcedFoldsStalled = new Map<string, { count: number; lastAt: number }>()
+  /**
+   * Whether the most recent summarize() call for this agent degraded to the
+   * extractive fallback. CompactionResult carries no provider field, so the
+   * resilience wrapper records it here for the fold path (prior learning).
+   */
+  private readonly lastSummarizeDegraded = new WeakMap<Agent, boolean>()
+  /** Whether the narrowed-window (probe/override) compaction override is on. */
+  private readonly dynamicThreshold: boolean
+  /** Whether the runway scheduler (fold_learning) owns trigger timing/amplitude. */
+  private readonly foldLearningEnabled: boolean
+  /**
+   * Intent timing at/above which a step is a CLEAN SEAM: its fold skips the
+   * learned time pacing (the planner skips the turn pacing symmetrically).
+   * Depth itself is the planner's AI dial — this threshold only gates WHEN a
+   * fold may bypass pacing and how strongly timing feeds that dial.
+   */
+  private readonly foldSeamMinTiming: number
+  /** Operator override for the seam target floor (undefined = shipped bound). */
+  private readonly foldSeamFloor: number | undefined
+  /** Chunked fold summarization (segment → per-segment note → mechanical merge). */
+  private readonly foldChunking: boolean
+  /** Chunking cold-start prior: tokens per segment. */
+  private readonly foldChunkTokens: number
+  /** Fold evidence audit: re-attach anchors the summary lost (zero-LLM floor). */
+  private readonly foldEvidenceCheck: boolean
+  /** Whether the operator pinned a trigger/target ratio (learning stands down). */
+  private readonly foldTempoPinned: boolean
+  /** Lower bound of the dynamic trigger ratio as the real window fills. */
+  private readonly dynamicThresholdFloor: number
+  /** Whether the mid-thinking context guard is enabled. */
+  private readonly thinkingGuardEnabled: boolean
+  /** Fraction of the real window the thinking guard fires at. */
+  private readonly thinkingGuardRatio: number
+  /** Public so memoryContext can reference it for force-compress. */
+  readonly compressor: HistoryCompressor
+  private readonly retriever: VectorRetriever
+  private readonly sanitizerConfig: SanitizerConfig
+  /** Recent messages kept verbatim by compression/truncation. */
+  private readonly retainRecent: number
+  /** Reserved tokens for the plugin's own per-turn RAG injection. */
+  private readonly injectionBudget: number
+  /** Whether the local-model conciseness directive is injected. */
+  private readonly conciseLocalMode: boolean
+  /** Text of the local-model conciseness directive. */
+  private readonly conciseLocalDirective: string
+  /**
+   * Oversized tool-result archive: exact text kept in the store, with a short
+   * ref-bearing stub left on the surface so `memory_expand` can read it back.
+   */
+  private readonly toolArchive: ToolResultArchive
+  /**
+   * Context accounting (Strategy 9): what the plugin injected or removed, and
+   * what the provider charged for the request.
+   */
+  private readonly usage: UsageLedger
+
+  /**
+   * @param ctx - the plugin context.
+   * @param config - validated plugin configuration.
+   */
+  constructor(ctx: Context, config: MemoryCompactionConfig) {
+    // Strip ALL plugin-specific fields before passing to BasicCompactionEngine.
+    // Unknown keys fail config validation, which stops this plugin from loading.
+    const {
+      retrieval,
+      compress_round_interval,
+      compress_trigger_ratio,
+      compress_target_ratio,
+      fold_learning,
+      fold_seam_floor,
+      fold_seam_min_timing,
+      fold_chunking,
+      fold_chunk_tokens,
+      fold_evidence_check,
+      compaction_governance,
+      compaction_dynamic_threshold,
+      compaction_dynamic_floor,
+      thinking_guard_enabled,
+      thinking_guard_ratio,
+      retain_recent_messages,
+      sanitize_max_chars,
+      rag_top_k,
+      rag_min_score,
+      rag_token_budget,
+      rag_chunk_size,
+      rag_dedupe_exact,
+      rag_dedupe_min_score,
+      rag_ingest_denylist,
+      rag_ingest_allowlist,
+      rag_ingest_importance,
+      rag_surface_dedupe,
+      concise_local_mode,
+      concise_local_directive,
+      tool_archive,
+      tool_archive_threshold_chars,
+      tool_archive_head_chars,
+      tool_archive_tail_chars,
+      tool_archive_max_entries,
+      tool_archive_retention_days,
+      tool_absorb,
+      tool_absorb_min_chars,
+      tool_absorb_max_digest_chars,
+      compress_nudge,
+      usage_ledger,
+      usage_retention_days,
+      ...basicConfig
+    } = config
+    super(ctx, pickBasicCompactionKeys(basicConfig))
+    this.retrieval = resolveRetrievalOptions(config)
+
+    // Provide the pyramid-consolidation summarizer to the memory context.
+    ctx.memoryContext.setSummarizer((texts, purpose, target) =>
+      summarizeMemoriesWithLlm(ctx, this.config, texts, purpose, target),
+    )
+
+    // Initialize the history compressor (Strategy 1).
+    // Token-pressure trigger (compress_trigger_ratio) delays compression while
+    // the context is roomy; the target water level (compress_target_ratio)
+    // makes compression progressive (only the oldest overflow is summarized).
+    // Inside hard bounds, the unified planner slides both water levels from the
+    // measured growth and the session's compression history.
+    const compressInterval = compress_round_interval ?? 7
+    const retainRecent = retain_recent_messages ?? 4
+    const injectionBudget = rag_token_budget ?? 2000
+    this.retainRecent = retainRecent
+    this.injectionBudget = injectionBudget
+    // LANE TAKEOVER (unconditional since 0.8.6): with the plugin installed,
+    // the fold lane owns routine pressure compaction and the base durable
+    // lane stands down — its legacy threshold (window − maxTokens − 65536
+    // default headroom) sat BELOW the fold trigger and silently became the
+    // routine compactor, bypassing every fold-lane feature. Only the
+    // fit-guard / provider-overflow emergency doors still run base
+    // machinery. (compaction_governance is a deprecated no-op kept for
+    // config compatibility; compaction_dynamic_threshold now only feeds the
+    // narrowed-lane decision curve.)
+    this.ctx.logger.info(
+      '[ContextGovernor] Lane takeover: the fold lane owns routine pressure '
+        + 'compaction; the base durable lane stands down (fit-guard and '
+        + 'provider-overflow recovery remain as emergency doors).',
+    )
+    this.dynamicThreshold = compaction_dynamic_threshold ?? true
+    this.dynamicThresholdFloor = compaction_dynamic_floor ?? 0.6
+    this.thinkingGuardEnabled = thinking_guard_enabled ?? true
+    this.thinkingGuardRatio = thinking_guard_ratio ?? 0.9
+    this.conciseLocalMode = concise_local_mode ?? true
+    this.conciseLocalDirective = concise_local_directive ?? DEFAULT_CONCISE_DIRECTIVE
+    // Runway scheduler (fold_learning): the learned tempo owns trigger timing
+    // and amplitude UNLESS the operator pinned an anchor ratio — an explicit
+    // `compress_trigger_ratio`/`compress_target_ratio` freezes the anchor and
+    // stands the learning down (mirrors `isSummarizationTimeoutExplicit`).
+    this.foldTempoPinned = compress_trigger_ratio !== undefined || compress_target_ratio !== undefined
+    this.foldLearningEnabled = (fold_learning ?? true) && !this.foldTempoPinned
+    this.foldSeamMinTiming = fold_seam_min_timing ?? GOV_SEAM_MIN_TIMING
+    this.foldSeamFloor = fold_seam_floor
+    this.foldChunking = fold_chunking ?? true
+    this.foldChunkTokens = fold_chunk_tokens ?? 6000
+    this.foldEvidenceCheck = fold_evidence_check ?? true
+    this.compressor = new HistoryCompressor(
+      ctx,
+      this.config,
+      compressInterval,
+      retainRecent,
+      compress_trigger_ratio ?? 0.85,
+      compress_target_ratio ?? 0.6,
+      injectionBudget,
+      // Persist turn counters to SQLite so the round interval survives restarts.
+      {
+        get: (key) => ctx.memoryContext.kvGet(key),
+        set: (key, value) => ctx.memoryContext.kvSet(key, value),
+        delete: (key) => ctx.memoryContext.kvDelete(key),
+        deleteOlderThan: (prefix, cutoffMs) => ctx.memoryContext.kvDeleteOlderThan(prefix, cutoffMs),
+      },
+      compress_nudge ?? true,
+    )
+
+    // Initialize the sanitizer config (Strategy 3)
+    this.sanitizerConfig = { maxChars: sanitize_max_chars ?? 2000 }
+
+    // Initialize the vector retriever (Strategy 4).
+    // topK/minScore come from the resolved retrieval options (rag_* effective,
+    // legacy retrieval.* as fallback); tokenBudget/chunkSize stay rag_*-only.
+    // Ingestion guards (dedup + high-value source filter + importance) are
+    // configured through the rag_ingest_* fields.
+    const retrieverConfig: VectorRetrieverConfig = {
+      topK: this.retrieval.topK,
+      minScore: this.retrieval.minScore,
+      tokenBudget: rag_token_budget ?? 2000,
+      stalenessHalfLifeDays: this.retrieval.stalenessHalfLifeDays,
+      chunkSize: rag_chunk_size ?? 500,
+      dedupeExact: rag_dedupe_exact ?? true,
+      dedupeMinScore: rag_dedupe_min_score ?? 0.92,
+      ingestDenylist: rag_ingest_denylist ?? DEFAULT_INGEST_DENYLIST,
+      ...(rag_ingest_allowlist === undefined ? {} : { ingestAllowlist: rag_ingest_allowlist }),
+      ingestImportance: rag_ingest_importance ?? 0.3,
+      dedupeSurface: rag_surface_dedupe ?? true,
+    }
+    this.retriever = new VectorRetriever(ctx, retrieverConfig)
+
+    // Tool-result archive (exact-text CCR): oversized tool results are copied
+    // verbatim into the store and their surface node becomes a small stub with
+    // a ref. The built-in pruner deletes the middle of a big result for good;
+    // this keeps it retrievable — and fires below the pruner threshold so its
+    // lossy marker is not reached first.
+    const archiveOptions = resolveToolArchiveOptions(config)
+    this.toolArchive = new ToolResultArchive({
+      store: {
+        archiveToolResult: record => ctx.memoryContext.archiveToolResult(record),
+        getToolResult: ref => ctx.memoryContext.getToolResult(ref),
+        findToolResultByCallId: callId => ctx.memoryContext.findToolResultByCallId(callId),
+        listToolResults: limit => ctx.memoryContext.listToolResults(limit),
+        searchToolResults: (query, limit) => ctx.memoryContext.searchToolResults(query, limit),
+        countToolResults: () => ctx.memoryContext.countToolResults(),
+        toolResultChars: () => ctx.memoryContext.toolResultChars(),
+        deleteToolResultsBefore: timestamp => ctx.memoryContext.deleteToolResultsBefore(timestamp),
+        trimToolResults: maxEntries => ctx.memoryContext.trimToolResults(maxEntries),
+      },
+      options: archiveOptions,
+      logger: ctx.logger,
+      estimateMessage: message => ctx.tokenMeter.estimateMessage(message),
+      // Absorb-style distillation (Strategy 7): the stub carries a digest of
+      // the signal lines instead of a blind head+tail slice. The digest cap is
+      // derived from the archive threshold so the stub always stays under it.
+      absorb: resolveAbsorbOptions(config, archiveOptions.thresholdChars),
+    })
+
+    // Register back-reference so tools.ts can reach the compressor for force-compress,
+    // reuse the configured retriever for ingestion (single config source), and
+    // reuse the configured sanitizer cap instead of a hard-coded one.
+    ctx.memoryContext.compactionEngine = {
+      agentFor: (id: string) => this.agentFor(id),
+      foldNow: (agent, signal, force) => this.foldNow(agent, signal, force),
+      requestForcedFold: (agent, signal) => this.requestForcedFold(agent, signal),
+      sanitizerConfig: this.sanitizerConfig,
+    }
+    ctx.memoryContext.retriever = { ingest: (text, source) => this.retriever.ingest(text, source) }
+
+    // Context accounting (Strategy 9). Append-only and best-effort: it records
+    // what the plugin injected/removed and what the provider charged, which is
+    // the only way to answer "were those tokens worth it" after the fact.
+    this.usage = new UsageLedger({
+      store: {
+        recordUsageEvent: record => ctx.memoryContext.recordUsageEvent(record),
+        usageTotals: sinceTs => ctx.memoryContext.usageTotals(sinceTs),
+        listUsageEvents: limit => ctx.memoryContext.listUsageEvents(limit),
+        pruneUsageEvents: beforeTs => ctx.memoryContext.pruneUsageEvents(beforeTs),
+        usageTotalsByDetail: sinceTs => ctx.memoryContext.usageTotalsByDetail(sinceTs),
+      },
+      options: resolveUsageOptions(config),
+      logger: ctx.logger,
+    })
+    ctx.memoryContext.usage = {
+      summary: days => this.usage.summary(days),
+      totals: sinceTs => this.usage.totals(sinceTs),
+      recent: limit => this.usage.recent(limit),
+    }
+
+    // Wire Strategy 3 (output sanitization + ingestion): observe every settled
+    // tool call and hand its STRUCTURED content blocks to the sanitizer — the
+    // source strategies (web_search / code_exec / per-field truncation) must
+    // see the payload; pre-joining it into a string would bypass them all.
+    // Listener failures are contained by onToolResult's own try/catch.
+    ctx.on('tools/result', (exec: ToolExecution, result: ToolExecutionResult) => {
+      if (exec.signal.aborted) return
+      const hasText = result.content.some(
+        block => block.type === 'text' && block.text.trim().length > 0,
+      )
+      if (!hasText) return
+      // Archive the EXACT text first: the stub written into the surface later
+      // carries only a ref, and `memory_expand` resolves it long after the
+      // sanitizer has reduced this payload to a summary. Best-effort.
+      const sessionId = exec.agent === undefined ? undefined : String(exec.agent.session.id)
+      const captured = this.toolArchive.capture(
+        exec.name,
+        exec.callId,
+        sessionId,
+        textOfBlocks(result.content),
+      )
+      if (captured !== null && captured.digest !== null) {
+        // Absorb: the digest is both the surface stub and a memory, so the
+        // signal lines outlive the stub itself once compaction drops it.
+        this.usage.record(
+          USAGE_KIND.absorbChars,
+          Array.from(captured.digest).length,
+          sessionId === undefined ? {} : { sessionId },
+        )
+        void this.retriever.ingest(captured.digest, exec.name)
+      }
+      void this.onToolResult(exec.name, result.content)
+    })
+
+    // Always register the governance hook: it also drives history compression
+    // (Strategy 1) and model-context adoption (G8) — both must keep working
+    // when RAG retrieval is disabled. The RAG section gates itself inside.
+    this.registerRetrieval(ctx)
+    this.registerSleepWatch(ctx)
+    this.registerDegenerateRetry(ctx)
+    this.registerUsage(ctx)
+    this.registerCompactionEffort(ctx)
+    // Idle timers must NOT survive this engine: a raw setTimeout is invisible
+    // to cordis teardown (it only unwinds ctx.on listeners), so a reload/HMR
+    // left zombie timers firing the OLD engine 15 minutes later — racing the
+    // new instance and double-spending the consolidation (the lifecycle
+    // review's P1-1). The scope disposer is the sanctioned unwind; a disposed
+    // agent additionally cancels its own timer immediately.
+    ctx.effect(() => () => {
+      for (const timer of this.sleepTimers.values()) clearTimeout(timer)
+      this.sleepTimers.clear()
+    }, 'clear idle-maintenance timers on teardown')
+    ctx.on('agent/disposed', ({ agent }: { agent: Agent }) => {
+      this.cancelIdleMaintenance(String(agent.session.id))
+    })
+    // A session CLEAR (or a fresh startup) restarts the turn numbering: the
+    // degenerate streak and the implicit-recall cooldown compare ABSOLUTE
+    // turn numbers, so stale-era stamps would silently block matches (and a
+    // wedged model would inherit a consumed streak). Start clean per era
+    // (the lifecycle review's P2-9; follow-up review's F1 was a false alarm —
+    // the dev-checkout agent/created DOES carry source, the stale built .d.ts
+    // inside the harness's node_modules does not).
+    ctx.on('agent/created', ({ agent, source }: { agent: Agent; source: string }) => {
+      if (source !== 'clear' && source !== 'startup') return
+      const sessionId = String(agent.session.id)
+      this.degenerateStreaks.delete(sessionId)
+      this.sleepLastRun.delete(sessionId)
+      for (const key of this.implicitRecallCooldown.keys()) {
+        if (key.startsWith(sessionId + ':')) this.implicitRecallCooldown.delete(key)
+      }
+    })
+
+    // Mid-thinking context guard: wrap the agent's LLM stream and inject a
+    // CONTEXT_WINDOW_EXCEEDED finish when input + output-so-far approaches the
+    // CURRENT model's real window, so the engine compacts durably and retries
+    // with room — the plugin intervenes even while the model is thinking, and
+    // a takeover whose input is already over the line is compacted up front.
+    if (this.thinkingGuardEnabled) {
+      this.registerThinkingGuard(ctx)
+    }
+    // Overflow observability + learning on the AGENT lane. TWO entry points,
+    // deliberately non-overlapping:
+    // 1. `agent/request-error` (this listener) — but the BASE engine's own
+    //    recovery listener sits OUTER in the waterfall and returns
+    //    `{kind:'retry'}` WITHOUT next() on a successful recovery, so this
+    //    listener only sees the residual cases (retries exhausted, recovery
+    //    failed, non-overflow errors). Its unique coverage: a 400 that never
+    //    led to a compaction.
+    // 2. the `context-overflow` trigger inside compactIfNeeded (dynamic
+    //    dispatch reaches the plugin override) — fires for EVERY recovery
+    //    compaction, i.e. the routine case. That is where learning happens.
+    // Both feed the same evidence discipline as the summarizer lane: a
+    // plausible server number (>=1024) adopts immediately, a garbage answer
+    // needs 2 strikes then adopts estimate+4096, a healthy summarizer call
+    // clears the strikes. (Production 2026-11-10 session b1941b5c: a durable
+    // compaction fired with zero ledger rows explaining it.)
+    ctx.on('agent/request-error', async ({ agent, provider, failure, signal }, next) => {
+      try {
+        // Issue #2 first, before the overflow gate: when the AGENT request
+        // itself is refused for its reasoning parameter, the plugin cannot fix
+        // the route, but it can stop sending that shape on its own fold calls
+        // (which would otherwise fail every compaction on top of the visible
+        // turn failure) and say once what to change on the route. The helper
+        // ignores anything that is not a reasoning refusal.
+        const refused = routedTargetOf(agent.session)
+        this.noteReasoningRejection(
+          `${provider}/${refused?.model ?? 'unknown'}`,
+          failure.message ?? '',
+          failure.code,
+        )
+        if (failure.code !== 'CONTEXT_WINDOW_EXCEEDED' || signal.aborted) return next()
+        const reason = failure.message ?? ''
+        const windowReported = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
+        const inputReported = reason.match(/\((\d+) tokens\) exceeds/i)
+        const parsed = (match: RegExpMatchArray | null): number | undefined => {
+          const value = Number.parseInt(match?.[1] ?? '', 10)
+          return Number.isFinite(value) && value >= 1024 ? value : undefined
+        }
+        const serverNumber = parsed(windowReported) ?? parsed(inputReported)
+        this.noteAgentOverflow(agent, provider, {
+          ...(serverNumber === undefined ? {} : { serverBound: serverNumber }),
+          inputTokens: this.ctx.tokenMeter.measure(agent.session).totalTokens,
+          ledger: `request-error:${(failure.message ?? '').slice(0, 80)}`,
+          allowEstimateAdoption: true,
+        })
+      } catch {
+        // Learning is best-effort; the base recovery proceeds regardless.
+      }
+      return next()
+    })
+  }
+
+  /**
+   * Record one agent-lane context overflow (see the listener comment in
+   * {@link initRegister}): strike accounting per route, window adoption under
+   * the 2-strike / server-number discipline, and a fold_check ledger row —
+   * the durable door's firings become attributable.
+   */
+  private noteAgentOverflow(
+    agent: Agent,
+    provider: string,
+    evidence: { serverBound?: number; inputTokens: number; ledger: string; allowEstimateAdoption?: boolean },
+  ): void {
+    const sessionId = String(agent.session.id)
+    // Failure servo: mark THIS cycle as failed — the k shrink happens ONCE,
+    // at the cycle's close (applyFoldCycle's hadFailure branch); shrinking
+    // here as well would double-count one failure.
+    try {
+      this.compressor.markCycleFailure(sessionId)
+    } catch {
+      // The servo never breaks the error path.
+    }
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks the error path.
+      }
+    }
+    const target = routedTargetOf(agent.session)
+    const route = `${provider}/${target?.model ?? 'unknown'}`
+    const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
+    const strike = { count: strikes.count + 1, lastAt: Date.now() }
+    this.overflowStrikes.set(route, strike)
+    // Estimate adoption ONLY where the failure message was seen (the
+    // listener): the recovery-compaction path carries no message, and its
+    // caller set includes the thinking-guard's SYNTHETIC takeover — adopting
+    // estimate+4096 there would shrink the window to today's envelope (a
+    // correctly-firing guard misread as an overflow). Server numbers are
+    // always trusted.
+    const adopted = evidence.serverBound
+      ?? (evidence.allowEstimateAdoption === true && strike.count >= 2 && evidence.inputTokens > 0
+        ? evidence.inputTokens + 4096
+        : undefined)
+    if (target !== undefined && adopted !== undefined) {
+      this.ctx.memoryContext.updateModelContext({
+        provider: target.provider,
+        model: target.model,
+        contextWindow: adopted,
+        source: 'overflow',
+      })
+      record(`overflow:${evidence.ledger} → adopt ${adopted} (server ${evidence.serverBound === undefined ? 'absent/garbage' : 'plausible'}, strike ${strike.count})`)
+      this.ctx.logger.warn(
+        `[ContextGovernor] agent request overflow: adopting real window <= ${adopted} `
+          + `for ${route} (strike ${strike.count})`,
+      )
+    } else {
+      record(`overflow:${evidence.ledger} → strike ${strike.count}${evidence.serverBound === undefined ? ';no-plausible-server-number' : ''}`)
+    }
+  }
+
+  /**
+   * Register the `llm/stream` guard (see {@link thinking-guard}). Only
+   * agent-loop requests are guarded; the window is the CURRENT routed model's
+   * real context (probe for local / declared for online), resolved through the
+   * per-model registry — so the guard follows whichever model the session is
+   * calling right now, even mid-turn after a model switch.
+   */
+  private registerThinkingGuard(ctx: Context): void {
+    registerThinkingGuard(ctx, {
+      enabled: this.thinkingGuardEnabled,
+      ratio: this.thinkingGuardRatio,
+      maxTokens: this.config.maxTokens ?? 8192,
+      isAgentLoopRequest,
+      windowForSession: (sessionId) => {
+        const session = ctx.sessions.get(SessionId(sessionId))
+        if (session === undefined) return undefined
+        // Route-aware to the end: the global "last observed" slot may belong to
+        // a different model, and budgeting the guard off it would fire the
+        // takeover at another session's window. The routed model is resolved
+        // even when requestContext.model is absent (dynamic routing picks the
+        // model at request time), and the session's DECLARED window beats the
+        // config default: with an empty tracker the orDeclared fallback lands
+        // on resolved.contextWindow (94000) while the fold lane budgets the
+        // declared window — the guard then fires at a THIRD of the real
+        // context (production 2026-11-10, session b1941b5c: two guard
+        // takeovers at ~46k surf on a 256k-window route whose fold trigger
+        // sat at 151k).
+        const target = routedTargetOf(session)
+        const model = target?.model ?? session.requestContext()?.model
+        const declared = session.requestContext()?.contextWindow
+        if (model !== undefined && declared !== undefined
+          && ctx.memoryContext.windowForModel(model) === undefined) {
+          // Adopt the declared window under the routed model: without a
+          // record every tracker-based door (guard, probe ceiling, force
+          // doors) falls to the config default.
+          ctx.memoryContext.observeRequestContext({
+            ...(target?.provider === undefined ? {} : { provider: target.provider }),
+            model,
+            contextWindow: declared,
+          })
+        }
+        // Poisoned-record defense (mirror of the force doors' check): an
+        // 'overflow' estimate far below the declared window is a heuristic —
+        // budgeting the takeover off it re-creates the checkpoint storm. Use
+        // the declaration for THIS decision and let a probe settle the truth.
+        const tracked = ctx.memoryContext.windowForModel(model)
+        let window = tracked
+          ?? declared
+          ?? ctx.memoryContext.windowForModelOrDeclared(model)
+        if (tracked !== undefined && declared !== undefined && tracked < declared / 4) {
+          const poisoned = ctx.memoryContext.perModelWindows()
+            .find(entry => entry.model === model)
+          if (poisoned?.source === 'overflow') {
+            window = declared
+            void ctx.memoryContext.probeModel(model)
+          }
+        }
+        return window
+      },
+      log: (message) => ctx.logger.info(message),
+    })
+  }
+
+  /**
+   * Step-boundary compaction entry, overridden to make the trigger track the
+   * routed model's REAL context window.
+   *
+   * The inherited pressure policy scales its threshold off the window DSH
+   * declares for the routed model (adapter/catalog). For local servers that
+   * declaration is frequently several times larger than the runtime context,
+   * so the threshold sits beyond what the model can hold and the conversation
+   * overflows before compaction ever fires — a single long thinking turn makes
+   * this worse because a whole round of growth lands at once. When a probe or
+   * a `modelWindows` override has narrowed the routed model's window below the
+   * declared one, this override forces the base overflow-style balanced
+   * reduction as soon as the measured conversation crosses a threshold derived
+   * from the REAL window (see {@link decidePressureCompaction}); otherwise it
+   * delegates unchanged.
+   */
+  override async compactIfNeeded(
+    agent: Agent,
+    trigger: CompactionTrigger,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null> {
+    // --- Tool-result archive (exact-text CCR) ---
+    // A compaction is about to rewrite the request prefix anyway, so this is
+    // the cheap moment for a FULL-surface pass: stub every oversized result
+    // BEFORE the base policy runs, so the built-in pruner (which deletes the
+    // middle for good) has nothing left to prune, and results that predate this
+    // plugin instance become retrievable too. Repeat calls are no-ops once the
+    // oversized nodes are stubs, so this never invalidates a prefix twice.
+    try {
+      const archived = this.toolArchive.rewriteAllResults(agent.session)
+      if (archived.replaced > 0) {
+        this.usage.record(USAGE_KIND.archiveChars, archived.charsRemoved, {
+          sessionId: String(agent.session.id),
+        })
+        this.ctx.logger.info(
+          `[ContextGovernor] Tool-result archive (pre-compaction): stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars (refs: ${archived.refs.join(', ')})`,
+        )
+      }
+    } catch (error) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Tool-result archive full pass failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    this.lastAgentBySession.set(String(agent.session.id), agent)
+    if (trigger === 'pressure' && !signal.aborted) {
+      const handled = await this.forceNarrowedPressure(agent, signal)
+      // LANE TAKEOVER: with this plugin installed, the fold lane owns routine
+      // pressure compaction and the base durable lane STANDS DOWN — never
+      // falls through to super with 'pressure'. The base's legacy threshold
+      // (window − maxTokens − 65536 default headroom) sat BELOW the fold
+      // trigger and silently became the routine compactor (production
+      // 2026-11-04), bypassing every fold-lane feature and wasting prepared
+      // speculation checkpoints. The narrowed-window override's force RESULT
+      // (real-window fit-guard / overflow) is the only durable machinery that
+      // still runs here, and only under real emergency; 'null' (skip) and
+      // 'undefined' (undecided) both fall to the fold.
+      if (handled !== undefined && handled !== null) return handled
+      return await this.tryFold(agent, signal)
+    }
+    // 'context-overflow' (provider overflow recovery, thinking-guard takeover,
+    // fit-guard force calls) delegates to the base machinery unchanged — that
+    // is the plugin-supervised emergency door, not the routine lane. But the
+    // RECOVERY case (the base's agent/request-error listener re-entering via
+    // dynamic dispatch) is the ONLY place the routine provider-400 lane is
+    // observable: its own waterfall listener short-circuits on success, so
+    // record the strike here where the failure evidence (the compacted
+    // envelope) is still at hand. See noteAgentOverflow for the discipline.
+    if (trigger === 'context-overflow') {
+      try {
+        const provider = routedTargetOf(agent.session)?.provider ?? ''
+        this.noteAgentOverflow(agent, provider, {
+          inputTokens: this.ctx.tokenMeter.measure(agent.session).totalTokens,
+          ledger: 'recovery-compaction',
+        })
+      } catch {
+        // Learning never breaks the emergency door.
+      }
+    }
+    return await super.compactIfNeeded(agent, trigger, signal)
+  }
+
+  /**
+   * Run the fold lane with error containment.
+   * @param agent - owner of the session.
+   * @param signal - cancellation signal.
+   * @returns the fold result, or null when not due / failed.
+   */
+  private async tryFold(agent: Agent, signal: AbortSignal): Promise<CompactionResult | null> {
+    // No governance flag here: with the plugin installed the fold lane IS the
+    // routine executor (the durable lane stands down unconditionally).
+    if (signal.aborted) return null
+    try {
+      return await this.foldNow(agent, signal)
+    } catch (error) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Fold failed: ${error instanceof Error ? error.message : String(error)}; `
+        + 'governance keeps the durable lane suppressed for this step (failure cooldown recorded)',
+      )
+      return null
+    }
+  }
+
+  /**
+   * The Agent that last owned a session (manual tool path).
+   * @param sessionId - session id to look up.
+   * @returns the agent, or undefined before the session ran a step.
+   */
+  agentFor(sessionId: string): Agent | undefined {
+    return this.lastAgentBySession.get(sessionId)
+  }
+
+  /**
+   * Evaluate whether NOW is a good moment to fold.
+   *
+   * Compaction timing is not just pressure: a fold rewrites the request
+   * prefix, so a mid-tool-loop step pays the summary cost and invalidates the
+   * cache for a request that is about to grow again, while a turn boundary
+   * lands on a clean seam. The planner receives this score and only modulates
+   * its trigger inside the hard water-level bounds.
+   * @param session - session whose surface tail is inspected.
+   * @returns the phase, opportunity score and session maturity.
+   */
+  /**
+   * Read the current surface into a content/stage intent.
+   * @param session - session whose surface is inspected.
+   * @param meter - authoritative prices for the same surface.
+   * @returns the bounded intent, or undefined for an empty surface.
+   */
+  private contextIntent(session: Session, meter: TokenMeasurement): CompactionIntent | undefined {
+    const nodes = session.surface.nodes
+    const priced = meter.nodes
+    const from = Math.max(0, nodes.length - 200)
+    const signals: SurfaceSignal[] = []
+    for (let i = from; i < nodes.length; i += 1) {
+      const seq = nodes[i]
+      const event = seq === undefined ? undefined : session.eventAt(seq)
+      if (event === undefined) continue
+      const tokens = priced[i]?.tokens ?? 0
+      if (event.type === 'user/message' || event.type === 'assistant/message') {
+        const message = (event.data as unknown as { message?: { role: string; content: unknown } }).message
+        const text = message === undefined ? '' : messageText(message)
+        const hasToolCalls = Array.isArray(message?.content)
+          ? message.content.some(block => (block as { type?: string }).type === 'tool-call')
+          : false
+        signals.push({ type: event.type, tokens, text, hasToolCalls })
+      } else if (event.type === 'tool/result') {
+        // The host flags tool errors on the frozen message, not on the frame
+        // data: data.message.isError. The previous `data.isError` read silently
+        // pinned recentErrors to 0 (scripts/contract-check.mjs pins the shape).
+        const isError = isToolResultError(event.data)
+        signals.push({ type: event.type, tokens, isError })
+      } else {
+        signals.push({ type: event.type, tokens })
+      }
+    }
+    return signals.length === 0 ? undefined : analyzeContext(signals)
+  }
+
+  private compactionOpportunity(session: Session, compressions: number): CompactionOpportunity {
+    const nodes = session.surface.nodes
+    let turnCount = 0
+    let stepsSinceUser = 0
+    let lastEventType = ''
+    let lastEventHadToolCalls = false
+    let toolResults = 0
+    let assistantMessages = 0
+    let sawUser = false
+    const scan = Math.min(nodes.length, 200)
+    for (let i = nodes.length - 1; i >= nodes.length - scan; i -= 1) {
+      const seq = nodes[i]
+      if (seq === undefined) continue
+      const event = session.eventAt(seq)
+      if (event === undefined) continue
+      const type = event.type
+      if (type === 'compaction/start' || type === 'compaction/summary' || type === 'compaction/end') continue
+      if (lastEventType === '') {
+        lastEventType = type
+        if (type === 'assistant/message') {
+          const data = event.data as { message?: { content?: readonly { type?: string }[] } }
+          lastEventHadToolCalls = data.message?.content?.some(block => block.type === 'tool-call') === true
+        }
+      }
+      if (type === 'user/message') {
+        turnCount += 1
+        sawUser = true
+      } else {
+        if (!sawUser) stepsSinceUser += 1
+        if (type === 'tool/result') toolResults += 1
+        else if (type === 'assistant/message') assistantMessages += 1
+      }
+    }
+    const toolAndAssistant = toolResults + assistantMessages
+    return evaluateOpportunity({
+      turnCount,
+      stepsSinceUser,
+      lastEventType,
+      lastEventHadToolCalls,
+      recentToolRatio: toolAndAssistant === 0 ? 0 : toolResults / toolAndAssistant,
+      compressions,
+    })
+  }
+
+  /**
+   * `/compact-force` entry point. The host ties the compaction transaction
+   * mode to the session's turn state: this plugin's fold rides
+   * `compactRegion`, i.e. AUTOMATIC mode, which requires an OPEN turn (that
+   * is how every routine, surge and emergency fold commits — at a step
+   * boundary). An idle session admits only standalone MANUAL transactions,
+   * whose single public entry (`compactNow`) re-selects with its own retain-0
+   * range — discarding the tail retention this plugin exists to guarantee —
+   * so it is not a usable lane for a forced fold. Therefore: open turn → the
+   * fold runs now; idle → the forced fold is marked in the KV and consumed by
+   * the next pre-step's fold pass, which runs it inside a real turn with
+   * force semantics — before the next model request, exactly when the freed
+   * window is needed. The marker survives restarts; an explicit force then
+   * replaces it (latest request wins).
+   * @param agent - attached agent owning the session to force-fold.
+   * @param signal - the command invocation's cancellation signal.
+   * @returns `'ran'` with the fold result, or `'queued'` for the next pre-step.
+   */
+  async requestForcedFold(agent: Agent, signal: AbortSignal): Promise<ForcedFoldOutcome> {
+    const sessionId = String(agent.session.id)
+    if (sessionHasOpenTurn(agent.session)) {
+      // An explicit force run SATISFIES any queued request: clear the marker
+      // here, or the next pre-step would consume it into a second unplanned
+      // forced fold past the pacing gates (latest request wins — 2026-11-20 review).
+      try {
+        this.ctx.memoryContext.kvDelete(FORCED_FOLD_PENDING_PREFIX + sessionId)
+      } catch {
+        // A dead KV has nothing durably queued anyway.
+      }
+      return { lane: 'ran', result: await this.foldNow(agent, signal, true) }
+    }
+    try {
+      this.ctx.memoryContext.kvSet(FORCED_FOLD_PENDING_PREFIX + sessionId, String(Date.now()))
+    } catch {
+      // Without the KV the request would be silently dropped; run the fold
+      // on the spot instead — the host turn gate may still reject it, and
+      // the command maps that error honestly (2026-11-19 incident: the
+      // rejection text at least surfaced the reason).
+      return { lane: 'ran', result: await this.foldNow(agent, signal, true) }
+    }
+    try {
+      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'forced-queued' })
+    } catch {
+      // Diagnostics must never break the command.
+    }
+    return { lane: 'queued', result: null }
+  }
+
+  /**
+   * Fold the session SURFACE to the unified fold target.
+   *
+   * This is the fold lane's ONLY executor. `agent/pre-step` carries just the
+   * step's inbox delta, so folding there could never see history (and would
+   * drop the step's real messages). The fold therefore rewrites the surface
+   * exactly like the durable lane, via compaction-basic's `compactRegion`,
+   * with the system head and first user message pinned (billion-context #2733).
+   *
+   * GENERATION SAFETY: this runs only from step boundaries (`agent/pre-step`
+   * / `compactIfNeeded`), never from `llm/stream` — the waterfall is deep
+   * frozen and no fold hook exists there by construction. A fold therefore
+   * always waits for the model to FINISH generating (including a long local
+   * reasoning phase) before it rewrites anything: the 14:53 production case
+   * (a 9m45s reasoning stream, fold committed the moment it ended) is this
+   * guarantee working, not a race. Never add a fold trigger on `llm/stream`.
+   * @param agent - owner of the session to fold.
+   * @param signal - cancellation signal.
+   * @param force - bypass the trigger/rate-limit gates (manual tool use).
+   * @returns the committed compaction result, or null when no safe fold is due.
+   */
+  async foldNow(agent: Agent, signal: AbortSignal, force = false): Promise<CompactionResult | null> {
+    if (signal.aborted) return null
+    const session = agent.session
+    const sessionId = String(session.id)
+    const requestContext = session.requestContext()
+    // Diagnostic channel: the DSH logger sink is not observable from here, so
+    // fold outcomes land in the usage ledger (kind=fold_check, detail=outcome).
+    const diag = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Diagnostics must never break governance.
+      }
+    }
+    // A forced fold queued by /compact-force on an idle session (the fold
+    // lane can only commit inside an open turn — see requestForcedFold):
+    // consume the persisted marker exactly once and run this pass with force
+    // semantics, past the pacing, importance and size gates.
+    if (!force) {
+      try {
+        const pending = this.ctx.memoryContext.kvGet(FORCED_FOLD_PENDING_PREFIX + sessionId)
+        if (pending !== undefined) {
+          this.ctx.memoryContext.kvDelete(FORCED_FOLD_PENDING_PREFIX + sessionId)
+          force = true
+          diag('forced-pending-consumed')
+        }
+      } catch {
+        // A dead KV leaves the fold routine; it must never break the step.
+      }
+    }
+    // Same route resolution as the thinking guard: the routed model may exist
+    // when requestContext.model is absent (dynamic routing) — missing it
+    // here would budget the fold lane off a different window source than
+    // the guard and re-create the divergence class of bugs.
+    const routedForWindow = routedTargetOf(session)
+    const routedModel = routedForWindow?.model ?? requestContext?.model
+    const window = this.ctx.memoryContext.windowForModel(routedModel)
+      ?? requestContext?.contextWindow
+      ?? this.ctx.memoryContext.windowForModelOrDeclared(routedModel)
+    if (!(Number.isFinite(window) && window > 0)) { diag('no-window'); return null }
+    // Use the SAME pressure budget as the durable lane: the window minus the
+    // reserved completion tokens (the provider charges them to the same
+    // window) minus the plugin headroom. Without the completion reserve the
+    // fold trigger sat ABOVE the durable threshold and the durable lane always
+    // won the race.
+    let declaredMaxTokens = session.requestHeader()?.config.maxTokens ?? 0
+    if (declaredMaxTokens <= 0) {
+      try {
+        const info = await this.ctx.llm.resolveModelInfo(
+          requestContext?.provider ?? '',
+          requestContext?.model ?? '',
+          signal,
+        )
+        declaredMaxTokens = info.defaultMaxTokens ?? 0
+      } catch {
+        // Unknown reserve: completionReserveOf substitutes the placeholder constant.
+      }
+    }
+    const headroom = Math.max(0, window - this.compressor.tokenBudget(window))
+    // A request cap at (or above) the whole window is the "never truncate"
+    // placeholder, not a completion budget: fed here raw it clamped to a
+    // quarter of the window and halved the fold budget (the 2026-11 Ubuntu
+    // low-water diagnosis). completionReserveOf degrades it to a small
+    // constant; the clamp below still keeps the minimum prompt share.
+    const reservedCompletion = completionReserveOf(declaredMaxTokens, window)
+    const pressureBudget = foldPressureBudget({ window, reservedCompletion, headroom })
+    // `let`: a committed-fold expiry pass rewrites the surface mid-flight, and
+    // every consumer below prices against the post-expiry view.
+    let meter = this.ctx.tokenMeter.measure(session)
+    if (meter.totalTokens <= 0) { diag('no-meter'); return null }
+    const snapshot = toSurfaceSnapshot({
+      totalTokens: meter.totalTokens,
+      surfaceTokens: meter.surfaceTokens,
+      window,
+    })
+    const ledger = this.compressor.beginFoldCheck(sessionId, snapshot.surfaceTokens)
+    // Cross-session prior: a session that has never folded warm-starts its
+    // deviation EMA from the converged prior of the same summarizer route —
+    // without it, every new session re-runs the systematic shortfall for two
+    // folds while its EMA re-converges from zero.
+    const routeTarget = routedTargetOf(session)
+    const routeKey = routeTarget === undefined ? undefined : `${routeTarget.provider}/${routeTarget.model}`
+    if (ledger.compressions === 0 && this.compressor.targetDeviationOf(sessionId) === undefined) {
+      if (routeKey !== undefined) {
+        const prior = this.compressor.deviationPriorOf(routeKey)
+        if (prior !== undefined) this.compressor.seedDeviationEma(sessionId, prior)
+      }
+    }
+    // Runway scheduler warm-start: same pattern, one cycle behind — a fresh
+    // session inherits the route's learned tempo instead of re-running the
+    // fixed band until its own first cycle closes.
+    if (this.foldLearningEnabled && ledger.compressions === 0 && routeKey !== undefined) {
+      this.compressor.seedCycleLearning(sessionId, routeKey)
+    }
+    const opportunity = this.compactionOpportunity(session, ledger.compressions)
+    const intent = this.contextIntent(session, meter)
+    const deviationEma = this.compressor.targetDeviationOf(sessionId)
+    // LEARNED TEMPO: the anchor sits one servo-scaled delivered runway above
+    // the last landing (ratio space; hard bounds clamp inside the planner).
+    // Undefined until the first cycle closes — the cold start then falls back
+    // to the configured anchor, and from fold 2 on the observed tempo owns
+    // trigger timing.
+    const learning = this.compressor.cycleLearningOf(sessionId)
+    // The anchor formula needs a landing REFERENCE: a session that has never
+    // landed (lastLandedTokens undefined — first fold, or a warm-started
+    // runway prior without a landing yet) has no meaningful landedRatio, and
+    // naively computing landedRatio = 0 would put the first fold at
+    // k × runway ≈ 35% of the budget — far EARLIER than the configured
+    // anchor. Learning starts at the second fold.
+    const landedKnown = this.compressor.lastLandedTokensOf(sessionId) !== undefined
+    const landedRatio = Number.isFinite(pressureBudget) && pressureBudget > 0
+      ? (this.compressor.lastLandedTokensOf(sessionId) ?? 0) / (pressureBudget as number)
+      : 0
+    const learnedAnchor = this.foldLearningEnabled && landedKnown
+      ? learnedAnchorRatio(landedRatio, learning)
+      : undefined
+    const tempoLearned = learnedAnchor !== undefined
+    const bandScale = tempoLearned ? learnedBandScale(learning) : undefined
+    const plan = planFoldCompaction({
+      surfaceTokens: snapshot.surfaceTokens,
+      fixedTokens: snapshot.fixedTokens,
+      window,
+      ledger,
+      baseTriggerRatio: learnedAnchor ?? this.compressor.triggerRatio,
+      baseTargetRatio: this.compressor.targetRatio,
+      compressInterval: this.compressor.compressInterval,
+      budgetTokens: pressureBudget,
+      injectionBudget: this.compressor.injectionBudget,
+      nudge: this.compressor.nudge,
+      force,
+      ...(tempoLearned ? { tempoLearned: true } : {}),
+      ...(bandScale === undefined ? {} : { bandScale }),
+      opportunity,
+      ...(deviationEma === undefined ? {} : { deviationEmaTokens: deviationEma }),
+      ...(intent === undefined ? {} : { intent }),
+      // Operator-tunable seam knobs (floor + gate); everything else keeps the
+      // shipped bounds (the seam lane is on by default — the 2026-11-26
+      // water-level complaint — with GOV_SEAM_* as its cold-start values).
+      bounds: {
+        ...(this.foldSeamFloor === undefined ? {} : { seamMemoryFloor: this.foldSeamFloor }),
+        seamMinTiming: this.foldSeamMinTiming,
+      },
+    })
+    if (plan.lane !== 'fold') {
+      const now = Date.now()
+      const last = this.lastFoldCheckAt.get(sessionId) ?? 0
+      // Sample normally once per 10 min, but always when close to the trigger.
+      const near = snapshot.surfaceTokens >= plan.surfaceTriggerTokens * 0.85
+      if (near || now - last >= 10 * 60_000) {
+        this.lastFoldCheckAt.set(sessionId, now)
+        diag(`plan:${plan.lane}:${plan.reason};surf=${snapshot.surfaceTokens};`
+          + `trigger=${plan.surfaceTriggerTokens};budget=${pressureBudget};`
+          + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+          + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
+      }
+      // Close to the trigger but not a clean seam: precompute the fold
+      // summary in the background so the eventual fold does not block. The
+      // rejection is contained here — an unhandled promise rejection would
+      // take the whole harness process down, and the gate code inside
+      // (selectFoldRange) has a documented meter/surface race throw.
+      this.maybeSpeculate({ agent, session, sessionId, plan, snapshot, meter, pressureBudget })
+        .catch((error) => {
+          const brief = (error instanceof Error ? error.message : String(error))
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120)
+          diag('spec-error:' + brief)
+        })
+      return null
+    }
+    // Forced-door stall: the fit-guard reason arrives DOWNGRADED to the fold
+    // lane (fold-only capabilities), and it bypasses the failure cooldown and
+    // the frequency gate by design — this ledger is its only brake. After
+    // repeated barren or failed attempts, stand down for the backoff window;
+    // the probe path re-verifies the narrowed record in the meantime.
+    if (plan.reason === 'fit-guard') {
+      const stall = this.forcedFoldsStalled.get(sessionId)
+      if (stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS) {
+        diag(`fit-guard-stall:${stall.count};surf=${snapshot.surfaceTokens}`)
+        return null
+      }
+    }
+    // Frequency gate: a routine fold must not fire again within a short
+    // window. Force, surge and the fit-guard still bypass it. The window is
+    // COST-AWARE: derived from the route's learned summarizer latency (4×
+    // EMA, clamped [5min, 60min]) — a slow local route folds on a minutes-
+    // scale cadence, a fast route folds as soon as the interval allows.
+    const learnedLatency = this.routeLatency(session)
+    // Pacing: the learned cycle time owns the floor once a cycle has closed
+    // (half the observed cadence, same envelope); the latency-based prior
+    // covers the cold start.
+    // EMERGENCY: the surface has reached the FULL budget — the next agent
+    // request is structurally dead whatever the trigger says, so every
+    // pacing/importance/minimum-size gate below yields to getting a fold
+    // done (segmented summarization absorbs any range size; the merge
+    // rounds keep the summary completable at this scale).
+    const emergency = snapshot.surfaceTokens >= this.compressor.tokenBudget()
+    const learnedInterval = this.foldLearningEnabled
+      ? learnedMinIntervalMs(this.compressor.cycleLearningOf(sessionId))
+      : undefined
+    const minIntervalMs = learnedInterval ?? foldIntervalFor(learnedLatency)
+    // EMERGENCY bypass: at 100% of the budget the NEXT agent request is
+    // structurally dead — pacing a fold that is the only way to keep the
+    // session alive is how a session dies twice (the min-interval gate held
+    // one production session at 137-145k tokens over a 126k trigger for
+    // three consecutive checks before anything folded).
+    // SEAM FOLDS ARE NEVER PACED (2026-11-26): a clean seam with the surface
+    // over the trigger is the cheapest moment for a deep fold; the learned
+    // interval would defer it into the next tool-loop, where the trigger
+    // swings up and the crossing is lost. The rapid-repeat behavior the gate
+    // guards against is exactly what deep seam folds replace with fewer,
+    // larger cycles — so the seam lane bypasses the time pacing (the planner
+    // bypasses the turn pacing symmetrically).
+    const seamFold = plan.drivers.timing >= this.foldSeamMinTiming || plan.drivers.milestone
+    if (!force && !emergency && !seamFold && (plan.reason === 'pressure' || plan.reason === 'nudge')) {
+      const last = this.compressor.lastFoldAt(sessionId)
+      if (last !== undefined && Date.now() - last < minIntervalMs) {
+        diag(`min-interval:${Math.round((Date.now() - last) / 1000)}/${Math.round(minIntervalMs / 1000)}s;`
+          + `surf=${snapshot.surfaceTokens}`)
+        return null
+      }
+    }
+    // --- TOOL-RESULT EXPIRY (the fold-time aging pass) ---
+    // A fold is about to run, so the request prefix is rebuilt anyway: this
+    // is the zero-regret moment to age STALE tool results into archive stubs
+    // regardless of size (Anthropic's "clear stale tool results" — the biggest
+    // safe cut in an agent transcript, and NVIDIA's compaction study says the
+    // accuracy cost is negligible). Everything outside the newest
+    // TOOL_EXPIRY_KEEP_RECENT_RESULTS results becomes a digest stub with the
+    // full text archived under a tr_ ref (memory_expand-recoverable, two hops
+    // deep at most: checkpoint → fl_ archive → tr_ payload). Everything
+    // downstream prices the POST-expiry surface — boundary keep, speculation
+    // (the stable fingerprint tier is built for stub churn), range selection,
+    // the size gates. If the sweep alone lands the surface under target, the
+    // selection returns null and the fold defers itself: expiry did the work,
+    // zero LLM calls, one prefix rebuild the fold owed anyway. Cadence is
+    // fold-gated (this sits behind the frequency gate), never per-step.
+    if (this.toolArchive.enabled && resolveToolExpiryOnFold(this.config)) {
+      try {
+        const expired = this.toolArchive.expireOldResults(session)
+        if (expired.replaced > 0) {
+          this.usage.record(USAGE_KIND.archiveChars, expired.charsRemoved, { sessionId })
+          diag(`expiry:n=${expired.replaced};chars=${expired.charsRemoved};surf=${this.ctx.tokenMeter.measure(session).surfaceTokens}`)
+          // Consumers below must price the rewritten surface.
+          meter = this.ctx.tokenMeter.measure(session)
+        }
+      } catch (error) {
+        diag('expiry-error:' + (error instanceof Error ? error.message : String(error)).slice(0, 120))
+      }
+    }
+    // Goal-conditioned importance: the carried task-state block is the goal
+    // reference; nodes in the cut-boundary window (the walk's max reach is 3)
+    // that are clearly ON-TOPIC stay verbatim even when they are not user
+    // messages. Zero LLM cost - the hash embedder prices each candidate in
+    // microseconds. No block or no embedder => empty set => the walk falls
+    // back to its user-message-only behaviour.
+    const importanceKeep = await this.importanceBoundary(sessionId, session, meter, plan)
+    // Prefer a speculative summary when its region is still verbatim-valid
+    // (fingerprint over the exact input the base engine will rebuild). A
+    // stale region - content replaced, surface drifted - is dropped and the
+    // range selected fresh; either way the committing fold is correct.
+    const speculation = this.speculative.get(sessionId)
+    let range: { start: SessionSeq; end: SessionSeq } | null = null
+    let speculationUsed = false
+    if (speculation !== undefined) {
+      // Ghost-anchor guard BEFORE the fingerprint — with REBASING: a retired
+      // seq whose callId still lives is the same node under a new number (a
+      // stub replace), so the checkpoint follows it; only a genuinely dead
+      // anchor (folded away, or conversational with no identity) drops the
+      // entry. buildRegionInput skips missing seqs, so a hash match alone
+      // proves nothing about dead anchors.
+      const rebased = this.rebaseSpeculation(sessionId, session, speculation)
+      if (rebased === null) {
+        this.speculative.delete(sessionId)
+      } else {
+        const projection = shadowedMessages(this.buildRegionInput(session, rebased.start, rebased.end))
+        // STRICT first, STABLE fallback: tool-text drift (stub write, expand
+        // restore, absorb digest) must not waste the checkpoint — the stable
+        // tier still proves the conversational thread is verbatim.
+        if (regionMessagesFingerprint(projection) === rebased.regionFingerprint
+          || regionStableFingerprint(projection) === rebased.stableFingerprint) {
+          // The checkpoint's boundary was balanced when captured; a surface
+          // rewrite since (stub churn, expand) can in principle drift it into
+          // an open step. Re-check against validateSurfaceRegion's contract —
+          // a stale boundary (or a seq no longer on the surface, which the
+          // predicates reject by throwing) drops the checkpoint and selection
+          // re-runs fresh, rather than throwing host-side inside compactRegion.
+          let boundaryOk = false
+          try {
+            boundaryOk = toolPairingBalancedBefore(session, rebased.start)
+              && toolPairingBalancedAfter(session, rebased.end)
+          } catch {
+            boundaryOk = false
+          }
+          if (boundaryOk) {
+            range = { start: rebased.start, end: rebased.end }
+            speculationUsed = true
+          } else {
+            this.speculative.delete(sessionId)
+          }
+        } else {
+          this.speculative.delete(sessionId)
+        }
+      }
+    }
+    // Under real pressure the selector may ESCALATE: widen the range
+    // node-by-node until it clears minimumFoldTokens, so a monster tail node
+    // or a speculation frozen at an older surface cannot starve the fold lane
+    // into per-step small-fold skips while the surface keeps growing (the
+    // 59.8k→84.5k incident). Without pressure, selection is unchanged.
+    const pressured = snapshot.surfaceTokens >= plan.surfaceTriggerTokens
+      || plan.reason === 'surge' || plan.reason === 'fit-guard' || plan.reason === 'forced'
+    const minFoldTokens = minimumFoldTokens(pressureBudget)
+    if (speculationUsed && range !== null) {
+      let frozenTokens = 0
+      for (const node of meter.nodes) {
+        if (node.seq >= range.start && node.seq <= range.end) frozenTokens += node.tokens
+      }
+      if (pressured && frozenTokens > 0 && frozenTokens < minFoldTokens) {
+        // The frozen speculation cannot net its own summary while the surface
+        // is at/over the trigger: drop it and select fresh (the escalated
+        // selector widens past whatever pinned the small range).
+        this.speculative.delete(sessionId)
+        speculationUsed = false
+        range = null
+      }
+    }
+    let escalated = false
+    if (range === null) {
+      range = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), importanceKeep)
+      // Escalate ONLY when the plain selection cannot net its own summary
+      // (a monster tail node, a just-dropped frozen speculation): widen
+      // node-by-node toward the tail. A naturally-large selection stays
+      // subject to the thin-fold gate — the net-saving bar is the churn
+      // protection for pressure folds, and `escalated` (not `pressured`)
+      // is what bypasses it below.
+      if (pressured || emergency) {
+        let plainTokens = 0
+        if (range !== null) {
+          for (const node of meter.nodes) {
+            if (node.seq >= range.start && node.seq <= range.end) plainTokens += node.tokens
+          }
+        }
+        if (range === null || (plainTokens > 0 && plainTokens < minFoldTokens)) {
+          const widened = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens),
+            importanceKeep, minFoldTokens)
+          if (widened !== null) {
+            range = widened
+            escalated = true
+          }
+        }
+        // EMERGENCY escalation: drop the importance boundary and the minimum
+        // fold size entirely — at 100% of the budget there is no "preserve
+        // the interesting middle" left to protect, and a fold that refuses
+        // to select a range IS the overflow the user sees. Tool-pair balance
+        // and the pinned head stay enforced by the selector itself.
+        if (range === null && emergency) {
+          const forcedRange = selectFoldRange(session, meter, Math.max(0, plan.targetSurfaceTokens), undefined)
+          if (forcedRange !== null) {
+            range = forcedRange
+            escalated = true
+            diag(`emergency-range;keep=0;surf=${snapshot.surfaceTokens}`)
+          }
+        }
+      }
+    }
+    if (range === null) {
+      diag(`no-range;surf=${snapshot.surfaceTokens};trigger=${plan.surfaceTriggerTokens};`
+        + `target=${plan.targetSurfaceTokens};phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`
+        + (emergency ? ';emergency' : ''))
+      return null
+    }
+    // A fold that is smaller than the summarizer's own output cannot net a
+    // saving (compaction-basic rejects it). Skip it instead of churning — a
+    // manual force still reports the honest outcome; the base's own size
+    // rejection remains the correctness backstop there.
+    let foldTokens = 0
+    for (const node of meter.nodes) {
+      if (node.seq >= range.start && node.seq <= range.end) foldTokens += node.tokens
+    }
+    // A zero sum means the meter priced the range at 0 (e.g. a cached/replay
+    // node); treat it as unknown and let compaction-basic's own size check decide.
+    if (!force && !emergency && foldTokens > 0 && foldTokens < minFoldTokens) {
+      diag(`small-fold:${foldTokens}<${minFoldTokens};escalated=${escalated};surf=${snapshot.surfaceTokens};`
+        + `target=${plan.targetSurfaceTokens};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)}`)
+      return null
+    }
+    // Thin-fold gate: a ROUTINE fold must net more than its own summarizer
+    // output plus the cost of the call and the post-fold cache refill. The
+    // ratio is COST-AWARE: paid (cloud) routes keep the 8% bar; local routes
+    // run on the operator's own hardware (the call is free) so the bar drops
+    // to zero — the dynamic fold interval is the only churn guard there.
+    // Force, surge, the fit-guard and ESCALATED folds bypass it: their
+    // occasion is not optional (a thin emergency fold still beats an
+    // overflow), while a NATURALLY-large pressure fold stays gated.
+    if (!force && !escalated && !emergency && (plan.reason === 'pressure' || plan.reason === 'nudge') && foldTokens > 0
+      && isThinFold(foldTokens, summarizationTargetTokens(this.config, foldTokens), pressureBudget,
+        thinFoldRatioFor(this.summarizerIsLocal(agent)))) {
+      diag(`thin-fold:fold=${foldTokens};summary~${summarizationTargetTokens(this.config, foldTokens)};`
+        + `budget=${pressureBudget};surf=${snapshot.surfaceTokens};timing=${plan.drivers.timing.toFixed(2)};`
+        + `mag=${plan.drivers.magnitude.toFixed(2)}`)
+      return null
+    }
+    this.ctx.logger.info(
+      `[ContextGovernor] Fold (${plan.reason}): surface ${snapshot.surfaceTokens}/${window}, `
+      + `keep tail ${plan.targetSurfaceTokens}, range ${range.start}..${range.end}`,
+    )
+    try {
+      // Cycle inputs must be captured BEFORE recordFold stamps the new
+      // lastCompressedAt / resets the accumulators.
+      const cycleInputs = this.compressor.cycleReportInputsOf(sessionId)
+      const result = await this.compactRegion(range.start, range.end, agent, signal)
+      // A committed fold proves the summarizer works: clear the forced-fold
+      // stall so the fit-guard/force doors resume their normal cadence.
+      this.forcedFoldsStalled.delete(sessionId)
+      this.compressor.recordFold(sessionId, snapshot.surfaceTokens)
+      // Closed-loop band: observe where the fold actually landed versus the
+      // plan's target and feed the signed shortfall into the next plan. The
+      // meter re-reads the rewritten surface (measure() re-syncs the session
+      // each call), so `landed` shares the target's basis (meter surface
+      // tokens on the same estimator). Scope: the FOLD lane feeds the loop —
+      // the durable lane runs its own (legacy) threshold curve rather than
+      // planCompaction, and its landings are not observed here, so a
+      // summary-overhead change seen only by durable compactions reaches
+      // this EMA one fold later.
+      const landed = this.ctx.tokenMeter.measure(session).surfaceTokens
+      // Forced folds (manual tool call) have atypical range shapes and
+      // overhead, so they OBSERVE without TEACHING: the diagnosis still
+      // reports the current EMA, but the average only learns from routine
+      // cadence folds.
+      const deviation = plan.reason === 'forced'
+        ? (this.compressor.targetDeviationOf(sessionId) ?? 0)
+        : this.compressor.recordFoldLanding(
+            sessionId,
+            landed - plan.targetSurfaceTokens,
+          )
+      // The route's cross-session prior only learns from LIVE (LLM)
+      // summaries: a degraded extractive fold has a different overhead shape
+      // and would poison the warm start.
+      const degraded = this.lastSummarizeDegraded.get(agent) ?? false
+      if (plan.reason !== 'forced' && !degraded) {
+        const target = routedTargetOf(session)
+        if (target !== undefined) {
+          this.compressor.recordDeviationPrior(`${target.provider}/${target.model}`, deviation)
+        }
+      }
+      // Fold-quality recall signal: an fl_ read-back since the last fold
+      // means the agent had to HUNT for what the previous fold removed.
+      const recallFl = this.ctx.memoryContext.flRecallCount(sessionId)
+      const recalled = recallFl > (this.lastRecallAtFold.get(sessionId) ?? 0)
+      if (recalled) {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'fold_quality:recalled' })
+      }
+      this.lastRecallAtFold.set(sessionId, recallFl)
+      // RUNWAY SCHEDULER: close the cycle this fold just ended. Only routine
+      // cadence folds with LIVE summaries teach the tempo (forced/degraded
+      // folds have atypical shapes — same exclusions as the deviation loop);
+      // they still reset the accumulators so the next cycle starts clean.
+      const cycleCacheTotal = cycleInputs.cacheRead + cycleInputs.cacheInput + cycleInputs.cacheWrite
+      const report: FoldCycleReport = {
+        // NaN = "no landing reference" (the session's first fold): the
+        // scheduler's guards skip the runway EMA instead of learning the
+        // 0.04-floor artifact of a zero runway.
+        runwayTokens: cycleInputs.lastLandedTokens === undefined
+          ? Number.NaN
+          : Math.max(0, snapshot.surfaceTokens - (cycleInputs.lastLandedTokens ?? snapshot.surfaceTokens)),
+        cycleTimeMs: cycleInputs.lastCompressedAt === undefined ? 0 : Math.max(0, Date.now() - cycleInputs.lastCompressedAt),
+        cycleRequests: cycleInputs.cycleRequests,
+        // Fabricated ratios are poison: a cycle whose adapter never reported
+        // cache reads must omit cycleCacheHit — 0 measured reads over a nonzero
+        // total reads as a 0% hit, and cacheUtilityVote would inflate the servo
+        // every cycle from data that does not exist (follow-up review F2).
+        ...(cycleCacheTotal > 0 && cycleInputs.cacheMeasured === true
+          ? { cycleCacheHit: cycleInputs.cacheRead / cycleCacheTotal }
+          : {}),
+        ...(cycleInputs.cacheDip === undefined ? {} : { cacheDip: cycleInputs.cacheDip }),
+        recalled,
+        hadFailure: cycleInputs.hadFailure,
+      }
+      const teaches = plan.reason !== 'forced' && !degraded
+      const cycleState = this.compressor.applyFoldCycle(
+        sessionId,
+        report,
+        pressureBudget,
+        landed,
+        teaches,
+      )
+      this.usage.record(USAGE_KIND.foldCheck, 1, {
+        sessionId,
+        detail: 'fold_cycle:'
+          // 'na' = the session's first fold (no landing reference): readable
+          // in the ledger, unlike Math.round(NaN) → 'NaN'.
+          + `runway=${Number.isFinite(report.runwayTokens) ? Math.round(report.runwayTokens) : 'na'};`
+          + `time=${report.cycleTimeMs};req=${report.cycleRequests};`
+          + `cache=${report.cycleCacheHit === undefined ? 'n/a' : report.cycleCacheHit.toFixed(2)};`
+          // dip = KV-cache rebuilt by the cycle's first post-fold request; 'na'
+          // when the cycle opened before any fold (or carried no usage rows).
+          + `dip=${report.cacheDip === undefined ? 'na' : report.cacheDip.toFixed(2)};`
+          + `recall=${report.recalled ? 1 : 0};fail=${report.hadFailure ? 1 : 0};`
+          + `k=${(cycleState.runwayFactor ?? 1).toFixed(2)};`
+          + `amp=${(learnedBandScale(cycleState) ?? 1).toFixed(2)};`
+          + `teach=${teaches ? 1 : 0}`,
+      })
+      const cycleRoute = routedTargetOf(session)
+      if (teaches && cycleRoute !== undefined) {
+        this.compressor.publishFoldCyclePrior(`${cycleRoute.provider}/${cycleRoute.model}`, cycleState)
+      }
+      // Savings are recorded centrally in summarize() (both lanes pass there),
+      // so the ledger does not double count the fold.
+      diag(`folded:${plan.reason};surf=${snapshot.surfaceTokens};target=${plan.targetSurfaceTokens};`
+        + `landed=${landed};dev=${Math.round(deviation)};recallFl=${recallFl};`
+        + `phase=${plan.drivers.phase};opp=${plan.drivers.opportunity.toFixed(2)};`
+        + `timing=${plan.drivers.timing.toFixed(2)};mag=${plan.drivers.magnitude.toFixed(2)};ms=${plan.drivers.milestone ? 1 : 0}`)
+      if (plan.reason === 'nudge') this.usage.record(USAGE_KIND.nudge, 1, { sessionId })
+      return result
+    } catch (error) {
+      this.compressor.recordFoldFailure(sessionId, error)
+      // A failed fold is stall evidence for the fit-guard/force doors (see
+      // FORCED_FOLD_STALL_*): a dead summarizer must not be re-asked every
+      // step through a door that bypasses the failure cooldown.
+      const stall = this.forcedFoldsStalled.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.forcedFoldsStalled.set(sessionId, { count: stall.count + 1, lastAt: Date.now() })
+      // Ghost-anchor containment (defense in depth behind the alive-anchor
+      // guards): a commit-time 'not found in surface' means the folded range
+      // anchored on a seq that was retired mid-step. Clearing the speculation
+      // here breaks any residual lock so the next pass selects fresh.
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.includes('not found in surface')) this.speculative.delete(sessionId)
+      diag(`error:${message}`)
+      throw error
+    }
+  }
+
+  /**
+   * Evaluate the narrowed-window pressure override for one step.
+   * @returns `undefined` to delegate to the base policy, or the result to
+   *   return in its place (`null` = skip, `CompactionResult` = forced run).
+   */
+  private async forceNarrowedPressure(
+    agent: Agent,
+    signal: AbortSignal,
+  ): Promise<CompactionResult | null | undefined> {
+    try {
+      const target = routedTargetOf(agent.session)
+      if (target === undefined) return undefined
+      const narrowed = this.ctx.memoryContext.windowForModel(target.model)
+      if (narrowed === undefined) return undefined
+      const declared = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal))
+        .context?.contextWindow
+      if (signal.aborted) return undefined
+      const measurement = this.ctx.tokenMeter.measure(agent.session)
+      // Fold-lane health (see FORCED_FOLD_STALL_*): the ledger shared by the
+      // fold door and these doors decides WHO acts at this line.
+      const stallKey = String(agent.session.id)
+      const stall = this.forcedFoldsStalled.get(stallKey)
+      const foldStalled = stall !== undefined && stall.count >= FORCED_FOLD_STALL_MAX
+        && Date.now() - stall.lastAt < FORCED_FOLD_STALL_BACKOFF_MS
+      // Sanity guard against a POISONED narrowed record: an 'overflow' bound
+      // is a heuristic estimate, and one far below the declared window (a
+      // garbage busy-server 400) turns every guard keyed on the "real window"
+      // into a per-step compaction storm that cannot converge (2026-11-03:
+      // 36 transactions in 73 minutes). When the record is estimate-sourced
+      // and implausibly small, re-verify with a live probe and stand down for
+      // this step; the probe result (which may widen an overflow record)
+      // settles it truthfully.
+      const narrowedRecord = this.ctx.memoryContext.perModelWindows()
+        .find(entry => entry.model === target.model)
+      if (narrowedRecord !== undefined && narrowedRecord.source === 'overflow'
+        && declared !== undefined && narrowed < declared / 4) {
+        this.ctx.logger.warn(
+          `[ContextGovernor] Narrowed window ${narrowed} for ${target.model} is an overflow estimate `
+            + `under a quarter of the declared ${declared} — looks poisoned; re-probing instead of forcing`,
+        )
+        void this.ctx.memoryContext.probeModel(target.model)
+        return null
+      }
+      // LANE DEFERRAL (2026-11-06): the fold lane IS the overflow-prevention
+      // mechanism — its budget math reserves completion + headroom against
+      // the same real window this guard reads (windowForModel), and its
+      // plan's fit-guard reason fires at the same line. A healthy fold
+      // therefore acts at this line too, and forcing FIRST would rewrite the
+      // surface under the fold's prepared checkpoint and waste it
+      // (production: 7 of 8 folds in session 230b5f4c were each preceded
+      // 2-3 minutes by a durable force whose rewrite killed the checkpoint —
+      // hit rate 1/8 with a fully healthy funnel). Defer; the pre-step's
+      // tryFold runs right after this returns null. The force doors below
+      // are reserved for a STALLED fold lane — one that has exhausted its
+      // own retry budget and is in its stand-down window.
+      if (!foldStalled) {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Real-window line reached (${measurement.totalTokens} tokens, `
+            + `window ${narrowed}, model=${target.model}) but the fold lane can act — deferring the durable force`,
+        )
+        return null
+      }
+      // Hard fit-guard: the request is about to run out of the REAL window
+      // while the fold lane is STALLED (exhausted retries): force the durable
+      // path so the session still gets room — the 'ensure no overflow'
+      // backstop of last resort. If compaction cannot shrink, the provider's
+      // own overflow path is the final backstop (the 10s force cooldown
+      // prevents a per-step storm).
+      // Force the durable path regardless of the dynamic threshold so the
+      // plugin's own summarization always gets room — the 'ensure no overflow'
+      // backstop, reached whenever the override OR the unified governor is on.
+      // If compaction cannot shrink, the provider's own overflow path is the
+      // final backstop (the 10s force cooldown prevents a per-step storm).
+      const guardReserve = Math.max(GOV_GUARD_RESERVE_MIN, Math.floor(narrowed * GOV_GUARD_RESERVE_RATIO))
+      if (measurement.totalTokens >= narrowed - guardReserve) {
+        const key = String(agent.session.id)
+        if (!this.compressor.markForce(key, FORCED_PRESSURE_COOLDOWN_MS)) return null
+        this.ctx.logger.info(
+          `[ContextGovernor] Fit-guard: ${measurement.totalTokens} tokens >= real window ${narrowed} `
+          + `− reserve ${guardReserve} (model=${target.model}); forcing durable compaction`,
+        )
+        const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
+        if (forced === null) {
+          // Nothing safe to fold even at the fit-guard line. During a stall
+          // the backoff must NOT be extended by barren forces — refreshing
+          // lastAt here would lock the fold lane out forever; leave the
+          // ledger alone and let the backoff expire so the fold retries.
+          if (!foldStalled) {
+            const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+            this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+            this.compressor.recordFoldFailure(stallKey, new Error('fit-guard: no safe compaction range'))
+            void this.ctx.memoryContext.probeModel(target.model)
+          }
+        } else {
+          // A durable success proves the summarizer is alive again: release
+          // the fold lane from its stall so it resumes on its next occasion.
+          this.forcedFoldsStalled.delete(stallKey)
+        }
+        return forced
+      }
+      const decision = decidePressureCompaction({
+        declaredWindow: declared,
+        narrowedWindow: narrowed,
+        measuredTokens: measurement.totalTokens,
+        thresholdRatio: this.thresholdRatioFor(target),
+        dynamicRatio: this.dynamicThreshold,
+        dynamicRatioFloor: this.dynamicThresholdFloor,
+      })
+      if (decision.mode === 'skip') {
+        this.ctx.logger.debug(
+          `[ContextGovernor] Pressure below narrowed threshold: ${measurement.totalTokens} < `
+          + `${decision.thresholdTokens} (model=${target.model}, window=${narrowed})`,
+        )
+        return null
+      }
+      if (decision.mode === 'force') {
+        const key = String(agent.session.id)
+        if (!this.compressor.markForce(key, FORCED_PRESSURE_COOLDOWN_MS)) return null
+        this.ctx.logger.info(
+          `[ContextGovernor] Narrowed-window pressure: ${measurement.totalTokens} tokens >= `
+          + `${decision.thresholdTokens} threshold (model=${target.model}, real window ${narrowed} `
+          + `< declared ${declared ?? 'unknown'}); forcing balanced compaction`,
+        )
+        const forced = await super.compactIfNeeded(agent, 'context-overflow', signal)
+        if (forced === null) {
+          // Same no-extension rule as the fit-guard branch above.
+          if (!foldStalled) {
+            const prev = this.forcedFoldsStalled.get(stallKey) ?? { count: 0, lastAt: 0 }
+            this.forcedFoldsStalled.set(stallKey, { count: prev.count + 1, lastAt: Date.now() })
+            this.compressor.recordFoldFailure(
+              stallKey,
+              new Error('narrowed-window force: no safe compaction range'),
+            )
+            void this.ctx.memoryContext.probeModel(target.model)
+          }
+        } else {
+          this.forcedFoldsStalled.delete(stallKey)
+        }
+        return forced
+      }
+      // 'delegate' — narrowed >= declared (override == declared, or the probe
+      // matched the declaration). Under the lane takeover the fold lane owns
+      // routine pressure unconditionally — a dynamic-line durable compaction
+      // here would be a second compaction at a different threshold (the churn
+      // seen on a 64k local model). Only the real-window force/fit-guard
+      // above still bypasses the fold.
+      return undefined
+    } catch (error) {
+      // Unknown route, resolveModelInfo rejection, aborted probe — fall back to
+      // the base policy, which produces its own structured diagnostics.
+      this.ctx.logger.debug(
+        `[ContextGovernor] Dynamic pressure check unavailable: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return undefined
+    }
+  }
+
+  /** The compaction threshold ratio the base policy resolves for this target. */
+  private thresholdRatioFor(target: { provider: string; model: string }): number {
+    const override = this.config.modelPolicies.find(
+      policy => policy.provider === target.provider && policy.model === target.model,
+    )
+    const ratio = override?.thresholdRatio ?? this.config.thresholdRatio
+    // Hard ceiling: the durable lane can never wait past GOV_TRIGGER_CEILING,
+    // even if a hand-written thresholdRatio (or model policy) says to.
+    return Math.min(ratio, GOV_TRIGGER_CEILING)
+  }
+
+  /**
+   * Replicate compaction-basic's `buildSummarizationInput`: the replayed
+   * cacheable prefix (system head from surface node 0, the header's tool
+   * schemas) followed by the region's derived messages in surface order. The
+   * speculative fingerprint is only as good as this replication — any
+   * divergence degrades to a fingerprint miss at commit, never to a wrong
+   * summary (the fingerprint match is the verification).
+   */
+  private buildRegionInput(session: Session, start: SessionSeq, end: SessionSeq): SummarizationInput {
+    const header = session.requestHeader()
+    const headNode = session.surface.nodes[0]
+    const headEvent = headNode === undefined ? undefined : session.eventAt(headNode)
+    const head = headEvent?.type === 'system/message' ? headEvent : undefined
+    const system = head === undefined ? null : session.deriveEventMessage(head)
+    const regionMessages: Message[] = []
+    for (const nodeSeq of session.surface.nodes) {
+      if (nodeSeq < start || nodeSeq > end) continue
+      const event = session.eventAt(nodeSeq)
+      if (event === undefined) continue
+      const message = session.deriveEventMessage(event)
+      if (message !== null) regionMessages.push(message)
+    }
+    return {
+      ...(header?.tools === undefined ? {} : { tools: header.tools }),
+      messages: system === null ? regionMessages : [system, ...regionMessages],
+    }
+  }
+
+  /**
+   * The session's summarizer route latency EMA (ms), or `undefined` before
+   * the first successful summary. Feeds the cost-aware fold cadence and
+   * thin-fold ratio.
+   */
+  private routeLatency(session: Session): number | undefined {
+    try {
+      const target = resolveSummarizationTarget(this.config, session)
+      return target === undefined
+        ? undefined
+        : this.summarizerLatencyOf(`${target.provider}/${target.model}`)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Goal-conditioned importance for the cut-boundary window: the carried
+   * task-state block embedded as the goal reference, and the ≤3 nodes the
+   * high-value walk can reach embedded per node. Sequences clearing
+   * GOV_IMPORTANCE_KEEP_COS stay verbatim even when they are not user
+   * messages. SHARED by the live fold path and the speculative launcher —
+   * the two must select ranges under the SAME rule, or a speculative hit
+   * would silently bypass the goal-conditioned boundary.
+   * @returns the important sequences, or `undefined` when the goal reference
+   *   is unavailable (no block yet / no embedder) — the caller then uses the
+   *   role-only rule.
+   */
+  private async importanceBoundary(
+    sessionId: string,
+    session: Session,
+    meter: TokenMeasurement,
+    plan: CompactionPlan,
+  ): Promise<Set<SessionSeq> | undefined> {
+    const taskStateBlock = this.compressor.taskStateOf(sessionId)
+    if (taskStateBlock === undefined) return undefined
+    const goalVec = await this.ctx.memoryContext.embedText(taskStateBlock.slice(0, 2000))
+    if (goalVec === undefined) return undefined
+    const important = new Set<SessionSeq>()
+    const naive = retainedTailStart(meter.nodes.map(node => node.tokens), Math.max(0, plan.targetSurfaceTokens))
+    for (let back = 1; back <= 3; back += 1) {
+      const node = meter.nodes[naive - back]
+      if (node === undefined) break
+      const event = session.eventAt(node.seq)
+      const message = event === undefined || event === null ? null : session.deriveEventMessage(event)
+      const text = message === null ? '' : messageText(message)
+      if (text.length === 0) continue
+      const vec = await this.ctx.memoryContext.embedText(text.slice(0, 2000))
+      if (vec === undefined) continue
+      if (cosineSimilarity(goalVec, vec) >= GOV_IMPORTANCE_KEEP_COS) important.add(node.seq)
+    }
+    return important
+  }
+
+  /**
+   * Launch a speculative fold summarization when the surface is CLOSE to the
+   * trigger but this step was not a clean seam. The summary LLM call — the
+   * slow part of a fold, up to minutes on a local model — then runs in the
+   * background while the conversation continues, and the committing fold
+   * consumes it if the region fingerprint still matches. Best-effort on every
+   * path: a failure or a surface drift simply falls back to the live
+   * summarizer at commit (fingerprint miss is recorded in the ledger, so the
+   * hit rate is observable).
+   */
+  /**
+   * Keep the session's SPECULATIVE CHECKPOINT current while the surface
+   * approaches the fold trigger.
+   *
+   * ROLLING DESIGN: the first launch summarizes the fold range R1 as it
+   * exists then (the expensive full call, in the background); every later
+   * pre-step with significant new content MERGES the delta into the carried
+   * checkpoint (a small call: prior summary + delta). At commit the frozen
+   * range's fingerprint still matches (the surface is append-only between
+   * refreshes, unless a stub rewrite mutated it — that correctly misses), so
+   * the fold consumes the latest checkpoint without a blocking full-range
+   * call. This fixes the v0.7.0 structural flaw: the commit-time range is
+   * always BIGGER than the speculation-time range on a growing surface, so
+   * the exact-fingerprint contract could only ever miss.
+   *
+   * No thin-fold bar here: the checkpoint is an INVESTMENT consumed at
+   * commit (where the range is large), not a fold itself — the commit-time
+   * thin gate still applies to the frozen range. The delta bar
+   * (minimumFoldTokens) keeps refreshes from being chatty.
+   */
+  private async maybeSpeculate(input: {
+    agent: Agent
+    session: Session
+    sessionId: string
+    plan: CompactionPlan
+    snapshot: SurfaceSnapshot
+    meter: TokenMeasurement
+    pressureBudget: number
+  }): Promise<void> {
+    if (!resolveSpeculativeFold(this.config)) return
+    if (input.plan.surfaceTriggerTokens <= 0) return
+    // PREDICTIVE launch timing (learned): a summary started NOW should
+    // finish around the trigger crossing — predicted time-to-trigger
+    // (distance ÷ learned growth rate) within the summarizer's learned
+    // latency × lead. Cold start (no growth/latency observations yet)
+    // falls back to the fixed distance ratio. The old fixed 0.8 distance
+    // launched too late on slow local summarizers (summary finished after
+    // the trigger — wasted) and too early on fast cloud models (the
+    // checkpoint sat stale through refresh cycles).
+    const growthRate = this.compressor.growthRateOf(input.sessionId)
+    const latencyMs = this.routeLatency(input.session)
+    if (!speculationDue({
+      surfaceTokens: input.snapshot.surfaceTokens,
+      triggerTokens: input.plan.surfaceTriggerTokens,
+      ...(growthRate === undefined ? {} : { growthRate }),
+      ...(latencyMs === undefined ? {} : { latencyMs }),
+      aheadRatio: SPECULATIVE_AHEAD_RATIO,
+    })) return
+    if (this.speculativeInFlight.has(input.sessionId)) return
+    // Concurrency headroom: the background call streams to the same server
+    // WHILE the step's main request streams. The call input must fit in the
+    // room the conversation leaves. No magic constant: "fits alongside the
+    // conversation" is the definition. An unknown window skips speculation
+    // (conservative — it is optional).
+    const routed = routedTargetOf(input.session)
+    const realWindow = routed === undefined
+      ? undefined
+      : this.ctx.memoryContext.windowForModel(routed.model)
+    if (realWindow === undefined) return
+    let existing = this.speculative.get(input.sessionId)
+    // Same cut rule as the live path (importance keep included): two paths,
+    // one selection rule.
+    const importanceKeep = await this.importanceBoundary(input.sessionId, input.session, input.meter, input.plan)
+    const range = selectFoldRange(input.session, input.meter, Math.max(0, input.plan.targetSurfaceTokens), importanceKeep)
+    if (range === null) return
+
+    if (existing === undefined) {
+      // FIRST LAUNCH: full summarizer call over the current fold range.
+      const specInput = this.buildRegionInput(input.session, range.start, range.end)
+      const specTokens = estimateTokens(specInput.messages.map(message => messageText(message)).join('\n'))
+      if (input.snapshot.totalTokens + specTokens > realWindow) return
+      const fingerprint = summarizationFingerprint(specInput)
+      const regionFingerprint = regionMessagesFingerprint(shadowedMessages(specInput))
+      const stableFingerprint = regionStableFingerprint(shadowedMessages(specInput))
+      // Anchor identities for rebasing across stub replaces (see
+      // rebaseAnchorSeq): absent for conversational anchors.
+      const startCallId = this.anchorCallIdOf(input.session, range.start)
+      const endCallId = this.anchorCallIdOf(input.session, range.end)
+      if (this.speculationStalled(input.sessionId)) return
+      this.speculativeInFlight.add(input.sessionId)
+      const { timeoutMs } = this.summarizerDeadline(input.agent, specTokens)
+      // Wrapper disabled (timeout 0): the speculative path cannot honor it
+      // (its calls are raw super.summarize with a hard AbortSignal) — skip;
+      // the live fold path bypasses the wrapper itself.
+      if (timeoutMs <= 0) {
+        this.speculativeInFlight.delete(input.sessionId)
+        return
+      }
+      void this.runSpeculativeInitial(input.agent, input.sessionId, range, specInput, fingerprint, regionFingerprint, stableFingerprint, startCallId, endCallId, timeoutMs)
+      return
+    }
+    // REFRESH: merge the delta (everything after the cached range end) into
+    // the carried checkpoint. Skipped when the delta is insignificant.
+    // Ghost-anchor guard first — with REBASING: an anchor whose seq was
+    // retired by a stub replace (same callId, new seq) follows the
+    // replacement; only an anchor with no live identity is dropped. Without
+    // the rebase, every stub write inside the frozen range silently killed
+    // the checkpoint (production 2026-11-08), and without the guard a retired
+    // anchor would re-arm via the surviving subrange's fingerprint and lock
+    // the fold lane (production 2026-11-04).
+    const rebased = this.rebaseSpeculation(input.sessionId, input.session, existing)
+    if (rebased === null) {
+      this.speculative.delete(input.sessionId)
+      return
+    }
+    existing = rebased
+    if (range.end <= existing.end) return
+    let deltaTokens = 0
+    for (const node of input.meter.nodes) {
+      if (node.seq > existing.end && node.seq <= range.end) deltaTokens += node.tokens
+    }
+    if (deltaTokens < minimumFoldTokens(input.pressureBudget)) return
+    const mergeInput = this.buildMergeInput(input.session, existing, range.end)
+    const mergeTokens = estimateTokens(mergeInput.messages.map(message => messageText(message)).join('\n'))
+    // The merge call replays the prior checkpoint plus the delta — neither
+    // is part of the conversation, so both must fit in the room the
+    // conversation leaves. Same headroom rule as the first launch: on a
+    // tight server skip instead of firing a merge that cannot succeed.
+    // The entry survives; the refresh retries on a later pass.
+    if (input.snapshot.totalTokens + mergeTokens > realWindow) return
+    // Both fingerprints cover the REFRESHED entry's true region: the entry
+    // keeps previous.start, so a full-input hash over range.start would make
+    // every refreshed entry miss the layer-1 range check at consume time.
+    const refreshedRegion = this.buildRegionInput(input.session, existing.start, range.end)
+    const mergedFingerprint = summarizationFingerprint(refreshedRegion)
+    const mergedRegionFingerprint = regionMessagesFingerprint(shadowedMessages(refreshedRegion))
+    const mergedStableFingerprint = regionStableFingerprint(shadowedMessages(refreshedRegion))
+    // The refreshed entry's END moves to range.end: recapture its identity.
+    const endCallId = this.anchorCallIdOf(input.session, range.end)
+    if (this.speculationStalled(input.sessionId)) return
+    this.speculativeInFlight.add(input.sessionId)
+    const { timeoutMs } = this.summarizerDeadline(input.agent, mergeTokens)
+    if (timeoutMs <= 0) {
+      this.speculativeInFlight.delete(input.sessionId)
+      return
+    }
+    void this.runSpeculativeMerge(input.agent, input.sessionId, range.end, mergeInput, mergedFingerprint, mergedRegionFingerprint, mergedStableFingerprint, endCallId, timeoutMs, existing)
+  }
+
+  /**
+   * Build the merge-call input for a rolling checkpoint refresh: the carried
+   * checkpoint (wrapped as a PRIOR checkpoint so the base instruction's
+   * merge rule recognizes it) followed by the delta messages.
+   */
+  private buildMergeInput(
+    session: Session,
+    existing: SpeculativeSummary,
+    endNow: SessionSeq,
+  ): SummarizationInput {
+    const priorText = existing.summary
+      .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+    const deltaMessages: Message[] = []
+    for (const nodeSeq of session.surface.nodes) {
+      if (nodeSeq <= existing.end || nodeSeq > endNow) continue
+      const event = session.eventAt(nodeSeq)
+      if (event === undefined) continue
+      const message = session.deriveEventMessage(event)
+      if (message !== null) deltaMessages.push(message)
+    }
+    return {
+      messages: [
+        createUserMessage({
+          content: [{ type: 'text', text: '<compacted-summary>\n' + priorText + '\n</compacted-summary>\n\nNewer messages arrived after the checkpoint above. Fold them into it.' }],
+          source: { kind: 'plugin:' + PLUGIN } as any,
+        }),
+        ...deltaMessages,
+      ],
+    }
+  }
+
+  /**
+   * FIRST speculative launch: full summarizer call over the current fold
+   * range, storing the checkpoint keyed by the region fingerprint. Funnel
+   * telemetry: launch → prepared/empty/failed, then hit/miss at consume —
+   * without the launch record the funnel is unobservable (a route with zero
+   * hits could mean "never fired" or "always missed").
+   */
+  /**
+   * The tool callId of a surface node's message, or `undefined` when the node
+   * is not a tool message (conversational anchors carry no callId and rely on
+   * their seq alone).
+   */
+  private anchorCallIdOf(session: Session, seq: SessionSeq): string | undefined {
+    try {
+      const event = session.eventAt(seq)
+      if (event === undefined) return undefined
+      const message = session.deriveEventMessage(event)
+      if (message === null) return undefined
+      const source = (message as { source?: { kind?: string; callId?: unknown } }).source
+      if (source?.kind !== 'tool' || typeof source.callId !== 'string') return undefined
+      return source.callId
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Rebase a carried checkpoint's anchors across stub replaces (see
+   * {@link rebaseAnchorSeq}): a retired anchor whose callId still lives on
+   * the surface follows the replacement; the map is updated in place so
+   * later checks are cheap. Returns the (possibly rebased) entry, or `null`
+   * when an anchor is genuinely dead — the ghost-anchor semantics that keep
+   * a retired-and-folded range from being re-armed.
+   */
+  private rebaseSpeculation(
+    sessionId: string,
+    session: Session,
+    entry: SpeculativeSummary,
+  ): SpeculativeSummary | null {
+    const callIdAt = (node: SessionSeq): string | undefined => this.anchorCallIdOf(session, node)
+    const start = rebaseAnchorSeq(session.surface.nodes, entry.start, entry.startCallId, callIdAt)
+    if (start === null) return null
+    const end = rebaseAnchorSeq(session.surface.nodes, entry.end, entry.endCallId, callIdAt)
+    if (end === null) return null
+    if (start === entry.start && end === entry.end) return entry
+    const rebased: SpeculativeSummary = {
+      ...entry,
+      start,
+      end,
+      ...(entry.startCallId === undefined ? {} : { startCallId: entry.startCallId }),
+      ...(entry.endCallId === undefined ? {} : { endCallId: entry.endCallId }),
+    }
+    this.speculative.set(sessionId, rebased)
+    return rebased
+  }
+
+  private async runSpeculativeInitial(
+    agent: Agent,
+    sessionId: string,
+    range: { start: SessionSeq; end: SessionSeq },
+    specInput: SummarizationInput,
+    fingerprint: number,
+    regionFingerprint: number,
+    stableFingerprint: number,
+    startCallId: string | undefined,
+    endCallId: string | undefined,
+    deadlineMs: number,
+  ): Promise<void> {
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks speculation.
+      }
+    }
+    record('speculative:launch')
+    try {
+      // super.summarize = the RAW summarizer (no resilience fallback, no
+      // post-processing): a failed speculation is dropped silently, and the
+      // committing fold then runs the live path with its own telemetry.
+      // ONE bounded retry: local models intermittently return an empty
+      // summary (reasoning-only output) — a second attempt with a fresh
+      // deadline recovers it cheaply, and the call is optional anyway.
+      let result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) {
+        record('speculative:empty-retry')
+        result = await super.summarize(specInput, agent, AbortSignal.timeout(deadlineMs))
+      }
+      if (result.summary.length === 0) {
+        record('speculative:empty')
+        return
+      }
+      this.speculative.set(sessionId, {
+        fingerprint,
+        regionFingerprint,
+        stableFingerprint,
+        summary: result.summary,
+        start: range.start,
+        end: range.end,
+        ...(startCallId === undefined ? {} : { startCallId }),
+        ...(endCallId === undefined ? {} : { endCallId }),
+      })
+      this.speculativeStalls.delete(sessionId)
+      record('speculative:prepared')
+      this.ctx.logger.info(
+        `[ContextGovernor] speculative fold summary prepared (session …${sessionId.slice(-8)}, `
+          + `range ${range.start}..${range.end})`,
+      )
+    } catch (error) {
+      const brief = (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120)
+      const stalls = this.speculativeStalls.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.speculativeStalls.set(sessionId, { count: stalls.count + 1, lastAt: Date.now() })
+      record('speculative:failed:' + brief)
+    } finally {
+      this.speculativeInFlight.delete(sessionId)
+    }
+  }
+
+  private async runSpeculativeMerge(
+    agent: Agent,
+    sessionId: string,
+    endNow: SessionSeq,
+    mergeInput: SummarizationInput,
+    mergedFingerprint: number,
+    mergedRegionFingerprint: number,
+    mergedStableFingerprint: number,
+    endCallId: string | undefined,
+    deadlineMs: number,
+    previous: SpeculativeSummary,
+  ): Promise<void> {
+    const record = (detail: string): void => {
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail })
+      } catch {
+        // Telemetry never breaks speculation.
+      }
+    }
+    record('speculative:refresh-merge')
+    try {
+      // Same one bounded retry as the launch path: an empty merge result is
+      // usually a transient local-model answer, and the previous checkpoint
+      // would otherwise be dropped for nothing (the entry is replaced only
+      // on success, so a failed merge leaves the old checkpoint standing).
+      let result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      if (result.summary.length === 0) {
+        record('speculative:refresh-empty-retry')
+        result = await super.summarize(mergeInput, agent, AbortSignal.timeout(deadlineMs))
+      }
+      if (result.summary.length === 0) {
+        record('speculative:refresh-empty')
+        return
+      }
+      this.speculative.set(sessionId, {
+        fingerprint: mergedFingerprint,
+        regionFingerprint: mergedRegionFingerprint,
+        stableFingerprint: mergedStableFingerprint,
+        summary: result.summary,
+        start: previous.start,
+        end: endNow,
+        ...(previous.startCallId === undefined ? {} : { startCallId: previous.startCallId }),
+        ...(endCallId === undefined ? {} : { endCallId }),
+      })
+      this.speculativeStalls.delete(sessionId)
+      record('speculative:refreshed')
+      this.ctx.logger.info(
+        `[ContextGovernor] speculative checkpoint refreshed (session …${sessionId.slice(-8)}, `
+          + `covers through ${endNow})`,
+      )
+    } catch (error) {
+      const brief = (error instanceof Error ? error.message : String(error))
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120)
+      const stalls = this.speculativeStalls.get(sessionId) ?? { count: 0, lastAt: 0 }
+      this.speculativeStalls.set(sessionId, { count: stalls.count + 1, lastAt: Date.now() })
+      record('speculative:refresh-failed:' + brief)
+    } finally {
+      this.speculativeInFlight.delete(sessionId)
+    }
+  }
+
+  /**
+   * The summarizer call under a bounded deadline, with a degradation path.
+   *
+   * Telemetry (2026-10) showed the call hanging until the provider's own
+   * 300s stream-idle limit — blocking the whole fold — and local configs
+   * failing every call outright; either failure used to ABANDON the fold, so
+   * the context kept growing exactly when the model could least afford it.
+   * Now: one hard timeout per attempt (a fresh timer each), a single retry,
+   * then a deterministic extractive summary. The fold always completes; the
+   * degraded path is observable as kind=fold_check detail=degraded:extractive.
+   * A CALLER cancellation still rethrows (a cancelled step must not fabricate
+   * a result), and `summarization_timeout_ms: 0` disables the wrapper.
+   *
+   * Known boundary: the race settles the CALL on time, but a backend that
+   * ignores the abort signal may keep its underlying stream open — the retry
+   * then runs concurrently with the abandoned attempt until the provider's
+   * own idle limit reaps it. Worst case is a briefly duplicated in-flight
+   * request, never a duplicated summary (the loser's result is discarded).
+   */
+  /**
+   * Whether the session's summarizer route points at a LOCAL server. Shared
+   * by the live summarizer deadline and the speculative precompute.
+   */
+  private summarizerIsLocal(agent: Agent): boolean {
+    try {
+      const target = resolveSummarizationTarget(this.config, agent.session)
+      return target !== undefined && this.ctx.memoryContext.isLocalRoute(target.provider)
+    } catch {
+      // Locality unreadable — the cloud default is the safe choice.
+      return false
+    }
+  }
+
+  /**
+   * The route's learned summarizer latency (EMA of successful durations, in
+   * ms), read from the KV store. `undefined` until the route has completed
+   * one live summary — the locality defaults then bootstrap, and this EMA
+   * takes over: the deadline becomes a MEASUREMENT, not a constant guess.
+   * @param route - the summarizer route (`provider/model`).
+   */
+  private summarizerLatencyOf(route: string): number | undefined {
+    try {
+      const raw = this.ctx.memoryContext.kvGet('summarizer-latency:' + route)
+      if (raw === undefined) return undefined
+      const parsed = JSON.parse(raw) as { ms?: unknown }
+      return typeof parsed.ms === 'number' && Number.isFinite(parsed.ms) && parsed.ms > 0
+        ? parsed.ms
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private recordSummarizerLatency(route: string, durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return
+    try {
+      const prev = this.summarizerLatencyOf(route)
+      // EMA weight 0.5 (one-call half-life), matching the deviation loop.
+      const next = prev === undefined ? durationMs : Math.round(prev * 0.5 + durationMs * 0.5)
+      this.ctx.memoryContext.kvSet('summarizer-latency:' + route, JSON.stringify({ ms: next }))
+    } catch {
+      // Learning is best-effort; the locality defaults still apply.
+    }
+  }
+
+  /**
+   * The summarizer deadline layers, SHARED by the live summarizer path and
+   * the speculative launcher — both must bound the same call shape under the
+   * same policy, or the speculative cache never populates on exactly the
+   * slow routes where precompute matters most. Layers:
+   * 1. ROUTE LEARNING first: the EMA of this route's successful summary
+   *    durations × 1.25 headroom. Once a route has completed one summary,
+   *    the deadline is a MEASUREMENT — no constant guesses. Stands down
+   *    when the operator explicitly pinned summarization_timeout_ms.
+   * 2. No data yet → the locality constants bootstrap (local 240s / cloud
+   *    90s, scaled by input size): a local model is SLOW (minutes for a
+   *    20k-token range), a cloud model that stalls is HUNG. Unknown
+   *    locality keeps the tight cloud default — and if that misread times
+   *    out, the first successful call teaches the EMA.
+   * 3. Hard caps per locality: cloud 300s (the provider's own stream-idle
+   *    limit), local 900s (llama.cpp-style servers have NO idle limit — a
+   *    slow stream is healthy, and capping it made local summaries
+   *    permanently unlearnable).
+   * @returns the per-attempt deadline plus the locality-aware retry deadline.
+   */
+  private summarizerDeadline(
+    agent: Agent,
+    inputTokens: number,
+  ): { timeoutMs: number; retryMs: number } {
+    const isLocal = this.summarizerIsLocal(agent)
+    const maxMs = isLocal ? LOCAL_MAX_SUMMARIZATION_TIMEOUT_MS : MAX_SUMMARIZATION_TIMEOUT_MS
+    const baseMs = scaleSummarizationTimeoutMs(
+      resolveSummarizationTimeoutMs(this.config, isLocal),
+      inputTokens,
+      maxMs,
+    )
+    const target = resolveSummarizationTarget(this.config, agent.session)
+    const route = target === undefined ? undefined : `${target.provider}/${target.model}`
+    // An explicitly DISABLED wrapper (summarization_timeout_ms: 0) must reach
+    // the `timeoutMs <= 0` bypass in summarize(): deadlineFrom clamps every
+    // input to >= 15s, so without this early return the disable contract was
+    // dead and slow local folds degraded to extractive on a 15s hard timeout.
+    if (baseMs <= 0) return { timeoutMs: 0, retryMs: 0 }
+    const learned = route === undefined || isSummarizationTimeoutExplicit(this.config)
+      ? undefined
+      : this.summarizerLatencyOf(route)
+    // Take the LARGER of the cold-start estimate and the learned latency —
+    // the learned value must never TIGHTEN below the cold-start estimate.
+    // Production (2026-10-30): a local route learned ~108s and the deadline
+    // dropped to 135s, BELOW the 240s cold start, re-degrading a fold whose
+    // summary ran slower than the EMA sample. Monotonic both ways: learning
+    // refines, it never tightens.
+    const timeoutMs = deadlineFrom(baseMs, learned, MIN_SUMMARIZATION_TIMEOUT_MS, maxMs)
+    return { timeoutMs, retryMs: isLocal ? timeoutMs * 2 : timeoutMs }
+  }
+
+  private async summarizeResilient(
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    const inputTokens = estimateTokens(input.messages
+      .map(message => messageText(message))
+      .join('\n'))
+    const target = resolveSummarizationTarget(this.config, agent.session)
+    const route = target === undefined ? undefined : `${target.provider}/${target.model}`
+    const { timeoutMs, retryMs } = this.summarizerDeadline(agent, inputTokens)
+    if (timeoutMs <= 0) return super.summarize(input, agent, signal)
+    const shadowed = shadowedMessages(input)
+    const startedAt = Date.now()
+    // --- CHUNKED RECURSIVE SUMMARIZATION (extract → mechanical merge) ---
+    // A 40k-token one-shot summary is outside a small local model's
+    // competence: production showed those summaries restating bulk and
+    // landing 7-13k over target. Split the region at tool-pair-safe seams,
+    // give every segment its OWN call (own deadline, own extractive fallback
+    // — one dead segment costs its own note, not the region), then merge the
+    // section structures mechanically: nothing is invented, order is kept.
+    // This is Mem0's extract-then-merge plus the recursive-summary lineage,
+    // and the segment calls are the shape the learned route latency prices,
+    // so the deadline stays a measurement. Regions under 2× the chunk prior
+    // keep the single call (the cache-reuse replay shape the base engine was
+    // designed around); speculation stays single-call — its fingerprint
+    // contract cannot be re-cut here, and live folds are where the quality
+    // loss was measured.
+    if (this.foldChunking) {
+      const chunkTokens = Math.min(16_000, Math.max(2_000, this.foldChunkTokens))
+      if (inputTokens >= chunkTokens * 2) {
+        const segments = splitRegionIntoSegments(
+          shadowed as Message[],
+          chunkTokens,
+          message => estimateTokens(messageText(message)),
+        )
+        if (segments.length > 1) {
+          const chunked = await this.summarizeChunked(input, segments, agent, signal)
+          // Latency learning per SEGMENT call (the shape the deadline
+          // controls); a degraded run teaches nothing, matching the single
+          // path's discipline.
+          if (!chunked.degraded && route !== undefined && signal?.aborted !== true) {
+            this.recordSummarizerLatency(
+              route,
+              Math.round((Date.now() - startedAt) / Math.max(1, chunked.attempts)),
+            )
+            this.overflowStrikes.delete(route)
+          }
+          this.lastSummarizeDegraded.set(agent, chunked.degraded)
+          try {
+            this.usage.record(USAGE_KIND.foldCheck, 1, {
+              sessionId: String(agent.session.id),
+              detail: `chunked:n=${segments.length};attempts=${chunked.attempts};rounds=${chunked.mergeRounds};`
+                + `degraded=${chunked.degraded ? 1 : 0};seg~${chunkTokens}`,
+            })
+            if (chunked.degraded) {
+              this.usage.record(USAGE_KIND.foldCheck, 1, {
+                sessionId: String(agent.session.id),
+                detail: 'degraded:chunked',
+              })
+            }
+          } catch {
+            // Diagnostics must never break the fold.
+          }
+          return redactedSummary(chunked.result)
+        }
+      }
+    }
+    const outcome = await summarizeWithResilience(
+      combined => super.summarize(input, agent, combined),
+      error => {
+        const reason = error instanceof Error ? error.message : String(error ?? 'unknown')
+        const text = extractiveSummary(
+          shadowed
+            .filter(message => message.role !== 'user' || isUserAuthored(message))
+            .map(message => ({ role: message.role, text: messageText(message) })),
+          { reason },
+        )
+        return {
+          summary: [{ type: 'text', text }],
+          provider: 'extractive',
+          model: 'extractive',
+        } satisfies SummaryResult
+      },
+      {
+        timeoutMs,
+        // Retry policy is locality knowledge (computed in summarizerDeadline):
+        // a local route is slow-but-alive (double the deadline), a cloud
+        // stream that produced nothing for a full deadline is usually dead
+        // (retry flat).
+        retryMs,
+        retries: 1,
+        ...(signal === undefined ? {} : { outerSignal: signal }),
+      },
+    )
+    // Learn the route's real latency from LIVE summaries only — the
+    // extractive fallback's duration measures OUR code, not the model.
+    // The measured span covers ALL attempts; the EMA wants the per-attempt
+    // time the deadline approximates, so divide by the attempt count.
+    if (!outcome.degraded && route !== undefined && signal?.aborted !== true) {
+      this.recordSummarizerLatency(route, Math.round((Date.now() - startedAt) / Math.max(1, outcome.attempts)))
+      // A success refutes the overflow suspicion: reset the strike counter so
+      // one garbage 400 followed by healthy calls cannot accumulate evidence.
+      this.overflowStrikes.delete(route)
+      // Self-healing widen: this call carried MORE tokens than the recorded
+      // window and SUCCEEDED — the window bound was too tight (a transient
+      // busy-server 400, say). The success is its own evidence; widen
+      // narrow-only style so the next fold plans against the truth.
+      if (inputTokens > 0 && inputTokens > (this.ctx.memoryContext.windowForModel(target?.model) ?? Number.MAX_SAFE_INTEGER)) {
+        try {
+          if (target !== undefined) {
+            this.ctx.memoryContext.updateModelContext({
+              provider: target.provider,
+              model: target.model,
+              contextWindow: inputTokens,
+              source: 'overflow',
+            })
+            this.ctx.logger.info(
+              `[ContextGovernor] summarizer success widens real window to >= ${inputTokens} `
+                + `for ${target.provider}/${target.model}`,
+            )
+          }
+        } catch {
+          // Learning is best-effort.
+        }
+      }
+    }
+    this.lastSummarizeDegraded.set(agent, outcome.degraded)
+    if (outcome.degraded) {
+      const reason = outcome.error instanceof Error
+        ? outcome.error.message
+        : String(outcome.error ?? 'unknown')
+      const brief = reason.replace(/\s+/g, ' ').trim().slice(0, 160)
+      this.ctx.logger.warn('[ContextGovernor] summarizer degraded to extractive: ' + brief)
+      // Overflow learning: a 400 "exceeds the available context size" on the
+      // SUMMARIZER call means the server's real context is smaller than the
+      // declared one (production: declared 128k, server answered "available
+      // context size (32)"). The summarizer replays the range as a prefix,
+      // so inputTokens + slack is a hard UPPER BOUND on the real window —
+      // adopt it narrow-only, and the next fold plans against the truth.
+      // Two server-side numbers are hard evidence, each with its own shape:
+      // "exceeds the context size (32768)" reports the WINDOW itself;
+      // "(40000 tokens) exceeds" reports the server's count of the REJECTED
+      // input (the window is below it). A placeholder answer from a busy
+      // server ("available context size (32)") is garbage: for those require
+      // the evidence to REPEAT, and then adopt a deliberately generous bound
+      // (estimate + slack). Asymmetry: too generous costs one more failed
+      // summarizer call (and the next 400 tightens the bound —
+      // self-correcting); too tight strangles every later budget, disables
+      // the self-heal, and made the fit-guard compact every step against a
+      // ~20k "window" (the 2026-11-03 checkpoint storm).
+      const windowReported = reason.match(/exceeds the (?:available )?context(?: size)? \((\d+)\)/i)
+      const inputReported = reason.match(/\((\d+) tokens\) exceeds/i)
+      const serverNumber = (match: RegExpMatchArray | null): number | undefined => {
+        const parsed = Number.parseInt(match?.[1] ?? '', 10)
+        return Number.isFinite(parsed) && parsed >= 1024 ? parsed : undefined
+      }
+      const serverBound = serverNumber(windowReported) ?? serverNumber(inputReported)
+      if ((windowReported !== null || inputReported !== null) && inputTokens > 0) {
+        try {
+          const target = resolveSummarizationTarget(this.config, agent.session)
+          if (target !== undefined) {
+            const route = `${target.provider}/${target.model}`
+            const strikes = this.overflowStrikes.get(route) ?? { count: 0, lastAt: 0 }
+            const strike = { count: strikes.count + 1, lastAt: Date.now() }
+            this.overflowStrikes.set(route, strike)
+            const adopted = serverBound
+              ?? (strike.count >= 2 ? inputTokens + 4096 : undefined)
+            if (adopted !== undefined) {
+              this.ctx.memoryContext.updateModelContext({
+                provider: target.provider,
+                model: target.model,
+                contextWindow: adopted,
+                source: 'overflow',
+              })
+              this.ctx.logger.warn(
+                `[ContextGovernor] summarizer overflow 400: adopting real window <= ${adopted} `
+                  + `for ${route} (server number ${serverBound === undefined ? 'absent/garbage' : 'plausible'},`
+                  + ` strike ${strike.count})`,
+              )
+            }
+          }
+        } catch {
+          // Overflow learning is best-effort; the fold continues degraded.
+        }
+      }
+      try {
+        this.usage.record(USAGE_KIND.foldCheck, 1, {
+          sessionId: String(agent.session.id),
+          detail: 'degraded:extractive:' + brief,
+        })
+      } catch {
+        // Diagnostics must never break the degraded path.
+      }
+    }
+    return redactedSummary(outcome.value)
+  }
+
+  /**
+   * The chunked live-fold summarization: one resilient summarize call per
+   * segment (the system head is replayed with each — the cache win only
+   * survives for the first segment, the QUALITY win is why chunking exists),
+   * then a mechanical merge of the section structures under a budget derived
+   * from the region's own output share. A segment whose model dies keeps its
+   * own extractive note instead of taking the whole region down with it.
+   * @param input - the original region input (supplies the system head and
+   *   the tool schemas every segment replays).
+   * @param segments - the region pre-split at tool-pair-safe seams.
+   * @param agent - the fold owner (routing, effort).
+   * @param signal - the fold's cancellation signal, honoured per segment.
+   * @returns the merged checkpoint plus the degraded/attempts accounting the
+   *   caller feeds into the route's latency EMA.
+   */
+  private async summarizeChunked(
+    input: SummarizationInput,
+    segments: Message[][],
+    agent: Agent,
+    signal: AbortSignal | undefined,
+  ): Promise<{ result: SummaryResult; degraded: boolean; attempts: number; mergeRounds: number }> {
+    const system = input.messages[0]?.role === 'system' ? input.messages[0] : undefined
+    let notes: string[] = []
+    let degraded = false
+    let attempts = 0
+    let mergeRounds = 0
+    // SEGMENT WINDOW CLIP: message-level packing can still leave one segment
+    // over the model window (a single monster message no bucket can split).
+    // The segment request is a STANDALONE call — its window is the model's
+    // own, not the session's — so the text blocks are clipped against the
+    // summarization route's ADOPTED per-model window (registry first,
+    // declared global as fallback — the bare global budgets one model off
+    // another's); the clipped tail stays recoverable through the fold archive
+    // of the ORIGINAL messages (its own serialize is 16k/message).
+    // The clip must also leave room for the ENVELOPE every segment replays:
+    // the system head and tool schemas ride OUTSIDE the clipped text blocks
+    // (SummarizationInput fields, prepended by the base), so a bare 80%-of-
+    // window on the TEXT alone can still push the assembled request over the
+    // line on a tool-heavy route. Estimate the real replayed envelope and
+    // subtract it FIRST; the 20% band then stays purely as answer headroom.
+    const segmentTarget = resolveSummarizationTarget(this.config, agent.session)
+    const segmentWindow = this.ctx.memoryContext.windowForModelOrDeclared(segmentTarget?.model)
+    // The live-fold path carries the system head as messages[0] (buildRegionInput),
+    // NOT the system field — and it is re-prepended to every segment below
+    // without clipping — so BOTH carriers count toward the replayed envelope.
+    const envelopeTokens = estimateTokens(
+      (input.system ?? '')
+      + (system === undefined ? '' : messageText(system))
+      + (input.tools === undefined ? '' : JSON.stringify(input.tools)),
+    )
+    const segmentWindowBudget = Math.max(2_000, Math.floor(segmentWindow * 0.8) - envelopeTokens)
+    const clippedSegments = segments.map(segment => {
+      const tokens = estimateTokens(segment.map(message => messageText(message)).join('\n'))
+      if (tokens <= segmentWindowBudget) return segment
+      let used = 0
+      return segment.map(message => {
+        if (!Array.isArray(message.content)) return message
+        const content = message.content.map(block => {
+          if (block.type !== 'text' || typeof block.text !== 'string') return block
+          const room = segmentWindowBudget - used
+          if (room <= 0) return { type: 'text' as const, text: '' }
+          // clipToTokens binary-searches against the REAL meter — the same
+          // CJK-aware accounting the budget itself was derived with.
+          const clipped = clipToTokens(block.text, room)
+          used += estimateTokens(clipped)
+          return { type: 'text' as const, text: clipped }
+        })
+        return { ...message, content }
+      })
+    })
+    for (const segment of clippedSegments) {
+      if (signal?.aborted === true) throw new Error('summarization aborted before a fold segment')
+      const segInput: SummarizationInput = {
+        // Carry the envelope EVERY segment replays: the conversation's own
+        // system prompt and tool schemas ride as separate SummarizationInput
+        // fields (the base prepends them for prefix-cache alignment — they
+        // are NOT messages[0]). Dropping them would silently cost both.
+        ...(input.system === undefined ? {} : { system: input.system }),
+        ...(input.tools === undefined ? {} : { tools: input.tools }),
+        messages: system === undefined ? segment : [system, ...segment],
+      }
+      const segTokens = estimateTokens(segment.map(message => messageText(message)).join('\n'))
+      const { timeoutMs, retryMs } = this.summarizerDeadline(agent, segTokens)
+      const outcome = await summarizeWithResilience(
+        combined => super.summarize(segInput, agent, combined),
+        error => {
+          const reason = error instanceof Error ? error.message : String(error ?? 'unknown')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160)
+          return {
+            summary: [{
+              type: 'text',
+              text: extractiveSummary(
+                segment
+                  .filter(message => message.role !== 'user' || isUserAuthored(message))
+                  .map(message => ({ role: message.role, text: messageText(message) })),
+                { reason: 'segment: ' + reason },
+              ),
+            }],
+            provider: 'extractive',
+            model: 'extractive',
+          } satisfies SummaryResult
+        },
+        {
+          // timeoutMs<=0 can only mean an operator-disabled wrapper; the
+          // chunk branch never starts under it (checked in summarizeResilient).
+          timeoutMs,
+          retryMs,
+          retries: 1,
+          ...(signal === undefined ? {} : { outerSignal: signal }),
+        },
+      )
+      if (outcome.degraded) degraded = true
+      attempts += outcome.attempts
+      notes.push(outcome.value.summary
+        .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+        .map(block => block.text)
+        .join('\n'))
+    }
+    // EMERGENCY MERGE ROUNDS: a region large enough to segment into dozens of
+    // pieces (the 100%-full rescue case) leaves a notes pile that would be
+    // mechanically concatenated into a manifest nobody reads. Group the notes
+    // under the merge input budget and merge every GROUP into one higher-level
+    // note via the session's own route; iterate until the notes fit a single
+    // request (or the round cap — a safety bound, not an operating point).
+    // A failed group keeps its raw notes: degradation, never loss.
+    const mergeInputBudget = Math.max(2_000, Math.floor((this.config.maxTokens ?? 4096) * 0.7 * 0.8))
+    while (notes.length > 1 && mergeRounds < EMERGENCY_MERGE_ROUNDS_MAX
+      && notes.reduce((sum, note) => sum + estimateTokens(note), 0) > mergeInputBudget) {
+      const groups: string[][] = []
+      let group: string[] = []
+      let groupTokens = 0
+      for (const note of notes) {
+        const noteTokens = estimateTokens(note)
+        if (groupTokens > 0 && groupTokens + noteTokens > mergeInputBudget) {
+          groups.push(group)
+          group = []
+          groupTokens = 0
+        }
+        group.push(note)
+        groupTokens += noteTokens
+      }
+      if (group.length > 0) groups.push(group)
+      // Every note alone exceeding the budget cannot shrink — a further round
+      // would loop on the same pile.
+      if (groups.length === notes.length) break
+      const mergeTarget = resolveSummarizationTarget(this.config, agent.session)
+      if (mergeTarget === undefined) break
+      const nextNotes: string[] = []
+      let roundDegraded = false
+      for (const mergeGroup of groups) {
+        if (mergeGroup.length === 1 && estimateTokens(mergeGroup[0]!) <= mergeInputBudget * 0.5) {
+          nextNotes.push(mergeGroup[0]!)
+          continue
+        }
+        try {
+          nextNotes.push(await summarizeMemoriesWithLlm(
+            this.ctx, this.config, mergeGroup,
+            'Merge these partial fold summaries into ONE checkpoint that keeps every still-relevant fact',
+            mergeTarget, signal,
+          ))
+          attempts += 1
+        } catch {
+          // The group's raw notes survive a failed merge — degradation, not loss.
+          nextNotes.push(...mergeGroup)
+          roundDegraded = true
+        }
+      }
+      notes = nextNotes
+      if (roundDegraded) degraded = true
+      mergeRounds += 1
+    }
+    // The budget basis MUST match the downstream global cap in summarize()
+    // (shadowedTokens × SUMMARY_OUTPUT_SHARE), or the section-budget reflow
+    // would reflow against one number and get blind-clipped to another.
+    const region = input.messages[0]?.role === 'system' ? input.messages.slice(1) : input.messages
+    const regionTokens = this.compressor.estimateMessageTokens(region)
+    const totalMaxChars = summaryCharBudget(regionTokens, SUMMARY_OUTPUT_SHARE)
+    const merged = applySectionBudget(mergeSegmentNotes(notes), {
+      // Both budgets DERIVE from the region's observed size: the total is
+      // the same share the single-call path caps at, and one section may
+      // never eat more than a sixth of it (a blown Critical Context section
+      // is how the local routes landed +13k on target).
+      perSectionMaxChars: Math.max(500, Math.floor(totalMaxChars / 6)),
+      totalMaxChars,
+    })
+    return {
+      result: { summary: [{ type: 'text', text: merged }], provider: 'chunked', model: 'chunked' },
+      degraded,
+      attempts,
+      mergeRounds,
+    }
+  }
+
+  /**
+   * Summarize a compacted region and then persist it as a mid-term memory,
+   * rebalance the memory pyramid, and run the forgetting sweep.
+   */
+  protected override async summarize(
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    // Consume a speculative summary when the REGION MESSAGES match: the
+    // summary LLM call already ran in the background, so the fold commits
+    // without blocking on it. One-shot: consumed or mismatched, the entry is
+    // gone (a miss falls through to the live summarizer with its telemetry).
+    // The contract is the region projection, NOT the full-input hash: the
+    // base engine rebuilds the input under its own preamble and the request's
+    // CURRENT header, so tool churn or a preamble tweak between prepare and
+    // consume breaks the full hash while every folded word stays identical
+    // (production evidence: 0 hits in 11 launches, all on preamble drift).
+    const sessionIdStr = String(agent.session.id)
+    const speculation = this.speculative.get(sessionIdStr)
+    if (speculation !== undefined) {
+      const incoming = shadowedMessages(input)
+      const strictHit = regionMessagesFingerprint(incoming) === speculation.regionFingerprint
+      // STABLE tier: tool-result text is rewritten in place by archive
+      // stubbing / memory_expand / absorb digests while the callIds (and the
+      // recoverable information) stay constant — a strict mismatch with only
+      // tool-text differences still leaves the prepared summary a valid
+      // replacement for the region. The full payloads remain recoverable via
+      // tr_ refs after the fold either way.
+      const stableHit = strictHit
+        || regionStableFingerprint(incoming) === speculation.stableFingerprint
+      if (stableHit) {
+        this.speculative.delete(sessionIdStr)
+        this.ctx.logger.info('[ContextGovernor] speculative summary consumed (fingerprint hit)')
+        this.usage.record(USAGE_KIND.foldCheck, 1, {
+          sessionId: sessionIdStr,
+          detail: strictHit ? 'speculative:hit' : 'speculative:hit:stable',
+        })
+        // A precomputed summary is a genuine live-LLM result: record it so the
+        // fold path publishes the route prior (the flag would otherwise hold a
+        // STALE value from an earlier call and wrongly suppress publishing).
+        this.lastSummarizeDegraded.set(agent, false)
+        // The precomputed summary joins the SAME commit lifecycle as a live
+        // one: clip, task-state rebuild, digest, evidence audit, folded-range
+        // archive, checkpoint memory. Production 2026-11-11 (session
+        // e8d3bbf8): an early return here skipped ALL of it — the hit fold
+        // landed with no fl_ archive, no checkpoint, no savings record, and
+        // a stale task state. Reversibility must not depend on where the
+        // summary came from.
+        const consumed = {
+          ...redactedSummary({
+            summary: speculation.summary,
+            provider: 'precomputed',
+            model: 'speculative',
+          }),
+        }
+        await this.postSummarize(consumed, input, agent)
+        return consumed
+      }
+      // Mismatch: the caller may be ANOTHER LANE. summarize() serves the
+      // durable/base compaction too, and that lane shadows a DIFFERENT range
+      // — the one-shot delete here wasted a checkpoint that was still
+      // verbatim-valid for its own lane (production 2026-11-04: the durable
+      // compaction consumed-and-dropped the fold checkpoint three minutes
+      // before the fold lane could use it). Keep the entry while its OWN
+      // region is still verbatim in the surface; the durable fold's surface
+      // rewrite invalidates it and the next fold-lane check drops it there.
+      let stillValid = false
+      try {
+        // REBASE first (same rule as the layer-1 check): a stub replace
+        // retires the anchor seq while its callId lives on — without the
+        // rebase the projection loses a message, both fingerprints fail, and
+        // a provably-valid checkpoint is misjudged dead (inconsistent with
+        // the layer-1 path, which follows the replacement).
+        const rebasedOwn = this.rebaseSpeculation(sessionIdStr, agent.session, speculation)
+        if (rebasedOwn === null) {
+          stillValid = false
+        } else {
+          const ownProjection = shadowedMessages(
+            this.buildRegionInput(agent.session, rebasedOwn.start, rebasedOwn.end),
+          )
+          // Same two tiers as the consume: a region that only drifted in tool
+          // text keeps the checkpoint valid for its own lane.
+          stillValid = regionMessagesFingerprint(ownProjection) === rebasedOwn.regionFingerprint
+            || regionStableFingerprint(ownProjection) === rebasedOwn.stableFingerprint
+        }
+      } catch {
+        stillValid = false
+      }
+      if (stillValid) {
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:other-region' })
+      } else {
+        this.speculative.delete(sessionIdStr)
+        this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId: sessionIdStr, detail: 'speculative:miss' })
+      }
+    }
+    // Spread once: the resilience wrapper's declared type keeps the summary
+    // read-only, while the clipping below rewrites it in place.
+    const result = { ...(await this.summarizeResilient(input, agent, signal)) }
+    await this.postSummarize(result, input, agent)
+    return result
+  }
+
+  /**
+   * The commit lifecycle every produced summary goes through: budget clip,
+   * task-state rebuild, user-instructions digest, evidence audit, folded-
+   * range archive + checkpoint memory, pyramid/forgetting sweep. SHARED by
+   * the live summarizer and the speculative-hit path — the reversibility
+   * contract (fl_ archive, read-back, supersede chain) applies to a fold no
+   * matter how its summary was produced.
+   * @param result - the summary, mutated in place (clipped, prefixed, floored
+   *   by the evidence section; the caller returns it after this call).
+   * @param input - the summarization input whose shadowed region is folded.
+   * @param agent - the fold owner (routing for the rebalance summarizer).
+   */
+  private async postSummarize(
+    result: MutableSummaryResult,
+    input: SummarizationInput,
+    agent: Agent,
+  ): Promise<void> {
+    try {
+      // The summarizer is asked for ~30% of its input, but local models often
+      // over-produce; a summary that is not smaller than the folded content is
+      // rejected by compaction-basic. Cap the committed summary to the planned
+      // share so the fold always nets a saving.
+      const shadowed = shadowedMessages(input)
+      const shadowedTokens = this.compressor.estimateMessageTokens(shadowed)
+      const maxChars = summaryCharBudget(shadowedTokens, SUMMARY_OUTPUT_SHARE)
+      let remaining = maxChars
+      result.summary = result.summary.map(block => {
+        if (block.type !== 'text') return block
+        if (remaining <= 0) return { ...block, text: '' }
+        if (block.text.length <= remaining) {
+          remaining -= block.text.length
+          return block
+        }
+        const clipped = block.text.slice(0, Math.max(0, remaining - 14)) + '\n…[truncated]'
+        remaining = 0
+        return { ...block, text: clipped }
+      })
+      let modelText = result.summary
+        .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+        .map(block => block.text)
+        .join('\n')
+        .trim()
+      // Working-memory slot: rebuild the carried task-state block from this
+      // fold's structured checkpoint (primary request / pending jobs / next
+      // step / critical context), falling back per-section to the previous
+      // block where the new fold has nothing. Injected fresh every turn by
+      // the pre-step splice; persisted here so restarts keep it.
+      if (modelText.length > 0) {
+        const sessionIdStr = String(agent.session.id)
+        const taskState = buildTaskStateBlock({
+          summary: modelText,
+          previous: this.compressor.taskStateOf(sessionIdStr),
+        })
+        if (taskState !== undefined && taskState !== this.compressor.taskStateOf(sessionIdStr)) {
+          this.compressor.recordTaskState(sessionIdStr, taskState)
+        }
+      }
+      // Keep the user's own words in the folded range. A model summary can
+      // drop instructions and identifiers; this digest is deterministic and
+      // survives whatever the summarizer decides to keep. 8 × 200 chars
+      // (2026-11-27 context-burden rework): 12 × 300 crowded the summary
+      // budget with verbatim quotes the fl_ archive already holds — the
+      // freed room goes to the model's summary instead.
+      const userInstructions = shadowed
+        .filter(message => message.role === 'user' && isUserAuthored(message))
+        .map(message => messageText(message).trim())
+        .filter(value => value.length > 0)
+        .slice(-8)
+        .map(value => `- ${value.length > 200 ? `${value.slice(0, 200)}…` : value}`)
+      const digestRaw = userInstructions.length === 0
+        ? ''
+        : `## 折叠区用户指令 / User instructions in the folded range\n${userInstructions.join('\n')}`
+      // The verbatim user-words channel crosses the SAME redaction line as the
+      // model's summary: a credential typed mid-session must not be quoted
+      // into folded_ranges, the mid-tier checkpoint and every later surface
+      // (the incident class redact.ts documents). The evidence audit below
+      // measures the UNREDACTED digest, so masking never fabricates a
+      // "missing anchor" that would then be re-attached.
+      const digest = digestRaw.length === 0 ? '' : redactCredentials(digestRaw)
+      // Fold evidence audit (deterministic fidelity floor): the deviation EMA
+      // measures a summary's SIZE, never its FIDELITY — a checkpoint can land
+      // exactly on budget and still have dropped the one line the resume
+      // needed (an exact path, an archive ref, an error string; KEEP-Bench).
+      // Extract the region's load-bearing anchors mechanically, subtract what
+      // the checkpoint already carries, re-attach the few MISSING ones
+      // verbatim. The section never rewrites the model's text — it floors it —
+      // and its share is capped at 25% of the summary budget, so evidence can
+      // never cannibalize the checkpoint it audits.
+      let evidenceSection = ''
+      if (this.foldEvidenceCheck && modelText.length > 0) {
+        try {
+          // Audit against EVERYTHING the fold lands, digest included: an
+          // anchor the user-instructions digest carries is kept and must not
+          // be re-attached a second time. The audit domain carries the
+          // UNREDACTED digest on purpose — anchors are compared verbatim,
+          // and a masked digest would count its own anchors as missing.
+          const auditDomain = digestRaw.length > 0 ? `${modelText}\n\n${digestRaw}` : modelText
+          const evidenceOptions = fitEvidenceOptions({}, Math.floor(maxChars * 0.25))
+          const anchors = extractAnchors(shadowed.map(message => ({
+            role: message.role,
+            source: (message as { source?: { kind?: string } }).source ?? null,
+            text: messageText(message),
+          })), evidenceOptions)
+          const poolCapped = anchorsPoolCapped(anchors, evidenceOptions)
+          let audit = auditEvidence(anchors, auditDomain, evidenceOptions, poolCapped)
+          // Missing anchors are re-attached VERBATIM — the channel most likely
+          // to quote a raw error line containing a credential — so the
+          // rendered block crosses redaction before any budget math sees it.
+          let candidate = redactCredentials(renderEvidenceSection(audit))
+          if (candidate.length > 0 && modelText.length + candidate.length + 2 > maxChars) {
+            // The re-attached block must fit the SAME budget: tighten the
+            // model's share (same cumulative text-block clip), then re-audit
+            // against the tightened text — lines that counted as kept before
+            // may have been clipped away, and those come back as evidence.
+            const room = Math.max(0, maxChars - evidenceSectionCeiling(evidenceOptions) - 2)
+            let spare = room
+            result.summary = result.summary.map(block => {
+              if (block.type !== 'text') return block
+              if (spare <= 0) return { ...block, text: '' }
+              if (block.text.length <= spare) {
+                spare -= block.text.length
+                return block
+              }
+              const clipped = block.text.slice(0, Math.max(0, spare - 14)) + '\n…[truncated]'
+              spare = 0
+              return { ...block, text: clipped }
+            })
+            modelText = result.summary
+              .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+              .map(block => block.text)
+              .join('\n')
+              .trim()
+            const tightened = digestRaw.length > 0 ? `${modelText}\n\n${digestRaw}` : modelText
+            audit = auditEvidence(anchors, tightened, evidenceOptions, poolCapped)
+            candidate = redactCredentials(renderEvidenceSection(audit))
+          }
+          if (candidate.length > 0) {
+            evidenceSection = candidate
+            this.usage.record(USAGE_KIND.foldCheck, 1, {
+              sessionId: String(agent.session.id),
+              detail: `evidence:missing=${audit.missing.length}${audit.truncated ? ';trunc=1' : ''}`,
+            })
+          }
+        } catch (error) {
+          // The audit must never break a fold commit.
+          this.ctx.logger.warn(
+            `fold evidence audit failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+      // The degradation header stays on the SURFACE copy (result.summary)
+      // only: the durable copies must not persist a transient provider error
+      // into the folded_ranges summary and the mid-tier memory.
+      // Belt-and-braces: every component above is already redacted at its own
+      // channel (digest, evidence, and the summarize exits for modelText), and
+      // redactCredentials is idempotent — wrapping the composition means any
+      // FUTURE verbatim channel added here inherits the line automatically.
+      const text = redactCredentials([digest, stripExtractiveHeader(modelText), evidenceSection].filter(Boolean).join('\n\n'))
+      if (text.length > 0) {
+        // One place records compaction savings for BOTH lanes (durable and
+        // fold), using the plugin's CJK-aware surface estimate.
+        if (shadowedTokens > 0) {
+          this.usage.record(USAGE_KIND.compactionSaved, shadowedTokens, {
+            sessionId: String(agent.session.id),
+          })
+        }
+        // The summary embedding back-fills INSIDE archiveFoldedRange, off the
+        // commit path: awaiting the embedder here blocked the fold on a
+        // possibly-slow (Transformers ONNX) embedder — the lifecycle review's
+        // P2-7.
+        const header = this.compressor.archiveFoldedRange(
+          String(agent.session.id),
+          shadowed,
+          text,
+        )
+        const prefix = [header.includes('fl_') ? header : '', digest]
+          .filter(Boolean)
+          .join('\n\n')
+        if (prefix.length > 0) {
+          let inserted = false
+          result.summary = result.summary.map(block => {
+            if (inserted || block.type !== 'text') return block
+            inserted = true
+            return { ...block, text: `${prefix}\n\n${block.text}` }
+          })
+          if (!inserted) result.summary = [{ type: 'text', text: prefix }, ...result.summary]
+        }
+        // The surface copy gets the evidence block too — the durable
+        // `text` above already carries it into the folded_ranges archive
+        // and the mid-tier checkpoint. It lands as its own block, never
+        // woven into the model's text.
+        if (evidenceSection.length > 0) {
+          result.summary = [...result.summary, { type: 'text', text: evidenceSection }]
+        }
+        // Mid-tier checkpoint digests file under their OWN kind: the
+        // supersede chain (below) retires every prior same-session digest the
+        // moment this one lands, and the per-kind forgetting policy gives
+        // them a short half-life — each fold's summary speaks for the session
+        // until the next fold replaces it (Zep-style invalidation, Letta's
+        // "forgetting = consolidation" discipline).
+        const digestDoc = await this.ctx.memoryContext.storeMemory(text, 'mid', {
+          sourceSessionId: agent.session.id,
+          importance: 0.6,
+          kind: 'checkpoint',
+        })
+        const superseded = this.ctx.memoryContext.supersedePrior(
+          String(agent.session.id),
+          'checkpoint',
+          digestDoc.id,
+        )
+        if (superseded > 0) {
+          this.ctx.logger.info(
+            `[ContextGovernor] digest superseded ${superseded} prior checkpoint memor${superseded === 1 ? 'y' : 'ies'} for this session`,
+          )
+        }
+      }
+      const rebalance = await this.ctx.memoryContext.rebalance(
+        resolveSummarizationTarget(this.config, agent.session),
+      )
+      if (rebalance.pyramid?.merged !== null && rebalance.pyramid?.merged !== undefined) {
+        this.ctx.logger.info(
+          `memory pyramid consolidated ${rebalance.pyramid.demotedMids.length} mid memories into one long memory `
+            + `(mids demoted to the short tier)`,
+        )
+      }
+      if (rebalance.forgetting.dropped.length > 0) {
+        this.ctx.logger.info(
+          `memory forgetting dropped ${rebalance.forgetting.dropped.length} low-value memories`,
+        )
+      }
+    } catch (error) {
+      // Persistence and rebalance are best-effort; the compaction itself already
+      // produced a usable checkpoint.
+      this.ctx.logger.warn(
+        `memory persistence/rebalance failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  /**
+   * Sanitize a tool result and ingest it into the vector memory.
+   * Called from the tool execution callback (onToolResult equivalent).
+   *
+   * `rawResult` may be the structured `ContentBlock[]` from the `tools/result`
+   * event (the automatic path) or any parsed payload (the manual
+   * `memory_ingest` tool) — {@link sanitizeToolResult} dispatches per shape.
+   *
+   * Error-isolated: failures never block the main flow.
+   */
+  async onToolResult(source: string, rawResult: unknown): Promise<void> {
+    try {
+      const sanitized = sanitizeToolResult(rawResult, source, this.sanitizerConfig)
+      const text = sanitizedPayloadText(sanitized)
+      if (text.length === 0) return
+      await this.retriever.ingest(text, source)
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[ContextGovernor] Tool result sanitization/ingestion failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+  /**
+   * Implicit fold recall: match the step's user-authored input against the
+   * session's recent fold summaries. A significant semantic overlap means
+   * the conversation is circling back to material a fold removed — the
+   * signal the amplitude loop was blind to when the model never calls
+   * memory_expand (20 production cycles at recall=0 pushed amp to its
+   * ceiling with zero information). Feeds the SAME flRecalls counter an
+   * explicit read bumps, so recallEma learns from it with no new loop.
+   * Fire-and-forget; failure costs one scan, never a step.
+   * @param sessionId - the folding session.
+   * @param turn - the current turn (cooldown key).
+   * @param texts - user-authored texts of this step's inbox delta.
+   */
+  private async scanImplicitRecall(sessionId: string, turn: number, texts: readonly string[]): Promise<void> {
+    if (!resolveImplicitRecall(this.config)) return
+    const joined = texts.map(text => text.trim()).filter(text => text.length > 0).join('\n')
+    if (joined.length < 40) return
+    const query = await this.ctx.memoryContext.embedText(
+      joined.length > IMPLICIT_RECALL_EMBED_CHARS ? joined.slice(0, IMPLICIT_RECALL_EMBED_CHARS) : joined,
+    )
+    if (query === undefined) return
+    const recent = this.ctx.memoryContext.recentFoldEmbeddings(sessionId, IMPLICIT_RECALL_SCAN_RECENT)
+    for (const { ref, embedding } of recent) {
+      const cooldownKey = sessionId + ':' + ref
+      if ((this.implicitRecallCooldown.get(cooldownKey) ?? Number.NEGATIVE_INFINITY) + IMPLICIT_RECALL_COOLDOWN_TURNS > turn) continue
+      const score = cosineSimilarity(query, embedding)
+      if (score < GOV_IMPLICIT_RECALL_COS) continue
+      // Watermark eviction, not a wholesale clear: Map iteration order is
+      // insertion order, and clear() would also wipe cooldowns stamped THIS
+      // turn — the same fold ref would re-match and re-count next turn (the
+      // lifecycle review's P2-4).
+      if (this.implicitRecallCooldown.size > IMPLICIT_RECALL_COOLDOWN_MAX) {
+        const evictCount = Math.floor(this.implicitRecallCooldown.size / 2)
+        let evicted = 0
+        for (const key of this.implicitRecallCooldown.keys()) {
+          this.implicitRecallCooldown.delete(key)
+          if (++evicted >= evictCount) break
+        }
+      }
+      this.implicitRecallCooldown.set(cooldownKey, turn)
+      this.ctx.memoryContext.noteFlRecall(sessionId)
+      this.usage.record(USAGE_KIND.foldCheck, 1, {
+        sessionId,
+        detail: `implicit-recall:ref=${ref};score=${score.toFixed(2)}`,
+      })
+    }
+  }
+
+  /**
+   * Sleep-time maintenance: when an agent goes idle, schedule one deferred
+   * consolidation pass; any non-idle status (or the next pre-step) cancels
+   * the pending pass. Letta's idle-compute pattern — the fold commit does
+   * the urgent work, idle time does the catch-up work (sweep the stale
+   * counters, re-summarize the superseded checkpoint history into the long
+   * tier). LLM spend is bounded: one call per session per idle window,
+   * min-GOV_SLEEP_CONSOLIDATE_MIN superseded checkpoints to arm, and a
+   * per-session rerun gap.
+   * @param ctx - the plugin context (agent/status dispatch).
+   */
+  private registerSleepWatch(ctx: Context): void {
+    ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
+      const sessionId = String(agent.session.id)
+      if (status === 'idle') {
+        this.scheduleIdleMaintenance(sessionId, agent.session)
+      } else {
+        this.cancelIdleMaintenance(sessionId)
+      }
+    })
+  }
+
+  /**
+   * Degenerate-turn invisible retry (upstream billion-context #821, engine-
+   * layer equivalent): when a turn is about to close normally, inspect its
+   * last assistant message; zero visible output (reasoning only, or empty)
+   * means the turn produced nothing — splice ONE corrective step into the
+   * inbox so the turn continues instead of ending on lost work. The streak
+   * cap bounds a wedged model; any real output (observed in registerUsage)
+   * resets it.
+   * @param ctx - the plugin context (agent-scoped serial dispatch).
+   */
+  private registerDegenerateRetry(ctx: Context): void {
+    ctx.on('agent/turn-stopping', ({ agent, turn, signal }: { agent: Agent; turn: number; signal: AbortSignal }) => {
+      if (!resolveDegenerateRetry(this.config)) return
+      if (signal.aborted) return
+      const sessionId = String(agent.session.id)
+      const streak = this.degenerateStreaks.get(sessionId) ?? 0
+      if (streak >= DEGENERATE_RETRY_MAX_STREAK) return
+      // The turn's OWN assistant message: scan the surface tail for the newest
+      // assistant/message belonging to this turn (a completed turn with no
+      // assistant message at all is the empty-turn path — nothing to retry).
+      let content: readonly { type: string; text?: string }[] | undefined
+      let outputTokens: number | undefined
+      try {
+        for (let i = agent.session.surface.nodes.length - 1; i >= 0; i--) {
+          const seq = agent.session.surface.nodes[i]
+          if (seq === undefined) continue
+          const event = agent.session.eventAt(seq)
+          if (event?.type !== 'assistant/message') continue
+          if (event.data.turn !== turn) break
+          content = event.data.message?.content
+          outputTokens = event.data.usage?.outputTokens
+          break
+        }
+      } catch {
+        return // history read failure is not worth a retry decision
+      }
+      if (content === undefined || !isDegenerateAssistantContent(content as never)) return
+      // A MAX-TOKENS stop is structural, not degenerate: the model was capped
+      // mid-reasoning and a full-context re-send ends the same way — up to 3
+      // wasted requests per episode. Retry only turns the model CHOSE to end
+      // (output under the configured ceiling; no ceiling configured = no veto).
+      const tokenCeiling = agent.options.maxTokens
+      if (tokenCeiling !== undefined && outputTokens !== undefined && outputTokens >= tokenCeiling) return
+      this.degenerateStreaks.set(sessionId, streak + 1)
+      try {
+        agent.inbox.append('next-step', degenerateRetryNudge())
+      } catch (error) {
+        this.degenerateStreaks.set(sessionId, streak) // append failed: do not count the attempt
+        this.ctx.logger.warn(
+          `[ContextGovernor] degenerate-turn retry failed to inject: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return
+      }
+      this.usage.record(USAGE_KIND.degenerateRetry, 1, { sessionId, detail: `turn=${turn};streak=${streak + 1}` })
+      this.ctx.logger.info(
+        `[ContextGovernor] Degenerate turn ${turn} (no visible output) — one invisible retry injected (streak ${streak + 1})`,
+      )
+    })
+  }
+
+  /**
+   * Arm one deferred idle pass unless one is already pending for the session.
+   * @param sessionId - the idle session.
+   * @param session - its session handle (routing + persistence).
+   */
+  private scheduleIdleMaintenance(sessionId: string, session: Session): void {
+    if (!resolveSleepConsolidate(this.config).enabled) return
+    if (this.sleepTimers.has(sessionId) || this.sleepInFlight.has(sessionId)) return
+    const idleMs = resolveSleepConsolidate(this.config).idleMs
+    const timer = setTimeout(() => {
+      this.sleepTimers.delete(sessionId)
+      // In-flight guard: sleepLastRun is only stamped on SUCCESS, so a slow
+      // local-model consolidation plus a second idle window (min 60s) would
+      // pass both the timer and rerun gates and run TWO merges concurrently
+      // (the lifecycle review's P2-5).
+      if (this.sleepInFlight.has(sessionId)) return
+      this.sleepInFlight.add(sessionId)
+      void this.runSleepMaintenance(sessionId, session)
+        .catch((error: unknown) => {
+          // Best-effort sweep, but never SILENT: the first version swallowed
+          // every failure here, which is how the no-route bug stayed invisible
+          // for a full production day.
+          const brief = error instanceof Error ? error.message.slice(0, 80) : String(error).slice(0, 80)
+          this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: `sleep:failed=${brief}` })
+          this.ctx.logger.warn(`[ContextGovernor] Idle consolidation failed: ${brief}`)
+        })
+        .finally(() => this.sleepInFlight.delete(sessionId))
+    }, idleMs)
+    timer.unref?.()
+    this.sleepTimers.set(sessionId, timer)
+  }
+
+  /** Cancel one session's pending idle pass (the agent woke up). */
+  private cancelIdleMaintenance(sessionId: string): void {
+    const timer = this.sleepTimers.get(sessionId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    this.sleepTimers.delete(sessionId)
+  }
+
+  /**
+   * One idle pass: stale-counter sweep + superseded-checkpoint consolidation.
+   * @param sessionId - the idle session.
+   * @param session - its session handle.
+   * @param summarize - the LLM merge call (injectable for tests).
+   */
+  private async runSleepMaintenance(
+    sessionId: string,
+    session: Session,
+    summarize: (texts: readonly string[], target: SummarizationTarget) => Promise<string> = async (texts, target) =>
+      summarizeMemoriesWithLlm(this.ctx, this.config, texts, 'sleep consolidation', target),
+  ): Promise<void> {
+    // The execution point re-checks the gate: the schedule side arms only
+    // enabled sessions, but this method must stand on its own (defense in
+    // depth — a stray direct call must not spend tokens against a disabled
+    // config).
+    if (!resolveSleepConsolidate(this.config).enabled) return
+    const lastRun = this.sleepLastRun.get(sessionId) ?? Number.NEGATIVE_INFINITY
+    if (Date.now() - lastRun < GOV_SLEEP_RERUN_MS) return
+    const superseded = this.ctx.memoryContext.supersededCheckpointTexts(sessionId, GOV_SLEEP_CONSOLIDATE_INPUTS)
+    if (superseded.count < GOV_SLEEP_CONSOLIDATE_MIN) return
+    // The consolidation LLM call MUST ride the session's own route: the
+    // fold path always passes one, but the first version of this call left
+    // the target unset — with no explicit config route the summarizer
+    // resolution threw, the schedule-side catch swallowed it, and idle
+    // consolidation silently never ran (zero ledger rows despite 10
+    // eligible superseded checkpoints — found by ledger diagnosis
+    // 2026-11-17).
+    const target = routedTargetOf(session)
+    if (target === undefined) {
+      this.usage.record(USAGE_KIND.foldCheck, 1, { sessionId, detail: 'sleep:skipped=no-route' })
+      return
+    }
+    const merged = await summarize(superseded.texts, target)
+    if (merged.trim().length === 0) return
+    // kind 'project': the fold's supersedePrior('checkpoint') must NOT retire
+    // the consolidation — it is the session's long-term conclusion, not the
+    // next digest's predecessor.
+    await this.ctx.memoryContext.storeMemory(merged, 'long', {
+      sourceSessionId: session.id,
+      importance: 0.7,
+      kind: 'project',
+    })
+    // Consume the merged checkpoints: without the stamp they re-qualify
+    // forever and every idle window re-emits a near-duplicate long memory
+    // (the lifecycle review's P2-6).
+    this.ctx.memoryContext.markCheckpointsConsolidated(superseded.ids)
+    this.sleepLastRun.set(sessionId, Date.now())
+    this.usage.record(USAGE_KIND.foldCheck, 1, {
+      sessionId,
+      detail: `sleep:consolidated=${superseded.texts.length}`,
+    })
+    this.ctx.logger.info(
+      `[ContextGovernor] Idle consolidation: ${superseded.texts.length} superseded checkpoints → one long memory (session …${sessionId.slice(-8)})`,
+    )
+  }
+
+  /** Register the per-turn governance hook: CTX adoption + compression + RAG injection. */
+  private registerRetrieval(ctx: Context): void {
+    ctx.on('agent/pre-step', async (
+      payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<PreStepDecision>,
+    ): Promise<PreStepDecision> => {
+      // Periodic cleanup of stale session counters + stale forced-pressure marks
+      this.evictIdleSessions(this.compressor.cleanupStale())
+      // The agent woke up: any pending idle pass is obsolete.
+      this.cancelIdleMaintenance(String(payload.agent.session.id))
+
+      // --- Implicit fold recall scan ---
+      // Fire-and-forget BEFORE the pipeline: the scan is read-only (one
+      // embed + one store query), and its signal must survive even if a
+      // later injection step throws.
+      try {
+        void this.scanImplicitRecall(
+          String(payload.agent.session.id),
+          payload.turn,
+          payload.messages.filter(message => isUserAuthored(message)).map(message => messageText(message)),
+        ).catch(() => { /* the scan costs one signal at most, never a step */ })
+      } catch { /* construction-time failures are the caller's problem, not the step's */ }
+
+      // --- Tool-result archive (exact-text CCR) ---
+      // Stub oversized tool results that appeared since the last pass BEFORE the
+      // request for this step is assembled, so the model reads a ref instead of
+      // the payload and `memory_expand` can hand the full text back later. The
+      // pass is cache-safe: it only touches nodes appended after the previous
+      // barrier, never a request prefix that was already sent. Isolated so a
+      // failed rewrite cannot block compression or retrieval.
+      try {
+        const archived = this.toolArchive.rewriteNewResults(payload.agent.session)
+        if (archived.replaced > 0) {
+          this.usage.record(USAGE_KIND.archiveChars, archived.charsRemoved, {
+            sessionId: String(payload.agent.session.id),
+          })
+          ctx.logger.info(
+            `[ContextGovernor] Tool-result archive: stubbed ${archived.replaced} result(s), ${archived.charsRemoved} chars off the surface (refs: ${archived.refs.join(', ')})`,
+          )
+        }
+      } catch (error) {
+        ctx.logger.warn(
+          `[ContextGovernor] Tool-result archive rewrite failed: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+
+      const decision = await next()
+      if (payload.signal.aborted || decision.kind !== 'enter' || decision.messages.length === 0) {
+        return decision
+      }
+
+      const session = payload.agent.session
+      if (this.lastInjectedTurn.get(session) === payload.turn) return decision
+
+      try {
+        const sessionId = session.id
+        // Adopt the ACTUAL model context window resolved by DSH (catalog /
+        // `/models`). This is what makes compression track the real model's
+        // context length — a 8K local model compresses early, a 128K online
+        // model waits — instead of a hard-coded window. Falls back to the
+        // configured window when DSH has not resolved one yet. The per-model
+        // registry (probe / modelWindows overrides) narrows this to the REAL
+        // runtime window for the routed model when one is known. The routed
+        // model is preferred over requestContext.model: dynamic routing may
+        // leave the declared model absent while the route table resolved one
+        // (production 2026-11-10: the un-keyed observation left the tracker
+        // empty and every tracker-based door fell to the 94000 config
+        // default against a 256k session).
+        let sessionWindow: number | undefined
+        const requestContext = session.requestContext()
+        const routed = routedTargetOf(session)
+        const routedModel = routed?.model ?? requestContext?.model
+        if (requestContext !== undefined || routed !== undefined) {
+          ctx.memoryContext.observeRequestContext({
+            ...(routed?.provider === undefined
+              ? requestContext?.provider === undefined ? {} : { provider: requestContext.provider }
+              : { provider: routed.provider }),
+            ...(routedModel === undefined ? {} : { model: routedModel }),
+            ...requestContext?.contextWindow === undefined ? {} : { contextWindow: requestContext.contextWindow },
+          })
+          sessionWindow = ctx.memoryContext.windowForModel(routedModel)
+            ?? requestContext?.contextWindow
+        }
+        // Route-aware to the end: never budget this session off another
+        // model's globally last-observed window.
+        const effectiveWindow = sessionWindow
+          ?? ctx.memoryContext.windowForModelOrDeclared(routedModel)
+        // Deep copy here to avoid side effects.
+        // Type is Message[] (not UserMessage[]) because compression injects a
+        // user-role summary and fallbackTruncate can reshape the array; the
+        // final PreStepDecision cast to UserMessage[] is intentional — every
+        // message we keep or inject is user-role by construction.
+        let currentMessages: Message[] = decision.messages.map(m => ({ ...m }))
+
+        // --- History compression is a SURFACE rewrite, not a pre-step rewrite ---
+        // `decision.messages` here is only the step's inbox delta (DSH appends
+        // it to the session surface). Folding it could never see history and,
+        // if it ever fired, would drop the step's real messages. The fold lane
+        // now runs in `compactIfNeeded` via `foldNow()` → compaction-basic's
+        // `compactRegion`, exactly like the durable lane.
+        // --- Strategy 4: RAG retrieval injection (gated on retrieval config;
+        // CTX adoption above stays active regardless) ---
+        // The active surface — the text of every message the model is about to
+        // read — is materialized lazily: the surface-aware retrieval de-dup and
+        // the conciseness directive both need it, but a step where neither
+        // applies should not pay for the full concatenation.
+        let surfaceCache: string[] | undefined
+        const surface = (): string[] => (surfaceCache ??= currentMessages
+          .map(message => messageText(message).trim())
+          .filter(text => text.length > 0))
+
+        // Messages to splice in BEFORE the latest user message, in order.
+        const injections: UserMessage[] = []
+
+        // --- Strategy 3.5: task-state working memory (carried from folds) ---
+        // Similarity retrieval structurally misses open-loop state: the next
+        // user message is rarely similar to a fifty-turn-old pending job, and
+        // production showed memory_search was never called directly. So the
+        // loop's working set (primary request / pending jobs / next step /
+        // critical context, rebuilt from every fold's checkpoint) is spliced
+        // in unconditionally, BEFORE the RAG background. Fresh each turn and
+        // never durable - it adds no per-turn surface messages. Its tokens
+        // come out of the RAG cap so the reserved injection budget holds.
+        let taskStateTokens = 0
+        if (resolveTaskStateEnabled(this.config)) {
+          const taskState = this.compressor.taskStateOf(sessionId)
+          if (taskState !== undefined) {
+            // Cadence gate (2026-11-27 context-burden rework): re-send on
+            // CHANGE (every fold rebuilds the block — the moments visibility
+            // matters most) or every INJECTION_REANCHOR_TURNS turns;
+            // byte-identical copies on every intermediate turn were pure
+            // per-request weight the model had already read.
+            const last = this.lastTaskState.get(session)
+            const reanchor = payload.turn - (last?.turn ?? Number.NEGATIVE_INFINITY) >= INJECTION_REANCHOR_TURNS
+            if (last === undefined || last.text !== taskState || reanchor) {
+              injections.push(createUserMessage({
+                content: [{ type: 'text', text: taskState }],
+                source: { kind: 'plugin:' + PLUGIN } as any,
+              }))
+              taskStateTokens = estimateTokens(taskState)
+              this.lastTaskState.set(session, { text: taskState, turn: payload.turn })
+              this.usage.record(USAGE_KIND.injectTokens, taskStateTokens, { sessionId })
+            }
+          }
+        }
+
+        if (this.retrieval.enabled) {
+          // Cap the injection at a share of the session's REAL window so a
+          // short-context local model keeps room for the conversation itself
+          // (the configured rag_token_budget remains the ceiling for large
+          // windows). The task-state block above is paid first.
+          // The task-state block is paid FIRST; when it consumes the whole
+          // share the RAG cap legitimately reaches zero (a CJK-heavy state
+          // block used to push the cap negative and disable RAG silently —
+          // floor at 0 and skip cleanly instead).
+          const injectionCap = Math.max(0, Math.min(
+            this.injectionBudget,
+            Math.max(256, Math.floor(effectiveWindow * RAG_WINDOW_SHARE)),
+          ) - taskStateTokens)
+          const userText = this.latestUserText(currentMessages)
+          if (userText !== undefined && injectionCap > 0) {
+            // Sticky exclusion + periodic re-anchor (2026-11-27): an empty
+            // retrieval used to CLEAR the exclusion set, re-injecting the
+            // same memories turn after turn. Now the set persists; the full
+            // Top-K re-anchor runs on the shared cadence instead.
+            if (payload.turn - (this.lastRagAnchorTurn.get(session) ?? Number.NEGATIVE_INFINITY) >= INJECTION_REANCHOR_TURNS) {
+              this.lastInjectedIds.delete(session)
+              this.lastRagAnchorTurn.set(session, payload.turn)
+            }
+            const excludeIds = this.lastInjectedIds.get(session)
+            const retrieval = await this.retriever.retrieve(
+              userText,
+              excludeIds,
+              injectionCap,
+              surface(),
+              // Same-session memories get the recency boost in the ranking.
+              String(session.id),
+            )
+            if (retrieval !== null) {
+              injections.push(retrieval.message)
+              this.lastInjectedIds.set(session, new Set(retrieval.ids))
+              this.lastRagAnchorTurn.set(session, payload.turn)
+              // Price the injection: tokens actually added to the request, how
+              // many memories that bought, and how many were dropped because
+              // the model could already see them.
+              this.usage.record(
+                USAGE_KIND.injectTokens,
+                estimateTokens(messageText(retrieval.message)),
+                { sessionId },
+              )
+              this.usage.record(USAGE_KIND.injectMemories, retrieval.hitCount, { sessionId })
+              this.usage.record(USAGE_KIND.surfaceSkips, retrieval.skipped, { sessionId })
+              ctx.logger.info(
+                `[ContextGovernor] RAG injected: ${retrieval.hitCount} memories for query "${userText.slice(0, 60)}…"`,
+              )
+            }
+            // A null retrieval now keeps the exclusion set sticky: the same
+            // memories re-injecting every turn was the old clearing behavior.
+            // The INJECTION_REANCHOR_TURNS cadence above owns the reset.
+          }
+        }
+
+        // --- Strategy 5: local-model conciseness directive ---
+        // A local model's narration is re-sent as input on every later request
+        // (and re-paid after each cache expiry), so one short directive that
+        // suppresses it usually pays for itself within the same turn. Injected
+        // at most once per DURABLE surface: the guard scans the session's
+        // committed nodes — the step's inbox delta alone never contains the
+        // previous turn's directive, so scanning only it made the guard dead
+        // and re-injected a ~60-token copy every turn. A user quoting the
+        // marker suppresses one injection; compaction re-arms afterwards.
+        if (this.conciseLocalMode && ctx.memoryContext.isLocalRoute(requestContext?.provider)) {
+          const durableTexts: string[] = []
+          for (const seq of session.surface.nodes.slice(-200)) {
+            const event = session.eventAt(seq)
+            if (event === undefined) continue
+            const data = event.data as { message?: { content?: unknown }; content?: unknown } | undefined
+            const content = data?.message?.content ?? data?.content
+            if (content === undefined) continue
+            durableTexts.push(messageText({ role: 'user', content }))
+          }
+          if (!hasConciseDirective([...durableTexts, ...surface()])) {
+            injections.push(createConciseMessage(this.conciseLocalDirective))
+            ctx.logger.info(
+              `[ContextGovernor] local conciseness directive injected (provider=${requestContext?.provider ?? 'unknown'})`,
+            )
+          }
+        }
+
+        // Insert the injected messages BEFORE the latest user message so the
+        // model reads them as context, not as new user input appended after the
+        // question (which would break instruction ordering). The conciseness
+        // directive goes LAST so it sits closest to the question and reads as
+        // the current turn's rule rather than as ancient background.
+        if (injections.length > 0) {
+          let insertAt = currentMessages.length
+          for (let i = currentMessages.length - 1; i >= 0; i--) {
+            const text = messageText(currentMessages[i]).trim()
+            // The USER's question, not the newest injected splice: parking
+            // RAG/task-state after the question is exactly the ordering
+            // break this insertion exists to avoid.
+            if (currentMessages[i].role === 'user' && text.length > 0 && isUserAuthored(currentMessages[i])) {
+              insertAt = i
+              break
+            }
+          }
+          currentMessages = [
+            ...currentMessages.slice(0, insertAt),
+            ...injections,
+            ...currentMessages.slice(insertAt),
+          ]
+        }
+
+        // --- Fallback truncation (Strategy 2 — deterministic last resort) ---
+        // Budget: the session's effective window minus headroom (same factor
+        // as the compressor's tokenBudget()).
+        const headroom = ctx.memoryContext.headroomRatio ?? 0.25
+        const tokenBudget = Math.floor(effectiveWindow * (1 - headroom))
+        const beforeCount = currentMessages.length
+        currentMessages = fallbackTruncate(currentMessages, tokenBudget, this.retainRecent)
+        if (currentMessages.length < beforeCount) {
+          ctx.logger.warn(
+            `[ContextGovernor] Fallback truncation: ${beforeCount} → ${currentMessages.length} messages (budget: ${tokenBudget} tokens)`,
+          )
+        }
+
+        return { kind: 'enter', messages: currentMessages as UserMessage[] }
+      } catch (error) {
+        ctx.logger.warn(
+          `[ContextGovernor] Governance hook error: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      } finally {
+        // Set on success AND failure: a mid-splice throw must not re-run the
+        // whole pipeline on the next step of the SAME turn (the usage ledger
+        // would double-count, and retrieval would re-pay its embed cost).
+        // The next turn has a different turn number and retries normally.
+        this.lastInjectedTurn.set(session, payload.turn)
+      }
+      return decision
+    })
+  }
+
+  /**
+   * Record the provider's own token accounting (Strategy 9).
+   *
+   * DSH's {@link TokenUsage} counts are DISJOINT: `inputTokens` is the
+   * *uncached* input, so the billed input is input + cacheRead + cacheWrite.
+   * They are stored separately (never pre-summed) because summing here would
+   * erase the cache-hit ratio — exactly the signal this accounting exists to
+   * expose. Steps whose adapter reported nothing are simply not counted.
+   *
+   * @param ctx - the plugin context.
+   */
+  /**
+   * Make auxiliary compaction calls use the session's own reasoning effort,
+   * and keep a route that refuses a reasoning-shaped body off that shape.
+   *
+   * compaction-basic's summarizer omits `reasoningEffort`, so the LLM service
+   * falls back to the model's declared default. Local providers commonly
+   * declare a default the served model rejects (e.g. default "high" while the
+   * GGUF template only accepts "medium"), which fails every summarization.
+   * Wrapping `stream` for `purpose: 'compaction'` passes the routed effort
+   * without forking the base.
+   *
+   * It must NOT invent an effort the session never routed (issue #2). A route
+   * whose reasoning dialect is `deepseek`/`zai` renders a non-off effort as a
+   * `thinking: { type: 'enabled' }` body field, and a gateway that maps that
+   * body onto Anthropic's schema answers
+   * `thinking: missing field "budget_tokens"` — every fold on the route dies
+   * on a request shape nobody asked for. So: the session's routed effort is
+   * copied, nothing else. Once a route refuses the reasoning parameter, the
+   * route is remembered and its compaction calls ask for the explicit off
+   * level instead, which renders as `thinking: { type: 'disabled' }` (or no
+   * field at all) and is accepted.
+   * @param ctx - the plugin context.
+   */
+  private registerCompactionEffort(ctx: Context): void {
+    const llm = ctx.llm
+    const marker = Symbol.for('dsh-infinite-context.compaction-effort')
+    const record = llm as unknown as Record<PropertyKey, unknown>
+    if (record[marker] === true) return
+    const original = llm.stream.bind(llm)
+    try {
+      llm.stream = (options: GenerateOptions) => {
+        if (options.purpose !== 'compaction') return original(options)
+        const route = `${options.provider}/${options.model}`
+        if (this.reasoningRejectedRoutes.has(route)) {
+          // Already refused: ask this route for its off level rather than the
+          // session's thinking level. `off` is the seam's own spelling; a route
+          // that cannot express it throws UNSUPPORTED_REASONING_EFFORT, which
+          // the summarizer's resilience state machine turns into the extractive
+          // fallback instead of an abandoned fold.
+          if (options.reasoningEffort === REASONING_OFF_EFFORT) return this.watchReasoningBody(original(options), route)
+          return this.watchReasoningBody(
+            original({ ...options, reasoningEffort: REASONING_OFF_EFFORT }),
+            route,
+          )
+        }
+        if (options.reasoningEffort === undefined) {
+          const effort = this.compactionEffortFor(options)
+          if (effort !== undefined) return this.watchReasoningBody(original({ ...options, reasoningEffort: effort }), route)
+        }
+        return this.watchReasoningBody(original(options), route)
+      }
+      record[marker] = true
+    } catch (error) {
+      // A frozen/proxied service must not break plugin loading; the
+      // summarizer simply keeps the provider default in that case.
+      this.ctx.logger.warn(
+        `[ContextGovernor] Could not pass reasoning effort to compaction calls: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    // The wrapper is idempotent and the plugin lives for the process.
+  }
+
+  /**
+   * Pass a compaction stream through, recording a reasoning-parameter refusal
+   * for its route so later folds stop producing the rejected body shape.
+   * @param stream - the stream the caller asked for.
+   * @param route - `provider/model` of the call being watched.
+   * @returns the same chunks, in order.
+   */
+  private watchReasoningBody(
+    stream: AsyncIterable<StreamChunk>,
+    route: string,
+  ): AsyncIterable<StreamChunk> {
+    return (async function* (this: MemoryCompactionEngine, source: AsyncIterable<StreamChunk>) {
+      try {
+        for await (const chunk of source) {
+          if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+            this.noteReasoningRejection(route, chunk.reason.failure.message, chunk.reason.failure.code)
+          }
+          yield chunk
+        }
+      } catch (error) {
+        // The seam also throws refusals outright (`UNSUPPORTED_REASONING_EFFORT`
+        // is raised before any chunk flows), so the throw path records too.
+        const message = error instanceof Error ? error.message : String(error ?? '')
+        this.noteReasoningRejection(route, message, (error as { code?: string } | undefined)?.code)
+        throw error
+      }
+    }).call(this, stream)
+  }
+
+  /**
+   * Remember (once per route) that this endpoint refuses the reasoning
+   * parameter, and tell the operator what to change on the route itself.
+   * @param route - `provider/model` of the refused call.
+   * @param message - the provider failure message.
+   * @param code - the failure's machine code, when one was reported.
+   */
+  private noteReasoningRejection(route: string, message: string, code?: string): void {
+    if (!isReasoningConfigRejection(message, code)) return
+    const first = !this.reasoningRejectedRoutes.has(route)
+    this.reasoningRejectedRoutes.add(route)
+    if (!first || this.reasoningRejectionNoticed.has(route)) return
+    this.reasoningRejectionNoticed.add(route)
+    this.ctx.logger.warn(
+      `[ContextGovernor] Route ${route} rejected the reasoning/thinking parameter `
+      + `${code === undefined ? '' : `(${code}) `}for compaction calls: ${redactCredentials(message).slice(0, 240)}. `
+      + 'Folds on this route now request reasoning off. To get summarized folds back, make the route '
+      + 'declare a dialect its URL can carry — in $DSH_HOME/profiles/<profile>/cordis.patch.yml under '
+      + 'id: llm-pi-ai → providers.<route>.models[].compat.thinkingFormat (an Anthropic-schema gateway '
+      + 'reached over an OpenAI-compatible URL refuses thinking without budget_tokens), or take the '
+      + 'levels away with reasoningEfforts: false — or keep the route at its off level.',
+    )
+  }
+
+  /**
+   * Resolve the reasoning effort for one auxiliary call.
+   *
+   * Only what the session itself routed — never a level invented from the
+   * model listing, which turns thinking on for a route the operator kept off
+   * (issue #2).
+   * @param options - the outgoing LLM call.
+   * @returns the routed session effort, or undefined to leave it as the host set it.
+   */
+  private compactionEffortFor(options: GenerateOptions): NonNullable<GenerateOptions['reasoningEffort']> | undefined {
+    const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId)
+    const session = sessionId === undefined ? undefined : this.lastAgentBySession.get(sessionId)?.session
+    return session?.requestHeader()?.config.reasoningEffort
+  }
+
+  private registerUsage(ctx: Context): void {
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'assistant/message') return
+      // Degenerate-turn streak bookkeeping runs BEFORE the usage gate: any
+      // assistant message with real output resets the session's streak, and
+      // this is the only choke point that sees every message (degenerate
+      // ones increment in registerDegenerateRetry at turn close).
+      const retryContent = event.data.message?.content
+      if (Array.isArray(retryContent) && !isDegenerateAssistantContent(retryContent as never)) {
+        this.degenerateStreaks.delete(String(session.id))
+      }
+      const usage = event.data.usage
+      if (usage === undefined) return
+      const sessionId = String(session.id)
+      // Attribute every count to THIS session's routed provider/model, read from
+      // the session itself — the tracker's global "last observed" slot can
+      // belong to a concurrent session on another model. A mid-session model
+      // switch invalidates the provider prefix cache, so without the per-model
+      // split that drop is indistinguishable from TTL expiry.
+      // Guarded like routedTargetOf: a partial session object must skip the
+      // attribution, not the whole cycle bookkeeping after it (the lifecycle
+      // review's P2-8).
+      let attribution: { detail?: string; sessionId?: string }
+      try {
+        attribution = usageAttribution(sessionId, session.requestContext())
+      } catch {
+        // Keep the session id: usage rows without it orphan from their session
+        // in ledger queries (follow-up review F12).
+        attribution = { sessionId }
+      }
+      this.usage.record(USAGE_KIND.llmRequests, 1, attribution)
+      if (usage.inputTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmInput, usage.inputTokens, attribution)
+      }
+      if (usage.outputTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmOutput, usage.outputTokens, attribution)
+      }
+      if (usage.cacheReadTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmCacheRead, usage.cacheReadTokens, attribution)
+      }
+      if (usage.cacheWriteTokens !== undefined) {
+        this.usage.record(USAGE_KIND.llmCacheWrite, usage.cacheWriteTokens, attribution)
+      }
+      // Runway scheduler: accumulate this cycle's cache utility (the
+      // cycle-cache-hit EMA is the "folds too frequent" signal — every fold
+      // invalidates the KV prefix and these rows are what that costs).
+      // cacheReadTokens passes through RAW: an adapter that omits cache
+      // fields must leave the dip unmeasured (`undefined`), not fabricate a
+      // total-miss dip=1.00 — noteCycleUsage's own finite-check is the gate
+      // (the lifecycle review's P2-3).
+      try {
+        this.compressor.noteCycleUsage(
+          sessionId,
+          usage.inputTokens ?? 0,
+          usage.cacheReadTokens,
+          usage.cacheWriteTokens ?? 0,
+        )
+      } catch {
+        // Learning never breaks the telemetry path.
+      }
+    })
+  }
+
+  /** Find the most recent non-empty user text in the request messages. */
+  private latestUserText(messages: readonly { role: string; content: unknown }[]): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i]
+      if (message.role !== 'user') continue
+      const text = messageText(message).trim()
+      if (text.length > 0) return text
+    }
+    return undefined
+  }
+
+}
+
+export default MemoryCompactionEngine

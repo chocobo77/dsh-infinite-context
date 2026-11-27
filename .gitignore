@@ -1,0 +1,84 @@
+# === Dependencies ===
+node_modules/
+
+# === Build output ===
+dist/
+*.tsbuildinfo
+
+# === Database (contains runtime memories) ===
+*.db
+*.db-shm
+*.db-wal
+
+# === OS generated files ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Environment / Credentials ===
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.token
+*.credential
+*.password
+credentials.*
+secrets.*
+
+# === Logs ===
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# === Packages / misc ===
+*.tgz
+*.tar.gz
+.cache/
+tmp/
+temp/
+
+# === local process notes (not tracked) ===
+REVIEW*.md
+DSH插件开发经验.md
+# === Machine-specific (install script persistence) ===
+scripts/install-dsh-plugin.cfg
+
+
+# === Local development only (not published) ===
+docs/
+scripts/*
+!scripts/contract-check.mjs
+ARCHITECTURE.md
+# The vitest suite left the repository on 2026-11-14 (operator decision):
+# tests/ and vitest.config.ts are gone; the suite remains recoverable from git
+# history (tag v0.9.8 and earlier). What replaced it is scripts/contract-check.mjs
+# — plain node:test over the COMPILED dist/, pinning the host event shape and
+# the redaction line. Unlike the rest of scripts/ (local operator tooling),
+# contract-check.mjs IS tracked: package.json's `test:contract` runs it inside
+# `verify`, `prepack` gates verify, and src/ comments cite it as the contract
+# pin — a fresh clone without it breaks verify and pack (2026-11-20 review).
+# The tarball stays clean: pack.sh rejects package/scripts/ outright.
+# verify = typecheck + build + test:contract.
+
+release/
+
+# bench replay outputs (generated reports)
+bench-results/
+
+# === Pack scripts: machine-local operator tooling (encoding/format quirks
+# === differ per machine; installs use the release URL instead) ===
+pack.ps1
+pack.sh
